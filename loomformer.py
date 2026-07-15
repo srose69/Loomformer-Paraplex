@@ -1635,15 +1635,27 @@ class ShardStream:
 
         rank = ddp_rank() if ddp_is_distributed() else 0
         world_size = ddp_world_size() if ddp_is_distributed() else 1
+        self._rng = np.random.default_rng(
+            int(getattr(cfg, "seed", 1)) + 1000003 * int(rank)
+        )
 
-        self._order = list(range(rank, len(self._files), world_size))
+        # With enough shards, assign disjoint shards to ranks.
+        # With fewer shards than ranks (including a single-file corpus),
+        # every rank uses the available files but samples different windows.
+        if len(self._files) >= world_size:
+            self._order = list(range(rank, len(self._files), world_size))
+        else:
+            self._order = list(range(len(self._files)))
+
         if not self._order:
             raise ValueError(
-            f"rank {rank} received no dataset shards: "
-            f"{len(self._files)} files for world_size={world_size}"
-        )
+                f"no dataset shards available for rank {rank}: "
+                f"{len(self._files)} files, world_size={world_size}"
+            )
+
         self._rng.shuffle(self._order)
         self._pos = 0
+        self._single_file = len(self._order) == 1
 
         self.current_tokens = self._tokenize_shard(self._next_index())  # first (only, if single-file) shard
         if self._single_file:

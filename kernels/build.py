@@ -153,6 +153,39 @@ def _save_hash_db(db: Dict[str, Dict[str, str]]) -> None:
 # PTX generation -- fully silent, best-effort, never affects the main build.
 # ============================================================================
 
+def _visible_cuda_arch_list() -> Optional[str]:
+    """Return unique compute capabilities for the CUDA devices visible here.
+
+    The format matches TORCH_CUDA_ARCH_LIST, for example ``"8.0;8.6"``.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        arches = {
+            f"{major}.{minor}"
+            for major, minor in (
+                torch.cuda.get_device_capability(i)
+                for i in range(torch.cuda.device_count())
+            )
+        }
+        return ";".join(sorted(arches, key=lambda x: tuple(map(int, x.split("."))))) or None
+    except Exception:
+        return None
+
+
+def _configure_visible_cuda_arches() -> None:
+    """Limit extension builds to architectures present in visible GPUs.
+
+    An explicitly supplied TORCH_CUDA_ARCH_LIST remains an override.
+    """
+    if os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        return
+    arch_list = _visible_cuda_arch_list()
+    if arch_list:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+
+
 def _nvcc_arch_flag() -> str:
     try:
         import torch
@@ -230,6 +263,7 @@ def build_or_load(
     the old load_inline() call sites did.
     """
     global _progress_done
+    _configure_visible_cuda_arches()
     from torch.utils.cpp_extension import load as _cpp_load
 
     abs_sources = [s if os.path.isabs(s) else os.path.join(_KERNELS_DIR, s) for s in sources]

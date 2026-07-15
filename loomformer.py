@@ -1618,11 +1618,20 @@ class ShardStream:
         self._files = files
         self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(files[0])
         self._text_field = getattr(cfg, "text_field", "text")
-        self._single_file = len(self._files) < 2
 
         rank = ddp_rank() if ddp_is_distributed() else 0
+        world_size = ddp_world_size() if ddp_is_distributed() else 1
         self._rng = np.random.default_rng(int(getattr(cfg, "seed", 1)) + 1000003 * int(rank))
-        self._order = list(range(len(self._files)))
+
+        # Partition shards only when every rank can receive at least one. For a
+        # single-file (or otherwise undersharded) corpus, every rank reads the
+        # same file set but samples different windows via its rank-specific RNG.
+        if world_size > 1 and len(self._files) >= world_size:
+            self._order = list(range(rank, len(self._files), world_size))
+        else:
+            self._order = list(range(len(self._files)))
+
+        self._single_file = len(self._order) < 2
         self._rng.shuffle(self._order)
         self._pos = 0
 

@@ -17,7 +17,7 @@ Soon
 Checkpoints here
 https://huggingface.co/srs6901/LoomFormer-Paraplex/
  
-(it converged! eval_loss 3.2438 bits/tok 4.6798 bpb 1.3228 on 120k steps from FSS1STR)
+(it converged! eval_loss 3.2438 bits/tok 4.6798 bpb 1.3228 on 120k steps from FSS1STR at 27.3k tok/s on single L40S, budget 3,440,640,000 tokens over 120,000 steps (0.735 epochs of 4,684,230,241), 112,999,621 params · 30.4 tok/param · 41.5 data-tok/param)
 
 ## Depth
 

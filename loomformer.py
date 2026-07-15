@@ -171,7 +171,20 @@ def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tupl
         print(f"[ddp] launching ({launch_note}):", " ".join(cmd), flush=True)
         if "OMP_NUM_THREADS" in env and not os.environ.get("OMP_NUM_THREADS"):
             print(f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}", flush=True)
-        raise SystemExit(subprocess.call(cmd, env=env))
+        proc = subprocess.Popen(cmd, env=env)
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            # The terminal has already delivered SIGINT to torchrun and its workers.
+            # Do not print a parent-side traceback or forward a duplicate signal;
+            # let rank 0 finish its checkpoint prompt and wait for a clean shutdown.
+            old_handler = signal.getsignal(signal.SIGINT)
+            try:
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                returncode = proc.wait()
+            finally:
+                signal.signal(signal.SIGINT, old_handler)
+        raise SystemExit(returncode)
 
     world_size = ddp_world_size()
     rank = ddp_rank()
@@ -1618,20 +1631,17 @@ class ShardStream:
         self._files = files
         self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(files[0])
         self._text_field = getattr(cfg, "text_field", "text")
+        self._single_file = len(self._files) < 2
 
         rank = ddp_rank() if ddp_is_distributed() else 0
         world_size = ddp_world_size() if ddp_is_distributed() else 1
-        self._rng = np.random.default_rng(int(getattr(cfg, "seed", 1)) + 1000003 * int(rank))
 
-        # Partition shards only when every rank can receive at least one. For a
-        # single-file (or otherwise undersharded) corpus, every rank reads the
-        # same file set but samples different windows via its rank-specific RNG.
-        if world_size > 1 and len(self._files) >= world_size:
-            self._order = list(range(rank, len(self._files), world_size))
-        else:
-            self._order = list(range(len(self._files)))
-
-        self._single_file = len(self._order) < 2
+        self._order = list(range(rank, len(self._files), world_size))
+        if not self._order:
+            raise ValueError(
+            f"rank {rank} received no dataset shards: "
+            f"{len(self._files)} files for world_size={world_size}"
+        )
         self._rng.shuffle(self._order)
         self._pos = 0
 
@@ -4349,6 +4359,7 @@ async def train_one_async(
 
         if ddp_is_distributed():
             ddp_barrier(device)
+            dist.destroy_process_group()
         raise SystemExit(130)  # 128+SIGINT: conventional shell exit code for Ctrl-C
 
     step = start_step

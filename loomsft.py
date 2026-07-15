@@ -3,25 +3,35 @@
 """
 loomsft.py -- SFT on top of LoomFormer.
 
-Consumes the jsonl schema documented in sft.md / sft_format.json (OpenAI-style
-messages, with first-class tool_calls/tool_call_id). Does NOT convert other formats
-into this shape -- get your data there yourself (see sft.md, "Out of scope").
+Consumes the jsonl schema documented in sft_format.json (OpenAI-style messages,
+with first-class tool_calls/tool_call_id). Does NOT convert other formats into
+this shape -- get your data there yourself.
 
-Packs multiple examples into every training row instead of padding each example to
-seq_len alone: real SFT examples are usually far shorter than seq_len, so a
-pad-to-seq_len batch wastes most of its compute on padding -- exactly the throughput
-stall packing exists to avoid. Packing is done correctly, not just concatenated:
+The previous version re-rendered the Jinja template and re-tokenized from raw
+JSON on every single batch draw, for the lifetime of training -- across many
+epochs over a fixed, static file, that is the same handful of megabytes of
+text being re-parsed and re-templated thousands of times over. Jinja rendering
+is an inherently per-example Python-level operation (it doesn't batch), so the
+only way to stop paying for it repeatedly is to pay for it once and cache the
+result. A 150k-line dataset renders+tokenizes in a few minutes on CPU, held
+entirely in RAM (a few hundred MB of int32 token ids) -- after that, every
+training step is pure array slicing and concatenation, no JSON, no Jinja, no
+tokenizer calls, ever again.
 
-  - block-diagonal causal attention mask: packed examples must not attend across each
-    other's boundary (a naive concat would let example B see example A's tokens).
-  - per-example position reset: every packed segment gets local position ids 0..len-1,
-    matching what it sees unpacked / at inference time.
-  - the next-token target at the LAST position of every packed segment is excluded from
-    the loss: under block-diagonal attention that position structurally cannot see the
-    next example, so "predicting" its first token is not a learnable, meaningful signal.
+No <CARRY> handling. Tria's temporal refeed runs on its normal dense grid,
+exactly like pretrain -- SFT does not place, mask, or otherwise think about
+<CARRY> at all. (If that ever changes, it belongs back in here as a targeted
+addition, not as the default.)
 
-Both attn_mask and position_ids are threaded through loomformer.Model.forward (added
-there for this purpose); passing neither reproduces the exact pretrain path unchanged.
+Packing: multiple pre-tokenized examples per row instead of padding each to
+seq_len alone (real SFT examples are usually much shorter than seq_len; a
+pad-to-seq_len batch wastes most of its compute on padding). Packing is
+block-diagonal, not a naive concat:
+  - packed examples cannot attend across each other's boundary
+  - every packed segment gets its own local position ids (0..len-1)
+  - the last position of every segment is excluded from the loss: under
+    block-diagonal attention it structurally cannot see the next example, so
+    "predicting" that example's first token is not a learnable signal.
 
 CLI:
   loomsft.py --sft-dataset train.jsonl --config sft.yaml --init-checkpoint pretrain.pt \
@@ -32,10 +42,11 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
+import queue
 import random
+import threading
 import time
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
@@ -87,10 +98,84 @@ def validate_example(ex: Dict, line_ctx: str = "") -> None:
             open_calls.discard(tcid)
 
 
+def _iter_jsonl(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            yield lineno, raw
+
+
+def _iter_examples(path: str):
+    """Reads jsonl OR a HF-style .arrow file with a 'messages' column (same
+    dual-format convenience as loomformer's own dataset loading) -- but always
+    the sft_format.json schema either way."""
+    if path.endswith(".arrow") or path.endswith(".feather"):
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+        with pa.memory_map(path, "r") as src:
+            try:
+                reader = ipc.open_file(src)
+            except pa.lib.ArrowInvalid:
+                src.seek(0)
+                reader = ipc.open_stream(src)
+            table = reader.read_all()
+        if "messages" not in table.column_names:
+            raise ValueError(f"{path}: expected a 'messages' column, got {table.column_names}")
+        for i, row in enumerate(table.column("messages").to_pylist(), 1):
+            yield i, {"messages": row}
+    else:
+        for lineno, raw in _iter_jsonl(path):
+            yield lineno, json.loads(raw)
+
+
 # ============================================================================
-# chat-template rendering: delegated to loomformer.ChatTemplate (single source
-# of truth shared with loomchat.py -- see chat_template.jinja).
+# preprocessing cache: render + tokenize once, hold pre-tokenized examples in
+# memory. This is the whole fix -- everything downstream of this function is
+# plain array bookkeeping, no per-example Python work left in the hot path.
 # ============================================================================
+
+class TokenizedExample:
+    __slots__ = ("ids", "mask")
+
+    def __init__(self, ids: np.ndarray, mask: np.ndarray):
+        self.ids = ids
+        self.mask = mask
+
+
+def preprocess_dataset(
+    path: str, chat: "lf.ChatTemplate", seq_len: int, verbose: bool = True,
+) -> List[TokenizedExample]:
+    t0 = time.time()
+    out: List[TokenizedExample] = []
+    n_seen = 0
+    n_dropped = 0
+    n_no_loss = 0
+    for line_ctx, ex in _iter_examples(path):
+        n_seen += 1
+        validate_example(ex, line_ctx=f"{path}:{line_ctx}: ")
+        ids, mask = chat.render_training_ids(ex["messages"], tools=ex.get("tools"))
+        # A packed row needs room for at least one more token after this example
+        # (the next segment, or the final target shift) -- same "> seq_len"
+        # boundary the old code used, just checked once here instead of per draw.
+        if len(ids) > seq_len - 1:
+            n_dropped += 1
+            continue
+        if not any(mask):
+            n_no_loss += 1
+            continue  # an example with zero loss-carrying tokens teaches nothing
+        out.append(TokenizedExample(np.asarray(ids, dtype=np.int32), np.asarray(mask, dtype=np.int8)))
+        if verbose and n_seen % 20000 == 0:
+            print(f"[loomsft] preprocessing {path}: {n_seen} read, {len(out)} kept "
+                  f"({time.time() - t0:.0f}s)", flush=True)
+    if not out:
+        raise ValueError(f"{path}: no examples fit within seq_len={seq_len} after validation/rendering")
+    if verbose:
+        print(f"[loomsft] preprocessed {path}: {len(out)} kept, {n_dropped} dropped "
+              f"(> seq_len-1={seq_len - 1} tokens), {n_no_loss} dropped (no loss-carrying "
+              f"tokens) -- {time.time() - t0:.0f}s total", flush=True)
+    return out
 
 
 # ============================================================================
@@ -100,8 +185,8 @@ def validate_example(ex: Dict, line_ctx: str = "") -> None:
 class PackedRow:
     __slots__ = ("ids", "loss_mask", "position_ids", "seg_id")
 
-    def __init__(self, T: int):
-        self.ids = np.zeros(T, dtype=np.int64)
+    def __init__(self, T: int, pad_id: int):
+        self.ids = np.full(T, pad_id, dtype=np.int64)
         self.loss_mask = np.zeros(T, dtype=np.int64)
         self.position_ids = np.zeros(T, dtype=np.int64)
         self.seg_id = np.full(T, -1, dtype=np.int64)  # -1 = padding, never attended across
@@ -117,243 +202,168 @@ def _need_pad_id(tok) -> int:
     return tid
 
 
-# ============================================================================
-# <CARRY> placement: loomformer.Model._forward_chunked now cuts a training
-# chunk wherever <CARRY> sits (spec: "if <CARRY> then refeed", no fixed grid --
-# see loomformer.py's chunk-boundary comment). This is the SFT-side half of
-# that contract: place <CARRY> by turn/content density, not by a token-count
-# grid, while never firing it closer than CARRY_MIN_GAP tokens apart (a
-# denser explicit refeed schedule buys nothing but chunk-count blowup).
-# ============================================================================
+class Packer:
+    """Greedy first-fit packing over an in-memory pool of already-tokenized
+    examples. Holds a shuffled permutation of the pool and walks it; reshuffles
+    and starts over once exhausted (a fresh "epoch" of example ORDER -- the
+    pool itself, and every example's tokenization, is fixed and was computed
+    exactly once in preprocess_dataset)."""
 
-CARRY_MIN_GAP = 48        # spec: never fire <CARRY> more often than every 48 tokens
-# datasets/sft/train.jsonl: mean assistant turn ~930 tok, median ~980 (p90 1402) --
-# each explicit <CARRY> forces its own chunk boundary in _forward_chunked, and
-# those chunks are daisy-chained through accT_seed (not independent regions), so
-# a too-dense internal stride multiplies backward-graph memory instead of the
-# usual grad-checkpointing win. 256 gives ~3-4 internal refeeds across a
-# median-length response instead of ~10.
-CARRY_TARGET_STRIDE = 256  # density target inside long assistant spans, floor-clamped to CARRY_MIN_GAP
-
-
-def _insert_carry_tokens(
-    ids: List[int], mask: List[int], im_end_id: int, carry_id: int,
-    min_gap: int = CARRY_MIN_GAP, target_stride: int = CARRY_TARGET_STRIDE,
-) -> Tuple[List[int], List[int]]:
-    """Places <CARRY> right after every AGENT (assistant) turn -- never after
-    user/system/tool turns -- and, inside assistant spans longer than
-    target_stride, at ~target_stride-token intervals within the response
-    itself (dense token streams, not a fixed grid). Never places two <CARRY>
-    closer than min_gap tokens. Loss mask of an inserted <CARRY> inherits from
-    its neighbors: 1 only if it sits inside an assistant-authored span (both
-    neighbors loss-carrying), 0 at turn boundaries -- structural, like every
-    other template control token (<|im_start|>, role headers) that
-    render_training_ids never loss-masks."""
-    out_ids: List[int] = []
-    out_mask: List[int] = []
-    since_last = min_gap  # a <CARRY> is allowed right at the first eligible boundary
-    n = len(ids)
-    for k in range(n):
-        out_ids.append(ids[k])
-        out_mask.append(mask[k])
-        since_last += 1
-        if k == n - 1:
-            continue
-        # mask[k] == 1 on an <|im_end|> means render_training_ids counted THIS
-        # turn as assistant-authored (it includes the closing <|im_end|> itself
-        # in the loss span) -- i.e. this is an agent turn's end, not any turn's.
-        turn_boundary = ids[k] == im_end_id and mask[k] == 1
-        dense_point = (
-            mask[k] == 1 and mask[k + 1] == 1 and since_last >= target_stride
-        )
-        if (turn_boundary or dense_point) and since_last >= min_gap:
-            carry_loss = 1 if (mask[k] == 1 and mask[k + 1] == 1) else 0
-            out_ids.append(carry_id)
-            out_mask.append(carry_loss)
-            since_last = 0
-    return out_ids, out_mask
-
-
-class SFTPackedStream:
-    """Streams an sft.md-shaped jsonl -- never materializes the whole file (a
-    training corpus is not guaranteed to be "eval/train-sft sized"; it needs to
-    scale the same way loomformer.py's on-the-fly pretrain streams do). Render +
-    tokenize happens lazily, one line at a time, wrapping back to the start of
-    the file for additional epochs. Shuffling is a bounded reservoir buffer
-    (tf.data/WebDataset ShuffleBuffer pattern): memory is O(shuffle_buffer)
-    examples, not O(dataset) -- the only cost is buffer-local shuffling instead
-    of a true full-dataset shuffle, which is the standard, correct trade-off at
-    this scale."""
-
-    def __init__(self, path: str, cfg: "lf.Config", tok, device: torch.device,
-                 shuffle: bool = True, shuffle_buffer: int = 4096):
-        self.cfg = cfg
-        self.tok = tok
-        self.device = device
-        self.pad_id = _need_pad_id(tok)
-        self.chat = lf.ChatTemplate(tok)
-        self.carry_id = tok.special_id("<CARRY>")
-        if self.carry_id is None:
-            print("[loomsft] tokenizer has no <CARRY> token -- Tria temporal refeed stays on "
-                  "the implicit dense grid only (see loomformer.DEFAULT_SPECIAL_TOKENS)")
-        self.path = path
-        self._shuffle = shuffle
-        self._file = open(path, "r", encoding="utf-8")
-        self._n_seen = 0
-        self.n_dropped = 0
-
-        self._buffer: List[Tuple[List[int], List[int]]] = []
+    def __init__(self, pool: List[TokenizedExample], seq_len: int, pad_id: int,
+                 shuffle: bool, seed: int = 0):
+        if not pool:
+            raise ValueError("empty example pool")
+        self.pool = pool
+        self.T = seq_len
+        self.pad_id = pad_id
+        self.shuffle = shuffle
+        self._rng = random.Random(seed)
+        self._order = list(range(len(pool)))
         if shuffle:
-            # Prime the reservoir once up front so even the very first draws are
-            # already buffer-shuffled, not a suspiciously-sequential prefix.
-            cap = max(1, int(shuffle_buffer))
-            for _ in range(cap):
-                ex = self._read_and_render_one()
-                if ex is None:  # dataset smaller than the buffer: that's fine, just stop
-                    break
-                self._buffer.append(ex)
-        if not self._buffer and not shuffle:
-            # Sequential (val) mode never fills a buffer; just prove the file
-            # has at least one usable example before training starts on it.
-            probe = self._read_and_render_one()
-            if probe is None:
-                raise ValueError(f"{path}: no examples fit within seq_len={cfg.seq_len}")
-            self._buffer.append(probe)
-        elif not self._buffer:
-            raise ValueError(f"{path}: no examples fit within seq_len={cfg.seq_len}")
+            self._rng.shuffle(self._order)
+        self._cursor = 0
 
-    def _read_and_render_one(self) -> Optional[Tuple[List[int], List[int]]]:
-        """Reads forward from the current file position, transparently wrapping
-        to the start for additional epochs. Returns None only if an entire pass
-        over the file produced not a single example that fits seq_len."""
-        wrapped = False
-        while True:
-            raw = self._file.readline()
-            if not raw:
-                if wrapped:
-                    return None
-                self._file.seek(0)
-                wrapped = True
-                continue
-            raw = raw.strip()
-            if not raw:
-                continue
-            self._n_seen += 1
-            ex = json.loads(raw)
-            validate_example(ex, line_ctx=f"{self.path}:{self._n_seen}: ")
-            # One rendered example == one packed segment. ChatTemplate prepends
-            # <bos> (the same fixed position-0 attention-sink anchor pretraining
-            # uses) inside render_text, so it lands at LOCAL position 0 of every
-            # segment once _pack_one_row resets position_ids per segment below --
-            # not just once at the front of the whole packed row.
-            ids, mask = self.chat.render_training_ids(ex["messages"], tools=ex.get("tools"))
-            if self.carry_id is not None:
-                ids, mask = _insert_carry_tokens(ids, mask, self.chat.im_end_id, self.carry_id)
-            if len(ids) > self.cfg.seq_len:
-                self.n_dropped += 1  # longer than one packed row: dropped, not silently
-                continue             # truncated mid tool-call / mid answer.
-            return ids, mask
+    def _next_example(self) -> TokenizedExample:
+        if self._cursor >= len(self._order):
+            self._cursor = 0
+            if self.shuffle:
+                self._rng.shuffle(self._order)
+        ex = self.pool[self._order[self._cursor]]
+        self._cursor += 1
+        return ex
 
-    def _next_example(self) -> Tuple[List[int], List[int]]:
-        if not self._shuffle:
-            ex = self._read_and_render_one()
-            return ex if ex is not None else self._buffer[0]  # single-example fallback, see __init__
-        nxt = self._read_and_render_one()
-        if nxt is None:
-            # Dataset exhausted and smaller than the buffer itself: sample straight
-            # from what the reservoir already holds instead of stalling forever.
-            return self._buffer[random.randrange(len(self._buffer))]
-        i = random.randrange(len(self._buffer))
-        out = self._buffer[i]
-        self._buffer[i] = nxt
-        return out
-
-    def _pack_one_row(self) -> PackedRow:
-        T = self.cfg.seq_len
-        row = PackedRow(T)
-        row.ids[:] = self.pad_id
+    def pack_one_row(self) -> PackedRow:
+        T = self.T
+        row = PackedRow(T, self.pad_id)
         cursor = 0
         seg = 0
-        guard = 0
+        # A single dataset pass already guarantees every example is <= T-1 tokens
+        # (preprocess_dataset dropped anything longer), so this can never spin:
+        # each iteration either places >=1 example or the row is full.
         while cursor < T:
-            guard += 1
-            if guard > 4 * T:  # pathological: examples that never fit remaining space
-                break
-            ids, mask = self._next_example()
-            L = len(ids)
+            ex = self._next_example()
+            L = len(ex.ids)
             if cursor + L > T:
                 if cursor == 0:
-                    ids, mask = ids[:T], mask[:T]  # single example longer than a fresh
-                    L = T                          # row: truncate rather than spin forever
-                else:
-                    break
-            row.ids[cursor:cursor + L] = ids
-            row.loss_mask[cursor:cursor + L] = mask
+                    break  # unreachable given the preprocessing guarantee; defensive only
+                break
+            row.ids[cursor:cursor + L] = ex.ids
+            row.loss_mask[cursor:cursor + L] = ex.mask
             row.position_ids[cursor:cursor + L] = np.arange(L)
             row.seg_id[cursor:cursor + L] = seg
             cursor += L
             seg += 1
         return row
 
-    def sample_batch(self) -> Dict[str, torch.Tensor]:
-        B, T = self.cfg.batch_size, self.cfg.seq_len
-        rows = [self._pack_one_row() for _ in range(B)]
-        ids = np.stack([r.ids for r in rows])              # (B,T)
-        loss_mask = np.stack([r.loss_mask for r in rows])   # (B,T)
-        pos = np.stack([r.position_ids for r in rows])      # (B,T)
-        seg = np.stack([r.seg_id for r in rows])            # (B,T)
+    def sample_batch(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
+        rows = [self.pack_one_row() for _ in range(batch_size)]
+        ids = np.stack([r.ids for r in rows])
+        loss_mask = np.stack([r.loss_mask for r in rows])
+        pos = np.stack([r.position_ids for r in rows])
+        seg = np.stack([r.seg_id for r in rows])
 
-        x = torch.from_numpy(ids[:, :-1]).to(self.device)
-        y = torch.from_numpy(ids[:, 1:]).to(self.device)
-        pos_ids = torch.from_numpy(pos[:, :-1]).to(self.device)
-        # target loss at position i predicts token i+1: valid only if (a) the TARGET
-        # token is an assistant-loss token, AND (b) i and i+1 are the same segment (else
-        # the model is being asked to predict across a boundary it cannot attend across).
-        seg_t = torch.from_numpy(seg).to(self.device)
+        x = torch.from_numpy(ids[:, :-1]).to(device)
+        y = torch.from_numpy(ids[:, 1:]).to(device)
+        pos_ids = torch.from_numpy(pos[:, :-1]).to(device)
+        seg_t = torch.from_numpy(seg).to(device)
         same_seg = (seg_t[:, :-1] == seg_t[:, 1:])
-        loss_valid = torch.from_numpy(loss_mask[:, 1:]).to(self.device).bool() & same_seg
+        loss_valid = torch.from_numpy(loss_mask[:, 1:]).to(device).bool() & same_seg
         y_masked = torch.where(loss_valid, y, torch.full_like(y, IGNORE_INDEX))
 
-        seg_x = seg_t[:, :-1]                               # (B,T-1)
-        allowed = (seg_x[:, None, :, None] == seg_x[:, None, None, :])         # (B,1,T-1,T-1)
-        causal = torch.tril(torch.ones(seg_x.shape[1], seg_x.shape[1], dtype=torch.bool, device=self.device))
+        seg_x = seg_t[:, :-1]
+        allowed = (seg_x[:, None, :, None] == seg_x[:, None, None, :])
+        causal = torch.tril(torch.ones(seg_x.shape[1], seg_x.shape[1], dtype=torch.bool, device=device))
         attn_mask = allowed & causal[None, None]
         return {"x": x, "y": y_masked, "position_ids": pos_ids, "attn_mask": attn_mask, "seg_id": seg_x}
 
-    async def _produce(self, queue: "asyncio.Queue", n: int):
-        loop = asyncio.get_event_loop()
-        for _ in range(n):
-            batch = await loop.run_in_executor(None, self.sample_batch)
-            await queue.put(batch)
-        await queue.put(None)
 
-    async def batches(self, n: int):
-        # NOTE: a bare `await queue.get()` here would hang forever if _produce's
-        # background executor call ever raises (sample_batch's exception is stored
-        # on the producer Task and never surfaces until awaited) -- the consumer
-        # would sit blocked on the queue with zero CPU/GPU activity, silently,
-        # since the producer never reaches its final `queue.put(None)` sentinel
-        # either. Race queue.get() against the producer task itself so a producer
-        # exception is re-raised here immediately instead of deadlocking.
-        queue: asyncio.Queue = asyncio.Queue(maxsize=4)
-        producer = asyncio.create_task(self._produce(queue, n))
+def print_sft_header(cfg: "lf.Config", device: torch.device, init_checkpoint: str,
+                     train_path: str, val_path: Optional[str]) -> None:
+    """1:1 with loomformer.print_architecture_report, plus SFT-specific fields
+    (init checkpoint, train/val dataset paths)."""
+    width = 64
+    rule = "=" * width
+    print(rule)
+    print(f" LoomSFT  ·  {device}  ·  amp={lf.AMP_DTYPE}  ·  init={init_checkpoint}")
+    print(rule)
+    grp = f"x{lf.GQA_GROUP_SIZE}" if lf.GQA_GROUP_SIZE else "x1"
+    print(f"  shape    d_model={lf.N}  heads={lf.N_Q_HEADS}q/{lf.N_KV_HEADS}kv({grp})  "
+          f"head_dim={lf.HEAD_DIM}  layers={lf.LAYERS}")
+    print(f"  ffn      hidden={lf.HIDDEN}  phase={lf.PHASE_SECTORS}  attn={lf.ATTN_IMPL}")
+    print(f"  rope     yarn  theta={lf.ROPE_THETA:g}  factor={lf.ROPE_FACTOR:g}x  "
+          f"orig_len={lf.ROPE_ORIGINAL_SEQ_LEN}")
+    if lf.HEAD_DIM < 8:
+        print(f"  WARNING: head_dim={lf.HEAD_DIM} is extremely small for LM attention.")
+    print(f"  train    {train_path}")
+    print(f"  val      {val_path}" if val_path else "  val      (none -- training loss only)")
+
+
+def print_sft_training_budget(cfg: "lf.Config", model, train_pool: List[TokenizedExample]) -> None:
+    """Same shape as loomformer.print_training_budget, but every number here
+    comes from the ACTUAL preprocessed pool (real render+tokenize output),
+    not an estimate -- this only makes sense printed after preprocess_dataset,
+    never before it."""
+    pool_tokens = int(sum(len(ex.ids) for ex in train_pool))
+    pool_loss_tokens = int(sum(int(ex.mask.sum()) for ex in train_pool))
+    accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+    tokens_per_step = int(cfg.batch_size) * int(cfg.seq_len) * accum_steps
+    run_tokens = int(cfg.steps) * tokens_per_step
+    run_epochs = run_tokens / max(1, pool_tokens)
+    print(f"  budget   {run_tokens:,} tokens over {cfg.steps:,} steps "
+          f"({run_epochs:.3f} epochs of {pool_tokens:,} pool tokens, "
+          f"{len(train_pool):,} examples)")
+    params = lf.count_params(model)
+    tpp = run_tokens / max(1, params)
+    epoch_tokens_per_param = pool_tokens / max(1, params)
+    print(f"           loomformer: {params:,} params  ·  {tpp:.1f} tok/param  ·  "
+          f"{epoch_tokens_per_param:.1f} data-tok/param")
+    loss_frac = pool_loss_tokens / max(1, pool_tokens)
+    avg_ex_len = pool_tokens / max(1, len(train_pool))
+    packing_eff = avg_ex_len / max(1, int(cfg.seq_len))
+    print(f"           pool: {pool_loss_tokens:,} loss-carrying tokens ({loss_frac:.1%} of pool)  ·  "
+          f"avg example {avg_ex_len:.0f} tok  ·  ~{packing_eff:.1%} of a bare row before packing gains")
+
+
+class BatchPrefetcher:
+    """Packing (Python loop over segments + broadcasting the block-diagonal
+    mask) is real CPU work, and without overlap the GPU sits idle for exactly
+    that long on EVERY step -- a wave in GPU utilization at the per-step
+    period, not something that shows up in a log averaged every log_every
+    steps. One background thread stays one batch ahead in a bounded queue;
+    the training loop only ever waits on a queue.get(), which returns
+    immediately once the GPU is done with the previous step's forward/backward
+    (i.e. the two overlap instead of serializing)."""
+
+    def __init__(self, packer: Packer, batch_size: int, device: torch.device, depth: int = 2):
+        self.packer = packer
+        self.batch_size = batch_size
+        self.device = device
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(1, depth))
+        self._stop = threading.Event()
+        self._err: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
         try:
-            while True:
-                get_task = asyncio.ensure_future(queue.get())
-                done, _pending = await asyncio.wait(
-                    {get_task, producer}, return_when=asyncio.FIRST_COMPLETED)
-                if get_task in done:
-                    batch = get_task.result()
-                    if batch is None:
-                        break
-                    yield batch
-                else:
-                    get_task.cancel()
-                    producer.result()  # re-raises the producer's exception, if any
-                    break
-        finally:
-            if not producer.done():
-                producer.cancel()
+            while not self._stop.is_set():
+                batch = self.packer.sample_batch(self.batch_size, self.device)
+                self._q.put(batch)
+        except BaseException as e:  # noqa: BLE001 -- must reach the consumer, not vanish in the thread
+            self._err = e
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def next(self) -> Dict[str, torch.Tensor]:
+        batch = self._q.get()
+        if batch is None and self._err is not None:
+            raise RuntimeError("BatchPrefetcher background thread failed") from self._err
+        return batch
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 # ============================================================================
@@ -361,11 +371,12 @@ class SFTPackedStream:
 # ============================================================================
 
 @torch.no_grad()
-def eval_sft(model: torch.nn.Module, stream: SFTPackedStream, device: torch.device, n_batches: int = 8) -> float:
+def eval_sft(model: torch.nn.Module, packer: Packer, batch_size: int,
+             device: torch.device, n_batches: int = 8) -> float:
     model.eval()
     tot_loss, tot_tok = 0.0, 0
     for _ in range(n_batches):
-        b = stream.sample_batch()
+        b = packer.sample_batch(batch_size, device)
         with lf.amp_autocast(device):
             logits = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"])
         model.last_tria_depth_carry = None
@@ -382,7 +393,7 @@ def eval_sft(model: torch.nn.Module, stream: SFTPackedStream, device: torch.devi
     return tot_loss / max(1, tot_tok)
 
 
-async def train_sft_async(
+def train_sft(
     cfg: "lf.Config",
     train_path: str,
     val_path: Optional[str],
@@ -394,68 +405,70 @@ async def train_sft_async(
     tok = lf.build_tokenizer(cfg)
     # Must run before apply_config: otherwise tria_temporal_auto recalibrates a
     # fresh W/alpha instead of the geometry init_checkpoint's Tria carry was
-    # actually trained under (same ordering as loomformer.train_async).
+    # actually trained under (same ordering loomformer.train_async uses).
     lf.restore_temporal_tria_from_checkpoint(cfg, init_checkpoint)
     lf.apply_config(cfg)
+    chat = lf.ChatTemplate(tok)
+    pad_id = _need_pad_id(tok)
 
     model = lf.Model().to(device)
     lf.load_model_checkpoint(model, init_checkpoint, ablation=False, device=device)
-    # SFT: refeed fires ONLY on explicit <CARRY>, never on the pretrain-only dense
-    # W-token deadline -- the model has no fixed-grid dependency to begin with.
-    model.tria_hard_fire_enabled = False
 
-    train_stream = SFTPackedStream(train_path, cfg, tok, device, shuffle=True)
-    val_stream = SFTPackedStream(val_path, cfg, tok, device, shuffle=False) if val_path else None
+    train_pool = preprocess_dataset(train_path, chat, cfg.seq_len)
+    train_packer = Packer(train_pool, cfg.seq_len, pad_id, shuffle=True, seed=cfg.seed)
+    val_packer = None
+    if val_path:
+        val_pool = preprocess_dataset(val_path, chat, cfg.seq_len)
+        val_packer = Packer(val_pool, cfg.seq_len, pad_id, shuffle=False, seed=cfg.seed)
+
+    print_sft_header(cfg, device, init_checkpoint, train_path, val_path)
+    print_sft_training_budget(cfg, model, train_pool)
+    print("=" * 64)
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt_cls, opt_name = lf.optimizer_class_from_name(getattr(cfg, "optimizer", "adamw"))
     opt = opt_cls(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    n_params = lf.count_params(model)
-    print(f"--- loomsft ({n_params:,} params | init={init_checkpoint} | train={train_path} | "
-          f"val={val_path or 'none'}) ---")
-
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+    prefetcher = BatchPrefetcher(train_packer, cfg.batch_size, device, depth=max(2, accum_steps // 4 + 1))
     step = 0
     trias_since_log = torch.zeros((), dtype=torch.long, device=device)
     t0 = time.time()
     opt.zero_grad(set_to_none=True)
-    micro = 0
-    loss_sum = 0.0
-    batch_iter = train_stream.batches(int(cfg.steps) * accum_steps).__aiter__()
-    async for batch in batch_iter:
-        with lf.amp_autocast(device):
-            logits = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"])
-        loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), batch["y"].reshape(-1),
-                                ignore_index=IGNORE_INDEX)
-        if model.last_tria_fire_mask is not None:
-            with torch.no_grad():
-                trias_since_log.add_(model.last_tria_fire_mask.detach().sum())
-        (loss / accum_steps).backward()
-        model.last_tria_depth_carry = None
-        model.last_tria_fire_mask = None
-        model.last_tria_document_carry_stats = None
-        loss_sum += float(loss.item())
-        micro += 1
-        if micro < accum_steps:
-            continue
-        torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        lr = lf.lr_at(cfg, step)
-        for g in opt.param_groups:
-            g["lr"] = lr
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        train_loss = loss_sum / micro
-        micro = 0
-        loss_sum = 0.0
-        if step % cfg.log_every == 0:
-            trias_log = int(trias_since_log.item())
-            trias_since_log.zero_()
-            msg = f"[loomsft] step {step:6d}  train_loss {train_loss:.4f}  trias: {trias_log:d}  lr {lr:.2e}  ({time.time()-t0:.0f}s)"
-            if val_stream is not None and step % (cfg.log_every * 5) == 0:
-                msg += f"  eval_loss {eval_sft(model, val_stream, device):.4f}"
-            print(msg)
-        step += 1
+    try:
+        while step < int(cfg.steps):
+            loss_sum = 0.0
+            for micro in range(accum_steps):
+                batch = prefetcher.next()
+                with lf.amp_autocast(device):
+                    logits = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"])
+                loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), batch["y"].reshape(-1),
+                                        ignore_index=IGNORE_INDEX)
+                if model.last_tria_fire_mask is not None:
+                    with torch.no_grad():
+                        trias_since_log.add_(model.last_tria_fire_mask.detach().sum())
+                (loss / accum_steps).backward()
+                model.last_tria_depth_carry = None
+                model.last_tria_fire_mask = None
+                model.last_tria_document_carry_stats = None
+                loss_sum += float(loss.item())
+            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            lr = lf.lr_at(cfg, step)
+            for g in opt.param_groups:
+                g["lr"] = lr
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            train_loss = loss_sum / accum_steps
+            if step % cfg.log_every == 0:
+                trias_log = int(trias_since_log.item())
+                trias_since_log.zero_()
+                msg = f"[loomsft] step {step:6d}  train_loss {train_loss:.4f}  trias: {trias_log:d}  lr {lr:.2e}  ({time.time()-t0:.0f}s)"
+                if val_packer is not None and step % (cfg.log_every * 5) == 0:
+                    msg += f"  eval_loss {eval_sft(model, val_packer, cfg.batch_size, device):.4f}"
+                print(msg, flush=True)
+            step += 1
+    finally:
+        prefetcher.stop()
 
     torch.save({"cfg": asdict(cfg), "model_kind": "loomformer", "ffn_type": "paraplex",
                 "ablation": False, "model": model.state_dict()}, ckpt_out)
@@ -469,7 +482,7 @@ async def train_sft_async(
 def smoke_test() -> None:
     import tempfile
 
-    cfg = lf.Config(vocab=256, seq_len=64, batch_size=2, model_dim=16, n_q_heads=2,
+    cfg = lf.Config(vocab=256, seq_len=320, batch_size=2, model_dim=16, n_q_heads=2,
                      head_dim=8, n_kv_heads=1, hidden=32, layers=1,
                      steps=3, warmup_steps=1, log_every=1)
     lf.apply_config(cfg)
@@ -510,11 +523,16 @@ def smoke_test() -> None:
     assert parsed and parsed[0]["function"]["name"] == "f"
     print(f"[smoke] ChatTemplate.parse_tool_calls OK: {parsed}")
 
+    pool = preprocess_dataset(sft_path, chat, cfg.seq_len, verbose=False)
+    assert len(pool) == 2
+    print(f"[smoke] preprocess_dataset OK: {len(pool)} examples cached")
+
     dev = lf.device_auto("cpu")
-    stream = SFTPackedStream(sft_path, cfg, tok, dev, shuffle=True)
-    b = stream.sample_batch()
-    assert b["x"].shape == (2, 63) and b["y"].shape == (2, 63)
-    assert b["attn_mask"].shape == (2, 1, 63, 63)
+    pad_id = _need_pad_id(tok)
+    packer = Packer(pool, cfg.seq_len, pad_id, shuffle=True, seed=0)
+    b = packer.sample_batch(2, dev)
+    assert b["x"].shape == (2, cfg.seq_len - 1) and b["y"].shape == (2, cfg.seq_len - 1)
+    assert b["attn_mask"].shape == (2, 1, cfg.seq_len - 1, cfg.seq_len - 1)
     print(f"[smoke] packing OK: x={tuple(b['x'].shape)} attn_mask={tuple(b['attn_mask'].shape)} "
           f"loss_tokens={(b['y'] != IGNORE_INDEX).sum().item()}")
 
@@ -525,23 +543,23 @@ def smoke_test() -> None:
     assert torch.isfinite(loss)
     print(f"[smoke] forward with packed attn_mask/position_ids OK, loss={loss.item():.4f}")
 
-    # cross-segment isolation, empirically: perturbing segment 0's tokens must not change
-    # segment 1's logits AT ALL under the block-diagonal mask.
-    seg = stream._pack_one_row()
-    ids_t = torch.from_numpy(seg.ids[None, :-1]).to(dev)
-    pos_t = torch.from_numpy(seg.position_ids[None, :-1]).to(dev)
-    seg_t = torch.from_numpy(seg.seg_id[None, :-1])
+    # cross-segment isolation, empirically: perturbing segment 0's tokens must not
+    # change segment 1's logits AT ALL under the block-diagonal mask.
+    seg_row = packer.pack_one_row()
+    ids_t = torch.from_numpy(seg_row.ids[None, :-1]).to(dev)
+    pos_t = torch.from_numpy(seg_row.position_ids[None, :-1]).to(dev)
+    seg_t = torch.from_numpy(seg_row.seg_id[None, :-1])
     same = seg_t[:, None, :, None] == seg_t[:, None, None, :]
     causal = torch.tril(torch.ones(ids_t.shape[1], ids_t.shape[1], dtype=torch.bool))
     amask = (same & causal[None, None]).to(dev)
     with torch.no_grad():
         base = model(ids_t, attn_mask=amask, position_ids=pos_t)
         ids2 = ids_t.clone()
-        first_seg_len = int((seg.seg_id == 0).sum())
+        first_seg_len = int((seg_row.seg_id == 0).sum())
         if first_seg_len > 0:
             ids2[0, :first_seg_len] = (ids2[0, :first_seg_len] + 1) % lf.VOCAB
             other = model(ids2, attn_mask=amask, position_ids=pos_t)
-            later = seg.seg_id[:-1] != 0
+            later = seg_row.seg_id[:-1] != 0
             if later.any():
                 delta = (base[0, later] - other[0, later]).abs().max().item()
                 assert delta < 1e-4, f"packed segments are NOT isolated: max delta {delta}"
@@ -577,7 +595,7 @@ def main() -> None:
 
     assert args.sft_dataset, "--sft-dataset is required"
     assert args.init_checkpoint, "--init-checkpoint is required (SFT starts from a pretrained LoomFormer checkpoint)"
-    asyncio.run(train_sft_async(cfg, args.sft_dataset, args.val_dataset, args.init_checkpoint, dev, args.checkpoint))
+    train_sft(cfg, args.sft_dataset, args.val_dataset, args.init_checkpoint, dev, args.checkpoint)
 
 
 if __name__ == "__main__":

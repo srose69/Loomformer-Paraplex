@@ -1,0 +1,66 @@
+{
+  "name": "loomsft",
+  "description": "Canonical SFT input schema for loomsft.py. One JSON object per line (jsonl). OpenAI-style messages with first-class tool-calling (tool_calls / tool_call_id), the convention adopted broadly across HF transformers, vLLM, and TRL -- not invented here.",
+  "source_url": null,
+  "format": "jsonl",
+  "columns": {
+    "messages": {
+      "type": "list<dict>",
+      "description": "Ordered conversation turns. Required, non-empty.",
+      "fields": {
+        "role": {
+          "type": "string",
+          "description": "One of: system, user, assistant, tool. Exactly the OpenAI chat-completions role set."
+        },
+        "content": {
+          "type": "string|null",
+          "description": "Turn text. null is valid ONLY on an assistant turn that carries tool_calls instead of (or in addition to) text -- see tool_calls below."
+        },
+        "tool_calls": {
+          "type": "list<dict>|null",
+          "description": "assistant-role only. Function calls the model makes this turn. Absent/null on all other roles.",
+          "fields": {
+            "id": {
+              "type": "string",
+              "description": "Call id. The tool-role turn answering this call must echo it back in tool_call_id."
+            },
+            "type": {
+              "type": "string",
+              "description": "Always 'function' today (OpenAI convention; the field exists so other tool types can be added later without a schema break)."
+            },
+            "function": {
+              "type": "dict",
+              "description": "{'name': string, 'arguments': string}. 'arguments' is a JSON-ENCODED STRING (matches OpenAI/HF exactly), not a nested object -- this is deliberate: the model must learn to emit valid JSON text, and training on a pre-parsed object would hide that."
+            }
+          }
+        },
+        "tool_call_id": {
+          "type": "string|null",
+          "description": "tool-role only. Must equal the id of the tool_calls entry this turn is the result of. Absent/null on all other roles."
+        }
+      }
+    },
+    "tools": {
+      "type": "list<dict>|null",
+      "description": "Optional, top-level (per-example, not per-turn). Function/tool definitions available in this conversation, OpenAI function-calling schema. Omit entirely for examples with no tool access rather than passing an empty list -- the renderer treats the two differently (see sft.md).",
+      "fields": {
+        "type": { "type": "string", "description": "Always 'function' today." },
+        "function": {
+          "type": "dict",
+          "description": "{'name': string, 'description': string, 'parameters': <JSON Schema object>}"
+        }
+      }
+    }
+  },
+  "validation": {
+    "required_columns": ["messages"],
+    "messages_min_length": 1,
+    "role_enum": ["system", "user", "assistant", "tool"],
+    "rules": [
+      "messages[0].role must be 'system' or 'user' (never 'assistant' or 'tool' -- nothing precedes them to respond to).",
+      "every tool-role turn's tool_call_id must match the id of a tool_calls entry in a PRECEDING assistant turn.",
+      "content may be null on an assistant turn ONLY if tool_calls is present and non-empty on that same turn.",
+      "content must be a non-null string on every system/user/tool turn."
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+{#-
+  loomformer chat template (Jinja2 -- same mechanism HF/vLLM/TRL use, stored as a
+  plain template string; see sft.md for the schema this renders).
+
+  Variables:
+    messages              -- list of {role, content, tool_calls?, tool_call_id?}
+    tools                 -- OPTIONAL. Presence vs absence is meaningful (see sft.md):
+                             pass the variable only when the source example's "tools"
+                             key was present at all; leave it undefined otherwise.
+    add_generation_prompt -- bool. Append an open "<|im_start|>assistant\n" with no
+                             content/close tag, so the model continues it (inference).
+    bos_token             -- OPTIONAL literal text of the <bos> token.
+
+  ChatML turn shape: <|im_start|>ROLE\n...<|im_end|>\n for every turn, matching
+  DEFAULT_SPECIAL_TOKENS in loomformer.py. Tool calls render as
+  <tool_call>\n{"name":...,"arguments":...}\n</tool_call> inside the assistant turn
+  that makes them; tool results render as <tool_response>\n...\n</tool_response>
+  inside a turn with role "tool".
+
+  NOTE: every {{ }} block below is kept SEPARATE around any `| tojson` value on
+  purpose -- concatenating a tojson Markup object with a plain string via `+`
+  makes MarkupSafe HTML-escape the plain part (this is a text prompt, not HTML;
+  that escaping is pure corruption here, not a stylistic choice).
+-#}
+{%- if bos_token %}{{ bos_token }}{%- endif -%}
+{%- set has_tools_key = tools is defined -%}
+{%- if has_tools_key -%}
+  {%- if messages[0].role == 'system' -%}
+    {{ '<|im_start|>system\n' }}{{ messages[0].content }}
+    {%- if tools -%}
+      {{ '\n\nYou have access to the following tools:\n' }}{{ tools | tojson }}
+    {%- else -%}
+      {{ '\n\nYou have no tools available for this conversation.' }}
+    {%- endif -%}
+    {{ '<|im_end|>\n' }}
+    {%- set messages = messages[1:] -%}
+  {%- else -%}
+    {{ '<|im_start|>system' }}
+    {%- if tools -%}
+      {{ '\n\nYou have access to the following tools:\n' }}{{ tools | tojson }}
+    {%- else -%}
+      {{ '\n\nYou have no tools available for this conversation.' }}
+    {%- endif -%}
+    {{ '<|im_end|>\n' }}
+  {%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- if message.role == 'assistant' -%}
+    {{ '<|im_start|>assistant\n' }}
+    {%- if message.content -%}{{ message.content }}{%- endif -%}
+    {%- for tc in (message.tool_calls or []) -%}
+      {{ '<tool_call>\n' }}{{ {'name': tc.function.name, 'arguments': tc.function.arguments} | tojson }}{{ '\n</tool_call>' }}
+    {%- endfor -%}
+    {{ '<|im_end|>\n' }}
+  {%- elif message.role == 'tool' -%}
+    {{ '<|im_start|>tool\n<tool_response>\n' }}{{ message.content }}{{ '\n</tool_response><|im_end|>\n' }}
+  {%- else -%}
+    {{ '<|im_start|>' }}{{ message.role }}{{ '\n' }}{{ message.content }}{{ '<|im_end|>\n' }}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {{ '<|im_start|>assistant\n' }}
+{%- endif -%}

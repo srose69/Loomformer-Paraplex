@@ -4205,6 +4205,18 @@ async def train_one_async(
     model_base = Model(ablation=ablation).to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
+
+    if TRIA_CARRY_ENABLED and len(model_base.blocks) > 0:
+        # Structurally dead edge parameters:
+        # block 0 never receives p_in; the final block never emits p_out.
+        model_base.blocks[0].ffn.identity_gate.raw_alpha.requires_grad_(False)
+        model_base.blocks[-1].ffn.gate_selector.logits.requires_grad_(False)
+        ddp_print(
+            "[tria] disabled structurally unused parameters: "
+            "blocks.0.ffn.identity_gate.raw_alpha, "
+            f"blocks.{len(model_base.blocks) - 1}.ffn.gate_selector.logits"
+        )
+
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
         grad_bytes = sum(p.numel() * p.element_size() for p in model_compiled.parameters() if p.requires_grad)

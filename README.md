@@ -1,6 +1,6 @@
 # LoomFormer-Paraplex
 
-LoomFormer: a Transformer LM built from Paraplex neurons.
+LoomFormer: a Transformer-based LM built from Paraplex neurons.
 
 Paraplex = the pseudo-complex paravector neuron (scalar+vector, Clifford Cl(0,n)
 paravector, behaves like a complex number). 
@@ -8,6 +8,9 @@ paravector, behaves like a complex number).
 LoomFormer = the architecture: normal causal GQA attention + Paraplex FFN + DepthAttn (AttnRes-style softmax-over-depth skip). 
 "Loom" for the pseudo-complex & pseudo paravector numbers; 
 "-former" for the... dunno. for the style.
+
+Tria.. too difficult to explain, but it works and useful! 
+Read the code tho
 
 Soon 
 

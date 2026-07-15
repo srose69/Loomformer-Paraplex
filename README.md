@@ -16,6 +16,7 @@ Soon
 
 Checkpoints here
 https://huggingface.co/srs6901/LoomFormer-Paraplex/
+(it converged! eval_loss 3.2438 bits/tok 4.6798 bpb 1.3228 on 120k steps from FSS1STR)
 
 SFT too slow for now, workin' on it, 
 BUT PT works! Enjoy 

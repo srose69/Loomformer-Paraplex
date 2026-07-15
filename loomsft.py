@@ -7,6 +7,9 @@ Consumes the jsonl schema documented in sft_format.json (OpenAI-style messages,
 with first-class tool_calls/tool_call_id). Does NOT convert other formats into
 this shape -- get your data there yourself.
 
+Design, rewritten from the ground up around one change: render+tokenize every
+example EXACTLY ONCE, up front, and never again.
+
 The previous version re-rendered the Jinja template and re-tokenized from raw
 JSON on every single batch draw, for the lifetime of training -- across many
 epochs over a fixed, static file, that is the same handful of megabytes of
@@ -232,6 +235,21 @@ class Packer:
         self._cursor += 1
         return ex
 
+    def fast_forward(self, n_rows: int) -> None:
+        """Advances the same RNG/cursor state that pack_one_row() would, without
+        building PackedRow objects or tensors -- used on --resume to skip past
+        already-seen draws cheaply (no torch, no numpy stacking, just the
+        example-order bookkeeping)."""
+        T = self.T
+        for _ in range(n_rows):
+            cursor = 0
+            while cursor < T:
+                ex = self._next_example()
+                L = len(ex.ids)
+                if cursor + L > T:
+                    break
+                cursor += L
+
     def pack_one_row(self) -> PackedRow:
         T = self.T
         row = PackedRow(T, self.pad_id)
@@ -400,19 +418,47 @@ def train_sft(
     init_checkpoint: str,
     device: torch.device,
     ckpt_out: str,
+    resume: Optional[str] = None,
+    resume_step: Optional[int] = None,
 ) -> None:
     lf.set_seed(cfg.seed)
     tok = lf.build_tokenizer(cfg)
+    weight_source = resume or init_checkpoint
     # Must run before apply_config: otherwise tria_temporal_auto recalibrates a
-    # fresh W/alpha instead of the geometry init_checkpoint's Tria carry was
-    # actually trained under (same ordering loomformer.train_async uses).
-    lf.restore_temporal_tria_from_checkpoint(cfg, init_checkpoint)
+    # fresh W/alpha instead of the geometry the checkpoint's Tria carry was
+    # actually trained under (same ordering loomformer.train_async uses). On
+    # --resume this reads from the SFT runpoint itself, not the original PT
+    # checkpoint -- by the time a runpoint is saved, tria_temporal_auto is
+    # already pinned False and the window/alpha are the resolved values, so
+    # either source agrees; using the runpoint keeps this 1:1 with pretrain's
+    # own resume path (restore_temporal_tria_from_checkpoint(cfg, resume)).
+    lf.restore_temporal_tria_from_checkpoint(cfg, weight_source)
     lf.apply_config(cfg)
     chat = lf.ChatTemplate(tok)
     pad_id = _need_pad_id(tok)
 
+    start_step = 0
+    if resume:
+        if resume_step is not None:
+            start_step = int(resume_step)
+        else:
+            _ckpt_step = torch.load(resume, map_location="cpu", weights_only=True).get("step", None)
+            if _ckpt_step is None:
+                print(f"[resume] WARNING: {resume!r} has no saved 'step' (older checkpoint) -- "
+                      f"defaulting to start_step=0. Pass --resume-step N to hard-set it.")
+            start_step = int(_ckpt_step or 0)
+        if start_step >= int(cfg.steps):
+            print(f"[resume] start_step={start_step} >= cfg.steps={cfg.steps} -- nothing to do, exiting.")
+            return
+        # The saved value is the LAST step that was completed and logged (this
+        # script logs/saves BEFORE incrementing its 0-indexed counter -- see the
+        # main loop below); resuming must continue at the next, not-yet-done
+        # step, or the first post-resume step would silently redo one already
+        # trained on.
+        start_step += 1
+
     model = lf.Model().to(device)
-    lf.load_model_checkpoint(model, init_checkpoint, ablation=False, device=device)
+    lf.load_model_checkpoint(model, weight_source, ablation=False, device=device)
 
     train_pool = preprocess_dataset(train_path, chat, cfg.seq_len)
     train_packer = Packer(train_pool, cfg.seq_len, pad_id, shuffle=True, seed=cfg.seed)
@@ -421,58 +467,100 @@ def train_sft(
         val_pool = preprocess_dataset(val_path, chat, cfg.seq_len)
         val_packer = Packer(val_pool, cfg.seq_len, pad_id, shuffle=False, seed=cfg.seed)
 
-    print_sft_header(cfg, device, init_checkpoint, train_path, val_path)
+    print_sft_header(cfg, device, weight_source, train_path, val_path)
     print_sft_training_budget(cfg, model, train_pool)
     print("=" * 64)
+
+    accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+
+    if resume and start_step > 0:
+        _n_replay = start_step * accum_steps * int(cfg.batch_size)
+        print(f"[resume] fast-forwarding Packer RNG by {_n_replay} row draws "
+              f"(start_step={start_step} * grad_accum_steps={accum_steps} * "
+              f"batch_size={cfg.batch_size}) to skip already-seen data...", flush=True)
+        train_packer.fast_forward(_n_replay)
+        print("[resume] fast-forward done.", flush=True)
+        print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
+              f"LR schedule/log step numbering continue.", flush=True)
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt_cls, opt_name = lf.optimizer_class_from_name(getattr(cfg, "optimizer", "adamw"))
     opt = opt_cls(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+    def _save_checkpoint(path_override: Optional[str] = None, at_step: int = 0) -> None:
+        save_path = path_override or ckpt_out
+        saved_cfg = asdict(cfg)
+        if saved_cfg.get("tria_temporal_window") is not None:
+            saved_cfg["tria_temporal_auto"] = False
+        torch.save(
+            {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
+             "ablation": False, "model": model.state_dict(), "step": at_step},
+            save_path,
+        )
+        print(f"[loomsft] saved -> {save_path}")
+
+    def _save_runpoint(at_step: int) -> None:
+        root, ext = os.path.splitext(ckpt_out)
+        ext = ext or ".pt"
+        fname = f"{os.path.basename(root)}.runpoint_step{at_step}{ext}"
+        if cfg.runpoints_path:
+            os.makedirs(cfg.runpoints_path, exist_ok=True)
+            runpoint_path = os.path.join(cfg.runpoints_path, fname)
+        else:
+            runpoint_path = f"{root}.runpoint_step{at_step}{ext}"
+        print(f"\n[runpoint] step {at_step}/{cfg.steps} -- saving, training continues.", flush=True)
+        _save_checkpoint(path_override=runpoint_path, at_step=at_step)
+
     prefetcher = BatchPrefetcher(train_packer, cfg.batch_size, device, depth=max(2, accum_steps // 4 + 1))
-    step = 0
+    step = start_step
     trias_since_log = torch.zeros((), dtype=torch.long, device=device)
     t0 = time.time()
     opt.zero_grad(set_to_none=True)
     try:
-        while step < int(cfg.steps):
-            loss_sum = 0.0
-            for micro in range(accum_steps):
-                batch = prefetcher.next()
-                with lf.amp_autocast(device):
-                    logits = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"])
-                loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), batch["y"].reshape(-1),
-                                        ignore_index=IGNORE_INDEX)
-                if model.last_tria_fire_mask is not None:
-                    with torch.no_grad():
-                        trias_since_log.add_(model.last_tria_fire_mask.detach().sum())
-                (loss / accum_steps).backward()
-                model.last_tria_depth_carry = None
-                model.last_tria_fire_mask = None
-                model.last_tria_document_carry_stats = None
-                loss_sum += float(loss.item())
-            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-            lr = lf.lr_at(cfg, step)
-            for g in opt.param_groups:
-                g["lr"] = lr
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            train_loss = loss_sum / accum_steps
-            if step % cfg.log_every == 0:
-                trias_log = int(trias_since_log.item())
-                trias_since_log.zero_()
-                msg = f"[loomsft] step {step:6d}  train_loss {train_loss:.4f}  trias: {trias_log:d}  lr {lr:.2e}  ({time.time()-t0:.0f}s)"
-                if val_packer is not None and step % (cfg.log_every * 5) == 0:
-                    msg += f"  eval_loss {eval_sft(model, val_packer, cfg.batch_size, device):.4f}"
-                print(msg, flush=True)
-            step += 1
+        with lf._GracefulInterrupt() as interrupt, lf._RunpointWatcher() as runpoint:
+            while step < int(cfg.steps):
+                loss_sum = 0.0
+                for micro in range(accum_steps):
+                    batch = prefetcher.next()
+                    with lf.amp_autocast(device):
+                        logits = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"])
+                    loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), batch["y"].reshape(-1),
+                                            ignore_index=IGNORE_INDEX)
+                    if model.last_tria_fire_mask is not None:
+                        with torch.no_grad():
+                            trias_since_log.add_(model.last_tria_fire_mask.detach().sum())
+                    (loss / accum_steps).backward()
+                    model.last_tria_depth_carry = None
+                    model.last_tria_fire_mask = None
+                    model.last_tria_document_carry_stats = None
+                    loss_sum += float(loss.item())
+                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+                lr = lf.lr_at(cfg, step)
+                for g in opt.param_groups:
+                    g["lr"] = lr
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                train_loss = loss_sum / accum_steps
+                if step % cfg.log_every == 0:
+                    trias_log = int(trias_since_log.item())
+                    trias_since_log.zero_()
+                    msg = f"[loomsft] step {step:6d}  train_loss {train_loss:.4f}  trias: {trias_log:d}  lr {lr:.2e}  ({time.time()-t0:.0f}s)"
+                    if val_packer is not None and step % (cfg.log_every * 5) == 0:
+                        msg += f"  eval_loss {eval_sft(model, val_packer, cfg.batch_size, device):.4f}"
+                    print(msg, flush=True)
+                if runpoint.consume() or (cfg.save_every and step > 0 and step % int(cfg.save_every) == 0):
+                    _save_runpoint(step)
+                if interrupt.requested:
+                    print(f"\n[interrupt] Ctrl-C at step {step}/{cfg.steps} -- saving a runpoint and stopping.",
+                          flush=True)
+                    _save_runpoint(step)
+                    step += 1
+                    break
+                step += 1
     finally:
         prefetcher.stop()
 
-    torch.save({"cfg": asdict(cfg), "model_kind": "loomformer", "ffn_type": "paraplex",
-                "ablation": False, "model": model.state_dict()}, ckpt_out)
-    print(f"[loomsft] saved -> {ckpt_out}")
+    _save_checkpoint(at_step=step)
 
 
 # ============================================================================
@@ -578,6 +666,12 @@ def main() -> None:
     ap.add_argument("--val-dataset", type=str, default=None)
     ap.add_argument("--init-checkpoint", type=str, default=None, help="pretrained LoomFormer checkpoint to start SFT from")
     ap.add_argument("--checkpoint", type=str, default="loomsft.pt")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="smart resume: load weights from an SFT runpoint, continue step count/LR "
+                         "schedule and skip already-seen data (optimizer state itself still restarts)")
+    ap.add_argument("--resume-step", type=int, default=None,
+                    help="override/hard-set the step to resume from, for runpoints saved before "
+                         "'step' was recorded (or to force a specific value)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--smoke-test", action="store_true")
@@ -594,8 +688,12 @@ def main() -> None:
     dev = lf.device_auto(device_pref)
 
     assert args.sft_dataset, "--sft-dataset is required"
-    assert args.init_checkpoint, "--init-checkpoint is required (SFT starts from a pretrained LoomFormer checkpoint)"
-    train_sft(cfg, args.sft_dataset, args.val_dataset, args.init_checkpoint, dev, args.checkpoint)
+    assert args.init_checkpoint or args.resume, (
+        "--init-checkpoint is required (SFT starts from a pretrained LoomFormer checkpoint), "
+        "unless --resume points at an existing SFT runpoint to continue instead"
+    )
+    train_sft(cfg, args.sft_dataset, args.val_dataset, args.init_checkpoint, dev, args.checkpoint,
+              resume=args.resume, resume_step=args.resume_step)
 
 
 if __name__ == "__main__":

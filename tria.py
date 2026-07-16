@@ -96,6 +96,11 @@ _cuda_tria_tried = False
 # CUDA fused tria is opt-in until forward/backward parity is validated on real GPU.
 # The PyTorch path is the reference implementation and is fully covered by self-tests.
 _CUDA_TRIA_ENABLED = os.environ.get("LOOM_TRIA_CUDA", "0").lower() in ("1", "true", "yes", "on")
+_TRIA_DISABLE_OPS = {
+    part.strip().lower().replace("-", "_")
+    for part in os.environ.get("LOOM_TRIA_DISABLE_OPS", "").split(",")
+    if part.strip()
+}
 
 # Fixed, non-learned carrier geometry. alpha is selected/configured by loomformer.py
 # (optionally by startup calibration); axis is supplied per depth layer. No tensor
@@ -150,6 +155,19 @@ def set_cuda_tria_enabled(enabled: bool) -> None:
 
 def cuda_tria_enabled() -> bool:
     return bool(_CUDA_TRIA_ENABLED)
+
+
+def _tria_cuda_op_enabled(name: str) -> bool:
+    key = name.strip().lower().replace("-", "_")
+    aliases = {
+        "temporal_endpoint": "temporal_carry_endpoint",
+        "temporal_carry_endpoint": "temporal_endpoint",
+    }
+    return (
+        _CUDA_TRIA_ENABLED
+        and key not in _TRIA_DISABLE_OPS
+        and aliases.get(key, "") not in _TRIA_DISABLE_OPS
+    )
 
 # CUDA source for the fused tria-step kernels now lives under kernels/tria/
 # -- one subfolder per kernel group (tria_init, tria_init_gate, tria_step,
@@ -511,7 +529,7 @@ class _TriaStepFused(torch.autograd.Function):
         r, i, o = r.contiguous(), i.contiguous(), o.contiguous()
         carry_previous = carry_previous.contiguous()
         tape = _active_depth_replay()
-        reverse = tape is not None and tape.current_index > 0
+        reverse = tape is not None and tape.current_index > 0 and _tria_cuda_op_enabled("depth_replay")
         if reverse:
             tape.bind_current(r, i, o, axis)
             # Same forward math as the plain path (tria_step_forward) -- the
@@ -584,7 +602,7 @@ class _TriaStepAndGateFused(torch.autograd.Function):
         r, i, o = r.contiguous(), i.contiguous(), o.contiguous()
         carry_previous, w = carry_previous.contiguous(), w.contiguous()
         tape = _active_depth_replay()
-        reverse = tape is not None and tape.current_index > 0
+        reverse = tape is not None and tape.current_index > 0 and _tria_cuda_op_enabled("depth_replay")
         if reverse:
             tape.bind_current(r, i, o, axis)
             # See _TriaStepFused.forward: same forward kernel, scale dropped.
@@ -752,7 +770,7 @@ def tria_init(
     """carry_1 = normalize(carrier_tria_1)."""
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
-    if _CUDA_TRIA_ENABLED and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda:
+    if _tria_cuda_op_enabled("init") and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda:
         fast_dtype = _tria_fast_dtype(r_1, i_1, o_1)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast = _cast_tria_args(fast_dtype, r_1, i_1, o_1)
@@ -784,7 +802,7 @@ def tria_init_seed(
     axis = _axis(axis)
     alpha = carrier_alpha()
     valid = seed_valid.to(device=r.device, dtype=torch.bool)
-    if _CUDA_TRIA_ENABLED and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda:
+    if _tria_cuda_op_enabled("init_seed") and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, seed)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast, seed_fast = _cast_tria_args(fast_dtype, r, i, o, seed)
@@ -803,7 +821,7 @@ def tria_init_seed_and_gate(
     axis = _axis(axis)
     alpha = carrier_alpha()
     valid = seed_valid.to(device=r.device, dtype=torch.bool)
-    if _CUDA_TRIA_ENABLED and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda and w.is_cuda:
+    if _tria_cuda_op_enabled("init_seed_gate") and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, seed, w)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast, seed_fast, w_fast = _cast_tria_args(
@@ -825,7 +843,7 @@ def tria_step(
     """carry_L = normalize(carrier_tria(r,i,o) @ carry_prev)."""
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
-    if _CUDA_TRIA_ENABLED and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda:
+    if _tria_cuda_op_enabled("step") and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, carry_prev)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast, carry_fast = _cast_tria_args(fast_dtype, r, i, o, carry_prev)
@@ -847,7 +865,7 @@ def tria_init_and_gate(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
-    if _CUDA_TRIA_ENABLED and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda and w.is_cuda:
+    if _tria_cuda_op_enabled("init_gate") and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r_1, i_1, o_1, w)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast, w_fast = _cast_tria_args(fast_dtype, r_1, i_1, o_1, w)
@@ -865,7 +883,7 @@ def tria_init_and_gate(
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_1, w):
         p_out = _graph_gate_slot_mix_op(carry_1, w)
     else:
-        p_out = _GateSlotMixFused.apply(carry_1, w) if _CUDA_TRIA_ENABLED and _cuda_slot_op_applicable(carry_1, w) else (tria_slots(carry_1) * w).sum(dim=-1)
+        p_out = _GateSlotMixFused.apply(carry_1, w) if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_1, w) else (tria_slots(carry_1) * w).sum(dim=-1)
     return _capture_depth_output(carry_1), p_out
 
 
@@ -875,7 +893,7 @@ def tria_step_and_gate(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
-    if _CUDA_TRIA_ENABLED and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda and w.is_cuda:
+    if _tria_cuda_op_enabled("step_gate") and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, carry_prev, w)
         if fast_dtype is not None:
             r_fast, i_fast, o_fast, carry_fast, w_fast = _cast_tria_args(fast_dtype, r, i, o, carry_prev, w)
@@ -893,7 +911,7 @@ def tria_step_and_gate(
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_new, w):
         p_out = _graph_gate_slot_mix_op(carry_new, w)
     else:
-        p_out = _GateSlotMixFused.apply(carry_new, w) if _CUDA_TRIA_ENABLED and _cuda_slot_op_applicable(carry_new, w) else (tria_slots(carry_new) * w).sum(dim=-1)
+        p_out = _GateSlotMixFused.apply(carry_new, w) if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_new, w) else (tria_slots(carry_new) * w).sum(dim=-1)
     return _capture_depth_output(carry_new), p_out
 
 
@@ -1071,7 +1089,7 @@ def temporal_carry_endpoint(
         and reset_mask.is_cuda
         and depth_carry.dtype in (torch.float32, torch.bfloat16, torch.float16)
     )
-    if cuda_applicable and _CUDA_TRIA_ENABLED:
+    if cuda_applicable and _tria_cuda_op_enabled("temporal_endpoint"):
         return _TemporalCarryEndpointFused.apply(depth_carry, reset_mask, initial_state, initial_valid)
     return temporal_carry_endpoint_reference(
         depth_carry, reset_mask, initial_state=initial_state, initial_valid=initial_valid, eps=eps)
@@ -1192,7 +1210,7 @@ def temporal_carry(
     if cuda_applicable and _GRAPH_MODE_ENABLED and _graph_temporal_carry_op is not None:
         document_carry, _scale = _graph_temporal_carry_op(depth_carry, reset_mask.to(torch.bool))
         return document_carry
-    if cuda_applicable and _CUDA_TRIA_ENABLED:
+    if cuda_applicable and _tria_cuda_op_enabled("temporal_carry"):
         return _TemporalCarryFused.apply(depth_carry, reset_mask)
     return temporal_carry_pytorch(depth_carry, reset_mask, eps=eps)
 
@@ -1222,7 +1240,7 @@ class GateSelector(nn.Module):
         # single-layer op into ~161ms/24 calls (see prof_tria_cuda.txt) --
         # more expensive than either fused Tria kernel. Never route this
         # through torch.einsum/torch.matmul again for that reason.
-        if _CUDA_TRIA_ENABLED and _cuda_slot_op_applicable(carry, w):
+        if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry, w):
             if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None:
                 return _graph_gate_slot_mix_op(carry, w)
             try:
@@ -1331,7 +1349,7 @@ class SharedTriaReader(nn.Module):
         # cuBLAS's degenerate tall-skinny gemv path, ~195ms combined in
         # profiling (see prof_tria_cuda.txt). Never route this through
         # torch.einsum/torch.matmul again for that reason.
-        if _CUDA_TRIA_ENABLED and _cuda_slot_op_applicable(carry, score_w):
+        if _tria_cuda_op_enabled("slot_attention_pool") and _cuda_slot_op_applicable(carry, score_w):
             if _GRAPH_MODE_ENABLED and _graph_slot_attention_pool_op is not None:
                 pooled_slots, _lse = _graph_slot_attention_pool_op(carry, score_w)
                 return self.proj(pooled_slots.to(self.proj.weight.dtype))
@@ -1449,7 +1467,7 @@ def final_ca_sparse(
     allowed: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    if q.is_cuda and k.is_cuda and v.is_cuda and _CUDA_TRIA_ENABLED:
+    if q.is_cuda and k.is_cuda and v.is_cuda and _tria_cuda_op_enabled("final_ca_sparse"):
         try:
             return _FinalCASparseFused.apply(q, k, v, allowed, float(scale))
         except RuntimeError:

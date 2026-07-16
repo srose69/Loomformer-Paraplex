@@ -165,25 +165,65 @@ def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tupl
             launch_note = f"CUDA_VISIBLE_DEVICES={visible}"
         if n < 2:
             raise RuntimeError(f"--device {pref or 'cudas'} requested but fewer than 2 CUDA GPUs are visible")
-        cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(n), __file__] + sys.argv[1:]
+        torchrun_bootstrap = r"""
+import signal
+
+from torch.distributed.run import main
+
+try:
+    main()
+except KeyboardInterrupt:
+    raise SystemExit(128 + signal.SIGINT)
+except BaseException as exc:
+    try:
+        from torch.distributed.elastic.multiprocessing.api import SignalException
+    except Exception:
+        SignalException = ()
+
+    if SignalException and isinstance(exc, SignalException):
+        sig = int(getattr(exc, "sigval", signal.SIGINT))
+        raise SystemExit(128 + sig)
+
+    raise
+"""
+
+        cmd = [
+            sys.executable,
+            "-c",
+            torchrun_bootstrap,
+            "--standalone",
+            "--nproc_per_node",
+            str(n),
+            __file__,
+        ] + sys.argv[1:]
+
         if not env.get("OMP_NUM_THREADS"):
             env["OMP_NUM_THREADS"] = str(_auto_omp_threads(n))
-        print(f"[ddp] launching ({launch_note}):", " ".join(cmd), flush=True)
+
+        print(
+            f"[ddp] launching ({launch_note}): "
+            f"torchrun --standalone --nproc_per_node {n} ...",
+            flush=True,
+        )
+
         if "OMP_NUM_THREADS" in env and not os.environ.get("OMP_NUM_THREADS"):
-            print(f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}", flush=True)
+            print(
+                f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}",
+                flush=True,
+            )
+
         proc = subprocess.Popen(cmd, env=env)
-        try:
-            returncode = proc.wait()
-        except KeyboardInterrupt:
-            # The terminal has already delivered SIGINT to torchrun and its workers.
-            # Do not print a parent-side traceback or forward a duplicate signal;
-            # let rank 0 finish its checkpoint prompt and wait for a clean shutdown.
-            old_handler = signal.getsignal(signal.SIGINT)
+
+        while True:
             try:
-                signal.signal(signal.SIGINT, signal.SIG_IGN)
                 returncode = proc.wait()
-            finally:
-                signal.signal(signal.SIGINT, old_handler)
+                break
+            except KeyboardInterrupt:
+                # SIGINT reached torchrun and workers as part of the foreground
+                # process group. Workers handle the checkpoint prompt; the
+                # parent launcher only waits and suppresses its own traceback.
+                continue
+
         raise SystemExit(returncode)
 
     world_size = ddp_world_size()
@@ -844,6 +884,13 @@ def apply_config(cfg: Config) -> None:
             f"HEAD_DIM={HEAD_DIM} is not divisible by 4; the optimized warp-per-row "
             "depth_attn CUDA kernel will be disabled and the slower block-per-row fallback "
             "will be used. Set head_dim to a multiple of 4 for the fast path.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    elif os.environ.get("LOOM_DEPTH_ATTN_DISABLE_WARP", "").strip() not in ("", "0"):
+        warnings.warn(
+            "LOOM_DEPTH_ATTN_DISABLE_WARP is set; depth_attn will use the legacy "
+            "block-per-row stacked CUDA path instead of the optimized warp-per-row path.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1635,13 +1682,15 @@ class ShardStream:
 
         rank = ddp_rank() if ddp_is_distributed() else 0
         world_size = ddp_world_size() if ddp_is_distributed() else 1
+
+        # Rank-specific sampler RNG. Must exist before shuffling shard order.
         self._rng = np.random.default_rng(
             int(getattr(cfg, "seed", 1)) + 1000003 * int(rank)
         )
 
-        # With enough shards, assign disjoint shards to ranks.
-        # With fewer shards than ranks (including a single-file corpus),
-        # every rank uses the available files but samples different windows.
+        # Give ranks disjoint shards when possible. For a corpus with fewer
+        # shards than ranks, every rank reads the available shard(s), but uses
+        # its own RNG and therefore samples different token windows.
         if len(self._files) >= world_size:
             self._order = list(range(rank, len(self._files), world_size))
         else:
@@ -3216,11 +3265,25 @@ class Model(nn.Module):
         self.tria_hard_fire_enabled = True
         self.last_tria_document_carry_stats: Optional[dict] = None
         self.last_tria_fire_mask: Optional[torch.Tensor] = None
+        self._disable_structurally_unused_params()
         self.reset_parameters()
+
+    def _disable_structurally_unused_params(self) -> None:
+        if not TRIA_CARRY_ENABLED or not self.blocks:
+            return
+        # Block 0 never receives a tria carrier input, so this gate scalar is
+        # outside the training graph on every step.
+        first_gate = getattr(self.blocks[0].ffn, "identity_gate", None)
+        if first_gate is not None:
+            first_gate.raw_alpha.requires_grad_(False)
+        # The last block never emits p_out to another block, so its selector is
+        # also unreachable from the loss.
+        last_selector = getattr(self.blocks[-1].ffn, "gate_selector", None)
+        if last_selector is not None:
+            last_selector.logits.requires_grad_(False)
 
     def reset_parameters(self) -> None:
         init_embedding_fanin(self.emb)
-
     def _build_tria_document_reset_mask(
         self,
         idx: torch.Tensor,
@@ -4205,18 +4268,6 @@ async def train_one_async(
     model_base = Model(ablation=ablation).to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
-
-    if TRIA_CARRY_ENABLED and len(model_base.blocks) > 0:
-        # Structurally dead edge parameters:
-        # block 0 never receives p_in; the final block never emits p_out.
-        model_base.blocks[0].ffn.identity_gate.raw_alpha.requires_grad_(False)
-        model_base.blocks[-1].ffn.gate_selector.logits.requires_grad_(False)
-        ddp_print(
-            "[tria] disabled structurally unused parameters: "
-            "blocks.0.ffn.identity_gate.raw_alpha, "
-            f"blocks.{len(model_base.blocks) - 1}.ffn.gate_selector.logits"
-        )
-
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
         grad_bytes = sum(p.numel() * p.element_size() for p in model_compiled.parameters() if p.requires_grad)
@@ -4263,7 +4314,8 @@ async def train_one_async(
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    params = [p for _, p in named_params]
     OptimizerClass, optimizer_name = optimizer_class_from_name(cfg.optimizer)
     base_model = ddp_unwrap_model(model)
     tria_agg = getattr(base_model, "tria_agg", None)
@@ -4324,6 +4376,74 @@ async def train_one_async(
     tokens_seen_global = 0
     data_wait_s = 0.0 
     batch_iter = stream.batches((int(cfg.steps) - start_step) * accum_steps).__aiter__()
+
+    def _tensor_stats(t: torch.Tensor) -> str:
+        tf = t.detach().float()
+        finite = torch.isfinite(tf)
+        finite_count = int(finite.sum().item())
+        total = tf.numel()
+        if finite_count > 0:
+            vals = tf[finite]
+            amin = float(vals.amin().item())
+            amax = float(vals.amax().item())
+        else:
+            amin = float("nan")
+            amax = float("nan")
+        nan_count = int(torch.isnan(tf).sum().item())
+        inf_count = int(torch.isinf(tf).sum().item())
+        return (
+            f"shape={tuple(t.shape)} finite={finite_count}/{total} "
+            f"nan={nan_count} inf={inf_count} min={amin:.9g} max={amax:.9g}"
+        )
+
+    def _first_nonfinite(which: str) -> Optional[str]:
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
+                return (
+                    f"{name}: {which} {_tensor_stats(t)} | "
+                    f"param {_tensor_stats(p)} | {grad_stats}"
+                )
+        return None
+
+    def _collect_nonfinite(which: str, limit: int = 10) -> List[str]:
+        out: List[str] = []
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
+                out.append(
+                    f"{name}: {which} {_tensor_stats(t)} | "
+                    f"param {_tensor_stats(p)} | {grad_stats}"
+                )
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _summarize_nonfinite(which: str) -> str:
+        counts: Dict[str, int] = {}
+        total = 0
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                total += 1
+                prefix = name.split(".", 2)
+                if len(prefix) >= 2 and prefix[0] == "blocks":
+                    key = ".".join(prefix[:2])
+                else:
+                    key = prefix[0]
+                counts[key] = counts.get(key, 0) + 1
+        if total == 0:
+            return "(none)"
+        parts = [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        return f"total={total} by_module=" + ", ".join(parts)
 
     def _save_checkpoint(path_override: Optional[str] = None) -> None:
         if ckpt_out and ddp_is_main():
@@ -4422,6 +4542,13 @@ async def train_one_async(
                     # Read before custom CUDA backward: if the same scalar changes
                     # afterwards, a backward kernel corrupted forward storage.
                     loss_before_backward = float(loss.detach().item())
+                    if not math.isfinite(loss_before_backward):
+                        raise RuntimeError(
+                            "non-finite training loss before backward: "
+                            f"loss={loss_before_backward:.9g} "
+                            f"max_logit={float(logits.detach().abs().amax().item()):.9g} "
+                            f"optimizer={optimizer_name} step={step} micro={micro_idx + 1}/{accum_steps}"
+                        )
                     if bool(getattr(cfg, "graph", False)) and loss_before_backward > 20.0:
                         anchors = [block.ffn.beta_anchor.detach().clone() for block in model_base.blocks]
                         with torch.no_grad(), amp_autocast(device):
@@ -4441,23 +4568,56 @@ async def train_one_async(
                             refeeds_since_log.add_(raw_model_for_tria.last_tria_fire_mask.detach().sum())
                     (total_loss / float(accum_steps)).backward()
                     loss_after_backward = float(loss.detach().item())
-                    if loss_after_backward != loss_before_backward:
+                    if math.isfinite(loss_before_backward) and math.isfinite(loss_after_backward) and loss_after_backward != loss_before_backward:
                         raise RuntimeError(
                             "training loss tensor changed during backward: "
                             f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
                             "a custom CUDA backward kernel wrote into forward storage"
+                        )
+                    if not math.isfinite(loss_after_backward):
+                        bad_grad = _first_nonfinite("grad")
+                        bad_grad_list = " || ".join(_collect_nonfinite("grad"))
+                        bad_grad_summary = _summarize_nonfinite("grad")
+                        raise RuntimeError(
+                            "non-finite training loss after backward: "
+                            f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
+                            f"summary={bad_grad_summary}; "
+                            f"first_nonfinite_grad={bad_grad or '(none found)'}; "
+                            f"examples={bad_grad_list or '(none found)'}"
                         )
                     raw_model_for_tria.last_tria_depth_carry = None
                     raw_model_for_tria.last_tria_document_carry_stats = None
                 train_loss_sum += loss_before_backward
                 train_tokens_step += int(y.numel())
 
+            bad_grad = _first_nonfinite("grad")
+            if bad_grad is not None:
+                bad_grad_list = " || ".join(_collect_nonfinite("grad"))
+                bad_grad_summary = _summarize_nonfinite("grad")
+                raise RuntimeError(
+                    "non-finite gradient detected before optimizer step: "
+                    f"optimizer={optimizer_name} step={step} lr={lr_at(cfg, step - 1):.9g} "
+                    f"summary={bad_grad_summary}; "
+                    f"first={bad_grad}; "
+                    f"examples={bad_grad_list}"
+                )
             if cfg.grad_clip and cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
             lr = lr_at(cfg, step - 1)
             for g in opt.param_groups:
                 g["lr"] = lr * float(g.get("lr_mult", 1.0))
             opt.step()
+            bad_param = _first_nonfinite("param")
+            if bad_param is not None:
+                bad_param_list = " || ".join(_collect_nonfinite("param"))
+                bad_param_summary = _summarize_nonfinite("param")
+                raise RuntimeError(
+                    "non-finite parameter detected after optimizer step: "
+                    f"optimizer={optimizer_name} step={step} lr={lr:.9g} "
+                    f"summary={bad_param_summary}; "
+                    f"first={bad_param}; "
+                    f"examples={bad_param_list}"
+                )
 
             train_loss_local = train_loss_sum / float(accum_steps)
             train_loss_log = ddp_mean_float(train_loss_local, device)

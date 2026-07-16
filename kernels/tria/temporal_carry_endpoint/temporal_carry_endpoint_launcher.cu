@@ -30,7 +30,7 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
     auto init_c = has_initial ? initial.contiguous() : torch::empty({0}, depth.options());
     auto valid_c = has_initial ? initial_valid.contiguous() : torch::empty({0}, depth.options().dtype(torch::kBool));
     const int64_t B = depth_c.size(0), T = depth_c.size(1), H = depth_c.size(2);
-    auto endpoint = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kFloat32));
+    auto endpoint = torch::empty({B, H, 3, 3}, depth.options());
     auto endpoint_fp32 = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kFloat32));
     const int threads = 256;
     const int64_t blocks = (B * H + threads - 1) / threads;
@@ -40,7 +40,7 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
                 depth_c.data_ptr<scalar_t>(), reset_c.data_ptr<bool>(),
                 has_initial ? init_c.data_ptr<scalar_t>() : nullptr,
                 has_initial ? valid_c.data_ptr<bool>() : nullptr,
-                endpoint.data_ptr<float>(),
+                endpoint.data_ptr<scalar_t>(),
                 endpoint_fp32.data_ptr<float>(), B, T, H, has_initial);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();

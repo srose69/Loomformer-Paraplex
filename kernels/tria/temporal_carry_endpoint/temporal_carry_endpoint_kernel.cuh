@@ -1,5 +1,4 @@
 #pragma once
-#include <cuda_bf16.h>
 #include <stdint.h>
 #include <math.h>
 #include "../carrier.cuh"
@@ -16,7 +15,7 @@ __global__ void temporal_carry_endpoint_forward_kernel(
     const bool* __restrict__ reset,
     const scalar_t* __restrict__ initial,
     const bool* __restrict__ initial_valid,
-    __nv_bfloat16* __restrict__ endpoint_bf16,
+    float* __restrict__ endpoint,
     float* __restrict__ endpoint_fp32,
     int64_t B, int64_t T, int64_t H,
     bool has_initial) {
@@ -51,12 +50,12 @@ __global__ void temporal_carry_endpoint_forward_kernel(
         for (int k = 0; k < 9; ++k) acc[k] = pre[k] * inv;
         have = true;
     }
+    float* out = endpoint + stream * 9;
     float* out32 = endpoint_fp32 + stream * 9;
-    __nv_bfloat16* out16 = endpoint_bf16 + stream * 9;
     #pragma unroll
     for (int k = 0; k < 9; ++k) {
+        out[k] = acc[k];
         out32[k] = acc[k];
-        out16[k] = __float2bfloat16_rn(acc[k]);
     }
 }
 

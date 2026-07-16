@@ -354,7 +354,7 @@ class Config:
     attn_sdpa_value_fusion: bool = True
     # Debug/perf fallback for old GPUs where FP32 mem-efficient backward is slow:
     # recompute softmax in a custom autograd backward instead of using SDPA bwd.
-    attn_sdpa_recompute_backward: bool = False
+    attn_sdpa_recompute_backward: bool = True
     rope_theta: float = 10000.0
     rope_factor: float = 4.0
     rope_original_seq_len: Optional[int] = None
@@ -746,7 +746,7 @@ AMP_DTYPE = "fp32"
 ATTN_IMPL = "sdpa"
 ATTN_SDPA_COMPUTE_DTYPE = "auto"
 ATTN_SDPA_VALUE_FUSION = True
-ATTN_SDPA_RECOMPUTE_BACKWARD = False
+ATTN_SDPA_RECOMPUTE_BACKWARD = True
 _sdpa_bf16_efficient_cache: Dict[Tuple[int, int, int], bool] = {}
 _REAL_STDOUT = sys.stdout
 ROPE_THETA = 10000.0
@@ -4341,7 +4341,7 @@ async def train_one_async(
         )
     n_params = count_params(ddp_unwrap_model(model))
 
-    if hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
+    if bool(getattr(cfg, "graph", False)) and hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
         ddp_print("[compile] torch.compile warmup -- tracing + JIT compiling fused kernels (this may take a while)...")
         _warm_batch2 = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
         _wx2, _wy2 = _warm_batch2[:, :-1], _warm_batch2[:, 1:]

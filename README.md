@@ -12,7 +12,7 @@ LoomFormer = the architecture: normal causal GQA attention + Paraplex FFN + Dept
 Tria.. too difficult to explain, but it works and useful! 
 Read the code tho
 
-Soon 
+SOON NORMAL README & docs WILL may BE!
 
 Checkpoints here
 https://huggingface.co/srs6901/LoomFormer-Paraplex/

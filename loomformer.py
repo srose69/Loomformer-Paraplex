@@ -3939,6 +3939,7 @@ def compute_raw_bytes_per_token_meta(
         "docs": int(docs),
         "total_docs": int(len(corpus)),
         "total_chars": int(corpus.total_chars),
+        "estimated_tokens": int(round(corpus.total_chars / max(1e-12, bpt))),
         "exact": bool(exact),
         "sample_stride": int(sample_stride),
         "source": "computed_from_raw_corpus" if exact else "estimated_from_raw_corpus_sample",
@@ -4007,6 +4008,17 @@ def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
         if nbytes % item != 0:
             raise ValueError(f"prepared dataset byte size is not uint16-aligned: {dataset} has {nbytes} bytes")
         return nbytes // item
+    meta_path = dataset + ".meta.json"
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        cached_tokens = int(meta.get("estimated_tokens", meta.get("tokens", 0)) or 0)
+        total_chars = int(meta.get("total_chars", 0) or 0)
+        bpt = float(meta.get("bytes_per_token", 0.0) or 0.0)
+        if total_chars > 0 and math.isfinite(bpt) and bpt > 0.0:
+            cached_tokens = int(round(total_chars / bpt))
+        if cached_tokens > 0:
+            return cached_tokens
     if cfg is None:
         raise ValueError("dataset_token_count needs cfg to estimate a raw-format corpus")
     tok = build_tokenizer(cfg)
@@ -4016,10 +4028,29 @@ def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
     sample_chars = sample_tokens = 0
     for fi, key, length in sample:
         text = corpus._read_doc_text(fi, key, length)
-        sample_chars += len(text)
+        sample_chars += len(text.encode("utf-8"))
         sample_tokens += len(tok.encode(text))
     ratio = sample_chars / max(1, sample_tokens)
-    return int(corpus.total_chars / max(1e-6, ratio))
+    estimated_tokens = int(round(corpus.total_chars / max(1e-6, ratio)))
+    payload = {
+        "tokens": int(sample_tokens),
+        "bytes": int(sample_chars),
+        "bytes_per_token": float(ratio),
+        "vocab": int(cfg.vocab),
+        "format": str(corpus.fmt),
+        "text_field": str(getattr(cfg, "text_field", "text")),
+        "docs": int(len(sample)),
+        "total_docs": int(len(corpus)),
+        "total_chars": int(corpus.total_chars),
+        "estimated_tokens": int(estimated_tokens),
+        "exact": False,
+        "source": "estimated_from_raw_corpus_sample",
+    }
+    tmp = meta_path + f".tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, meta_path)
+    return estimated_tokens
 
 
 def depth_attn_param_count() -> int:

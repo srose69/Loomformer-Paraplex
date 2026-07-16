@@ -2843,7 +2843,7 @@ class _RecomputeAttention(torch.autograd.Function):
                 scores = scores.masked_fill(~attn_mask, float("-inf"))
             elif is_causal:
                 T, S = q.shape[-2], k.shape[-2]
-                q_pos = torch.arange(S - T, S, device=q.device)[:, None]
+                q_pos = torch.arange(T, device=q.device)[:, None]
                 k_pos = torch.arange(S, device=q.device)[None, :]
                 causal = (k_pos <= q_pos).view(1, 1, T, S)
                 scores = scores.masked_fill(~causal, float("-inf"))
@@ -2865,7 +2865,7 @@ class _RecomputeAttention(torch.autograd.Function):
             scores = scores.masked_fill(~attn_mask, float("-inf"))
         elif ctx.is_causal:
             T, S = q.shape[-2], k.shape[-2]
-            q_pos = torch.arange(S - T, S, device=q.device)[:, None]
+            q_pos = torch.arange(T, device=q.device)[:, None]
             k_pos = torch.arange(S, device=q.device)[None, :]
             causal = (k_pos <= q_pos).view(1, 1, T, S)
             scores = scores.masked_fill(~causal, float("-inf"))

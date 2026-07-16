@@ -30,7 +30,7 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
     auto init_c = has_initial ? initial.contiguous() : torch::empty({0}, depth.options());
     auto valid_c = has_initial ? initial_valid.contiguous() : torch::empty({0}, depth.options().dtype(torch::kBool));
     const int64_t B = depth_c.size(0), T = depth_c.size(1), H = depth_c.size(2);
-    auto endpoint = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kBFloat16));
+    auto endpoint = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kFloat32));
     auto endpoint_fp32 = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kFloat32));
     const int threads = 256;
     const int64_t blocks = (B * H + threads - 1) / threads;
@@ -40,7 +40,7 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
                 depth_c.data_ptr<scalar_t>(), reset_c.data_ptr<bool>(),
                 has_initial ? init_c.data_ptr<scalar_t>() : nullptr,
                 has_initial ? valid_c.data_ptr<bool>() : nullptr,
-                reinterpret_cast<__nv_bfloat16*>(endpoint.data_ptr<at::BFloat16>()),
+                endpoint.data_ptr<float>(),
                 endpoint_fp32.data_ptr<float>(), B, T, H, has_initial);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -61,8 +61,8 @@ std::vector<torch::Tensor> temporal_carry_endpoint_backward_cuda(
     auto init_c = has_initial ? initial.contiguous() : torch::empty({0}, depth.options());
     auto valid_c = has_initial ? initial_valid.contiguous() : torch::empty({0}, depth.options().dtype(torch::kBool));
     const int64_t B = depth_c.size(0), T = depth_c.size(1), H = depth_c.size(2);
-    auto grad_depth = torch::empty_like(depth_c);
-    auto grad_initial = has_initial ? torch::empty_like(init_c) : torch::empty({0}, depth.options());
+    auto grad_depth = torch::zeros_like(depth_c);
+    auto grad_initial = has_initial ? torch::zeros_like(init_c) : torch::empty({0}, depth.options());
     const int threads = 256;
     const int64_t blocks = (B * H + threads - 1) / threads;
     // Nested AT_DISPATCH: both macros bind a local alias literally named

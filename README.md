@@ -40,5 +40,5 @@ https://huggingface.co/srs6901/LoomFormer-Paraplex/
 
 For context: ResNet-101 has 101 layers and ~1K skip connections. GPT-2 small has ~24 true layers. LoomFormer-nano: more depth than ResNet-101, orders of magnitude more connections, at 113M parameters.
 
-SFT works too!
+SFT and LoomChat works too! (last is vram-heavy for now but manageable even an my GTX1080, workin' on it) 
 Enjoy 

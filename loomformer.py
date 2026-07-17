@@ -4354,6 +4354,12 @@ class _RunpointWatcher:
                 self.requested.set()
 
     def __enter__(self) -> "_RunpointWatcher":
+        # Every local torchrun worker inherits the same controlling terminal.
+        # Letting multiple ranks save/modify termios races on restore: a later
+        # rank can save rank 0's cbreak/no-echo state as its "original" state
+        # and leave the shell broken after an exception (notably CUDA OOM).
+        if not ddp_is_main():
+            return self
         try:
             import termios
             import tty
@@ -4417,15 +4423,15 @@ class _RunpointWatcher:
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
         if self._old_termios is not None:
             try:
                 import termios
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_termios)
             except Exception:
                 pass
-        # The reader thread now polls with a 0.05s timeout instead of blocking
-        # forever in read(1), so it notices _stop and exits promptly on its own
-        # without needing a join() here.
+        self._active = False
 
     def consume(self) -> bool:
         if self.requested.is_set():

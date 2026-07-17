@@ -1286,6 +1286,36 @@ class RawCorpus:
             return str(table.column(self.text_field)[key])
         raise ValueError(self.fmt)
 
+    def iter_sampled_texts(self, docs):
+        """Read sampled Parquet rows without materializing whole shards."""
+        if self.fmt != "parquet":
+            for fi, key, length in docs:
+                yield self._read_doc_text(fi, key, length)
+            return
+
+        import pyarrow.parquet as pq
+
+        by_file: Dict[int, List[int]] = {}
+        for fi, key, _length in docs:
+            by_file.setdefault(fi, []).append(int(key))
+
+        for fi, row_indices in by_file.items():
+            pf = pq.ParquetFile(self._files[fi])
+            rows = iter(sorted(row_indices))
+            wanted = next(rows, None)
+            row_base = 0
+            for rg in range(pf.num_row_groups):
+                row_count = pf.metadata.row_group(rg).num_rows
+                row_end = row_base + row_count
+                if wanted is not None and wanted < row_end:
+                    col = pf.read_row_group(rg, columns=[self.text_field]).column(self.text_field)
+                    while wanted is not None and wanted < row_end:
+                        yield str(col[wanted - row_base])
+                        wanted = next(rows, None)
+                row_base = row_end
+                if wanted is None:
+                    break
+
     def sample_window_spans(self, min_chars: int, rng: np.random.Generator) -> List[str]:
         pos = int(rng.integers(0, self.total_chars))
         doc_i = int(np.searchsorted(self._cum, pos, side="right"))
@@ -3921,8 +3951,7 @@ def compute_raw_bytes_per_token_meta(
     total_bytes = 0
     total_tokens = 0
     docs = 0
-    for fi, key, length in docs_src:
-        text = corpus._read_doc_text(fi, key, length)
+    for text in corpus.iter_sampled_texts(docs_src):
         if not text:
             continue
         total_bytes += len(text.encode("utf-8"))
@@ -3991,6 +4020,38 @@ def loss_to_bits(loss_nats: float, bytes_per_token: float) -> Tuple[float, float
     return bits_tok, bpb
 
 
+def _fast_parquet_token_count(dataset: str, cfg: "Config", tok, sample_docs: int = 50) -> Optional[int]:
+    meta_path = dataset + ".meta.json"
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            total_chars = int(json.load(f).get("total_chars", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if total_chars <= 0:
+        return None
+
+    import pyarrow.parquet as pq
+
+    files = RawCorpus._resolve_files(dataset, "parquet")
+    texts: List[str] = []
+    for path in files:
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=sample_docs - len(texts), columns=[cfg.text_field]):
+            texts.extend(text for text in batch.column(0).to_pylist() if text)
+            if len(texts) >= sample_docs:
+                break
+        if len(texts) >= sample_docs:
+            break
+    if not texts:
+        return None
+
+    sample_chars = sum(len(text) for text in texts)
+    sample_tokens = sum(len(tok.encode(text)) for text in texts)
+    if sample_chars <= 0 or sample_tokens <= 0:
+        return None
+    return int(total_chars * sample_tokens / sample_chars)
+
+
 def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower() if cfg is not None else "auto"
     is_bin = fmt == "bin" or (fmt == "auto" and os.path.isfile(dataset) and dataset.endswith(".bin"))
@@ -4003,12 +4064,19 @@ def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
     if cfg is None:
         raise ValueError("dataset_token_count needs cfg to estimate a raw-format corpus")
     tok = build_tokenizer(cfg)
+    files = RawCorpus._resolve_files(dataset, fmt)
+    if not files:
+        raise ValueError(f"no corpus files found at {dataset!r} (format={fmt!r})")
+    resolved_fmt = fmt if fmt != "auto" else RawCorpus._infer_format(files[0])
+    if resolved_fmt == "parquet":
+        fast_count = _fast_parquet_token_count(dataset, cfg, tok)
+        if fast_count is not None:
+            return fast_count
     corpus = RawCorpus(dataset, fmt=getattr(cfg, "dataset_format", "auto"),
                         text_field=getattr(cfg, "text_field", "text"))
     sample = corpus._docs[:: max(1, len(corpus._docs) // 50)][:50]
     sample_chars = sample_tokens = 0
-    for fi, key, length in sample:
-        text = corpus._read_doc_text(fi, key, length)
+    for text in corpus.iter_sampled_texts(sample):
         sample_chars += len(text)
         sample_tokens += len(tok.encode(text))
     ratio = sample_chars / max(1, sample_tokens)
@@ -4021,7 +4089,7 @@ def format_big_int(n: int) -> str:
 
 
 
-def print_training_budget(cfg: Config, dataset: str, ablation: bool = False) -> None:
+def print_training_budget(cfg: Config, dataset: str) -> Tuple[int, int]:
     data_tokens = dataset_token_count(dataset, cfg)
     global_bs = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
@@ -4030,13 +4098,11 @@ def print_training_budget(cfg: Config, dataset: str, ablation: bool = False) -> 
     run_epochs = run_tokens / max(1, data_tokens)
     print(f"  budget   {format_big_int(run_tokens)} tokens over {cfg.steps:,} steps "
           f"({run_epochs:.3f} epochs of {format_big_int(data_tokens)})")
-    # Real count, not a hand-maintained formula: a throwaway CPU-only instance
-    # (no .to(device), no compile -- Model() construction itself never touches
-    # CUDA, kernels load lazily on first forward()) costs a few seconds even at
-    # ~1B params and is immediately discarded. This was a formula before and it
-    # silently drifted out of sync the moment PARAPLEX_GATE_PROJ was added --
-    # one source of truth (the real nn.Module tree) instead of two.
-    params = count_params(Model(ablation=ablation))
+    return run_tokens, data_tokens
+
+
+def print_training_scale(run_tokens: int, data_tokens: int, model: nn.Module) -> None:
+    params = count_params(model)
     tpp = run_tokens / max(1, params)
     epoch_tokens_per_param = data_tokens / max(1, params)
     print(f"           paraplex: {format_big_int(params)} params  ·  "
@@ -4392,12 +4458,16 @@ async def train_one_async(
         print("[data] all ranks ready", flush=True)
     apply_config(cfg)
     print_architecture_report(cfg, device, ablation, dataset, val_dataset)
+    budget = None
     if ddp_is_main():
-        print_training_budget(cfg, dataset, ablation)
-    ddp_print("=" * 64)
+        budget = print_training_budget(cfg, dataset)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
-    model_base = Model(ablation=ablation).to(device)
+    model_base = Model(ablation=ablation)
+    if ddp_is_main():
+        print_training_scale(*budget, model_base)
+    ddp_print("=" * 64)
+    model_base = model_base.to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)

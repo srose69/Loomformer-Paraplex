@@ -11,7 +11,8 @@ LoomFormer = the architecture: normal causal GQA attention + Paraplex FFN + Dept
 Tria... too difficult to explain, but it works and is useful! 
 Read the code tho.
 
-!!! VANILLA TRANSFORMERS L00MINATION PIPELINE COMING !!!
+!!! VANILLA TRANSFORMERS L00MINATION PIPELINE PRESENT !!!
+Dont be scared by high loss from the very beginning, new residual, new act.. RMS -> LayerNorm.. It shocked!  
 
 SOON A NORMAL README & DOCS WILL (MAYBE) BE READY!
 

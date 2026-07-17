@@ -1,0 +1,66 @@
+{
+  "family": "llama",
+  "description": "Llama/Mistral/Qwen2/SmolLM2-style decoder-only: RMSNorm (weight-only, no bias), SwiGLU MLP (gate_proj/up_proj/down_proj), separate q_proj/k_proj/v_proj/o_proj attention projections, RoPE.",
+  "detect": {
+    "config_json_field": "architectures",
+    "any_of": ["LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM"]
+  },
+
+  "config_map": {
+    "hidden_size": "model_dim",
+    "num_attention_heads": "n_q_heads",
+    "num_key_value_heads": "n_kv_heads",
+    "num_hidden_layers": "layers",
+    "vocab_size": "vocab",
+    "rope_theta": "rope_theta",
+    "max_position_embeddings": "rope_original_seq_len",
+    "tie_word_embeddings": "tied_embeddings"
+  },
+  "hidden_from": {
+    "numerator": "intermediate_size",
+    "denominator": "hidden_size",
+    "target_field": "hidden_mult"
+  },
+  "head_dim_from": {
+    "numerator": "hidden_size",
+    "denominator": "num_attention_heads"
+  },
+  "config_notes": [
+    "hidden_mult is intermediate_size/hidden_size, NOT necessarily a round number (e.g. SmolLM2-360M: 2560/960 = 2.6667) -- do not round to a 'clean' value, LoomFormer's own hidden=round_up(model_dim*hidden_mult, n_q_heads) must reconstruct intermediate_size exactly or the w1_real/w2/gate_proj shapes will not match the donor's.",
+    "RMSNorm vs LayerNorm mismatch: donor norms have weight only, no bias, and do not subtract the mean (LoomFormer's ln_attn/ln_ffn are full LayerNorm, weight+bias). weight is transplanted 1:1 as an approximation; bias defaults to LoomFormer's own zero-init. This is a known, accepted approximation -- see the RMSNorm/LayerNorm caveat in the design discussion. ln_attn/ln_ffn are therefore NOT included in train_lr_overrides' frozen/low-lr list: they need full LR to help absorb this mismatch.",
+    "model.norm.weight (the final pre-lm_head RMSNorm) has NO destination: LoomFormer applies `head` directly to the last block's residual stream with no final norm layer. It is dropped -- see 'drop' entries below. If this turns out to matter empirically, the fix is a small companion feature (an optional ln_final in Model, analogous to how paraplex_gate_proj was added) -- NOT part of this mapping file.",
+    "gate_proj only has a destination when the target LoomFormer config sets paraplex_gate_proj: true (see loomformer.py's PARAPLEX_GATE_PROJ). Without it, gate_proj is dropped and that donor matrix's learned behavior is not transplanted at all."
+  ],
+
+  "per_layer": {
+    "input_layernorm.weight":            {"to": "ln_attn.weight",       "op": "copy"},
+    "self_attn.q_proj.weight":           {"to": "attn.qkv_weight",      "op": "qkv_concat", "part": "q"},
+    "self_attn.k_proj.weight":           {"to": "attn.qkv_weight",      "op": "qkv_concat", "part": "k"},
+    "self_attn.v_proj.weight":           {"to": "attn.qkv_weight",      "op": "qkv_concat", "part": "v"},
+    "self_attn.o_proj.weight":           {"to": "attn.o.weight",        "op": "copy"},
+    "post_attention_layernorm.weight":   {"to": "ln_ffn.weight",        "op": "copy"},
+    "mlp.up_proj.weight":                {"to": "ffn.w1_real.weight",   "op": "copy"},
+    "mlp.down_proj.weight":              {"to": "ffn.w2.weight",        "op": "copy"},
+    "mlp.gate_proj.weight":              {"to": "ffn.gate_proj.weight", "op": "copy", "requires_config": {"paraplex_gate_proj": true}}
+  },
+
+  "global": {
+    "model.embed_tokens.weight": {"to": "emb.weight",  "op": "copy"},
+    "lm_head.weight":            {"to": "head.weight", "op": "copy", "optional": true, "note": "absent when tie_word_embeddings=true -- emb.weight covers both"},
+    "model.norm.weight":         {"to": null, "op": "drop", "note": "no LoomFormer destination -- see config_notes"}
+  },
+
+  "train_lr_overrides": [
+    {"pattern": "attn.qkv_weight",     "train": true, "lr_scale": 0.1, "note": "transplanted from donor"},
+    {"pattern": "attn.o.weight",       "train": true, "lr_scale": 0.1, "note": "transplanted from donor"},
+    {"pattern": "ffn.w1_real.weight",  "train": true, "lr_scale": 0.1, "note": "transplanted from donor (up_proj)"},
+    {"pattern": "ffn.w2.weight",       "train": true, "lr_scale": 0.1, "note": "transplanted from donor (down_proj)"},
+    {"pattern": "ffn.gate_proj.weight","train": true, "lr_scale": 0.1, "note": "transplanted from donor (gate_proj), only present if paraplex_gate_proj=true"},
+    {"pattern": "emb.weight",         "train": true, "lr_scale": 0.1, "note": "transplanted from donor (requires matching tokenizer)"},
+    {"pattern": "head.weight",        "train": true, "lr_scale": 0.1, "note": "transplanted from donor if untied and present"},
+    {"pattern": "ln_attn.weight",     "train": true, "lr_scale": 1.0, "note": "RMSNorm->LayerNorm approximation -- full LR to help it self-correct"},
+    {"pattern": "ln_attn.bias",       "train": true, "lr_scale": 1.0, "note": "no donor equivalent (RMSNorm has no bias) -- zero-init, full LR"},
+    {"pattern": "ln_ffn.weight",      "train": true, "lr_scale": 1.0, "note": "RMSNorm->LayerNorm approximation -- full LR to help it self-correct"},
+    {"pattern": "ln_ffn.bias",        "train": true, "lr_scale": 1.0, "note": "no donor equivalent (RMSNorm has no bias) -- zero-init, full LR"}
+  ]
+}

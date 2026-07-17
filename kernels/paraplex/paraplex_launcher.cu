@@ -9,24 +9,28 @@
 #include "paraplex_kernel.cuh"
 
 std::vector<torch::Tensor> paraplex_forward_cuda(
-    torch::Tensor p_real, torch::Tensor beta_linear, torch::Tensor bias,
+    torch::Tensor p_real, torch::Tensor gate_src, torch::Tensor beta_linear, torch::Tensor bias,
     torch::Tensor trace, torch::Tensor trace_w, torch::Tensor reset,
     torch::Tensor anchor, int64_t mode, bool update_anchor, double decay, double m);
 std::vector<torch::Tensor> paraplex_backward_cuda(
     torch::Tensor grad_act, torch::Tensor grad_s, torch::Tensor grad_next,
-    torch::Tensor p_real, torch::Tensor beta_linear, torch::Tensor bias,
+    torch::Tensor p_real, torch::Tensor gate_src, torch::Tensor beta_linear, torch::Tensor bias,
     torch::Tensor trace, torch::Tensor trace_w, torch::Tensor reset,
     torch::Tensor anchor, int64_t mode, double floor, double near_eps, double m);
 
 static void paraplex_check(
-    const torch::Tensor& p, const torch::Tensor& beta, const torch::Tensor& bias,
+    const torch::Tensor& p, const torch::Tensor& gate_src, const torch::Tensor& beta, const torch::Tensor& bias,
     const torch::Tensor& trace, const torch::Tensor& trace_w,
     const torch::Tensor& reset, const torch::Tensor& anchor) {
-    TORCH_CHECK(p.is_cuda() && beta.is_cuda() && bias.is_cuda() && trace.is_cuda() &&
+    TORCH_CHECK(p.is_cuda() && gate_src.is_cuda() && beta.is_cuda() && bias.is_cuda() && trace.is_cuda() &&
                 trace_w.is_cuda() && anchor.is_cuda(), "paraplex: CUDA tensors required");
-    TORCH_CHECK(beta.device() == p.device() && bias.device() == p.device() && trace.device() == p.device() &&
-                trace_w.device() == p.device() && anchor.device() == p.device(), "paraplex: device mismatch");
-    TORCH_CHECK(p.dim() == 3 && beta.sizes() == p.sizes(), "p/beta must be [B,T,H]");
+    TORCH_CHECK(gate_src.device() == p.device() && beta.device() == p.device() && bias.device() == p.device() &&
+                trace.device() == p.device() && trace_w.device() == p.device() && anchor.device() == p.device(),
+                "paraplex: device mismatch");
+    TORCH_CHECK(p.dim() == 3 && beta.sizes() == p.sizes() && gate_src.sizes() == p.sizes(),
+                "p/gate_src/beta must be [B,T,H]");
+    TORCH_CHECK(gate_src.scalar_type() == p.scalar_type(),
+                "paraplex: gate_src dtype must match p_real (cast before calling, same as beta_linear)");
     TORCH_CHECK(beta.scalar_type() == p.scalar_type() && trace.scalar_type() == p.scalar_type(),
                 "p/beta/trace dtype mismatch");
     TORCH_CHECK(trace.dim() == 2 && trace.size(0) == p.size(0) && trace.size(1) == p.size(2),
@@ -43,12 +47,12 @@ static void paraplex_check(
 }
 
 std::vector<torch::Tensor> paraplex_forward_cuda(
-    torch::Tensor p_real, torch::Tensor beta_linear, torch::Tensor bias,
+    torch::Tensor p_real, torch::Tensor gate_src, torch::Tensor beta_linear, torch::Tensor bias,
     torch::Tensor trace, torch::Tensor trace_w, torch::Tensor reset,
     torch::Tensor anchor, int64_t mode, bool update_anchor, double decay, double m) {
-    paraplex_check(p_real, beta_linear, bias, trace, trace_w, reset, anchor);
+    paraplex_check(p_real, gate_src, beta_linear, bias, trace, trace_w, reset, anchor);
     c10::cuda::CUDAGuard guard(p_real.device());
-    auto pc = p_real.contiguous(), bc = beta_linear.contiguous();
+    auto pc = p_real.contiguous(), gc = gate_src.contiguous(), bc = beta_linear.contiguous();
     auto bic = bias.contiguous(), tc = trace.contiguous(), twc = trace_w.contiguous();
     auto rc = reset.numel() ? reset.contiguous() : torch::empty({0}, p_real.options().dtype(torch::kBool));
     auto ac = anchor.contiguous();
@@ -79,7 +83,7 @@ std::vector<torch::Tensor> paraplex_forward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pc.scalar_type(),
         "paraplex_forward_cuda", ([&] {
             paraplex_forward_kernel<scalar_t><<<elem_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                pc.data_ptr<scalar_t>(), bc.data_ptr<scalar_t>(), bic.data_ptr<float>(), tc.data_ptr<scalar_t>(),
+                pc.data_ptr<scalar_t>(), gc.data_ptr<scalar_t>(), bc.data_ptr<scalar_t>(), bic.data_ptr<float>(), tc.data_ptr<scalar_t>(),
                 twc.data_ptr<float>(), rc.numel() ? rc.data_ptr<bool>() : nullptr,
                 act.data_ptr<scalar_t>(), s.data_ptr<scalar_t>(), next.data_ptr<scalar_t>(),
                 (float)m, B, T, H);
@@ -90,18 +94,18 @@ std::vector<torch::Tensor> paraplex_forward_cuda(
 
 std::vector<torch::Tensor> paraplex_backward_cuda(
     torch::Tensor grad_act, torch::Tensor grad_s, torch::Tensor grad_next,
-    torch::Tensor p_real, torch::Tensor beta_linear, torch::Tensor bias,
+    torch::Tensor p_real, torch::Tensor gate_src, torch::Tensor beta_linear, torch::Tensor bias,
     torch::Tensor trace, torch::Tensor trace_w, torch::Tensor reset,
     torch::Tensor anchor, int64_t mode, double floor, double near_eps, double m) {
-    paraplex_check(p_real, beta_linear, bias, trace, trace_w, reset, anchor);
+    paraplex_check(p_real, gate_src, beta_linear, bias, trace, trace_w, reset, anchor);
     c10::cuda::CUDAGuard guard(p_real.device());
     auto ga = grad_act.contiguous(), gs = grad_s.contiguous(), gn = grad_next.contiguous();
-    auto pc = p_real.contiguous(), bc = beta_linear.contiguous();
+    auto pc = p_real.contiguous(), gc = gate_src.contiguous(), bc = beta_linear.contiguous();
     auto bic = bias.contiguous(), tc = trace.contiguous(), twc = trace_w.contiguous();
     auto rc = reset.numel() ? reset.contiguous() : torch::empty({0}, p_real.options().dtype(torch::kBool));
     auto ac = anchor.contiguous();
     const int64_t B = p_real.size(0), T = p_real.size(1), H = p_real.size(2), n = p_real.numel();
-    auto gp = torch::empty_like(pc), gbeta = torch::empty_like(bc), gtrace = torch::empty_like(tc);
+    auto gp = torch::empty_like(pc), ggate = torch::empty_like(gc), gbeta = torch::empty_like(bc), gtrace = torch::empty_like(tc);
     auto gbias = torch::empty_like(bic), gtw = torch::empty_like(twc);
     const int threads = 256;
     const int64_t blocks = (n + threads - 1) / threads;
@@ -113,21 +117,21 @@ std::vector<torch::Tensor> paraplex_backward_cuda(
                     using grad_t = scalar_t;
                     paraplex_backward_kernel<input_t, grad_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
                         ga.data_ptr<grad_t>(), gs.data_ptr<grad_t>(), gn.data_ptr<grad_t>(), pc.data_ptr<input_t>(),
-                        bc.data_ptr<input_t>(), bic.data_ptr<float>(), tc.data_ptr<input_t>(), twc.data_ptr<float>(),
+                        gc.data_ptr<input_t>(), bc.data_ptr<input_t>(), bic.data_ptr<float>(), tc.data_ptr<input_t>(), twc.data_ptr<float>(),
                         rc.numel() ? rc.data_ptr<bool>() : nullptr, ac.data_ptr<float>(), gp.data_ptr<input_t>(),
-                        gbeta.data_ptr<input_t>(), gtrace.data_ptr<input_t>(), (int)mode, (float)floor,
+                        ggate.data_ptr<input_t>(), gbeta.data_ptr<input_t>(), gtrace.data_ptr<input_t>(), (int)mode, (float)floor,
                         (float)near_eps, (float)m, B, T, H);
                     const int warps = (threads + 31) / 32;
                     paraplex_reduce_kernel<input_t, grad_t><<<H, threads, 2 * warps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
                         ga.data_ptr<grad_t>(), gs.data_ptr<grad_t>(), gn.data_ptr<grad_t>(), pc.data_ptr<input_t>(),
-                        bc.data_ptr<input_t>(), bic.data_ptr<float>(), tc.data_ptr<input_t>(), twc.data_ptr<float>(),
+                        gc.data_ptr<input_t>(), bc.data_ptr<input_t>(), bic.data_ptr<float>(), tc.data_ptr<input_t>(), twc.data_ptr<float>(),
                         rc.numel() ? rc.data_ptr<bool>() : nullptr, ac.data_ptr<float>(),
                         gbias.data_ptr<float>(), gtw.data_ptr<float>(), (int)mode, (float)floor,
                         (float)near_eps, (float)m, B, T, H);
                 }));
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {gp, gbeta, gbias, gtrace, gtw};
+    return {gp, ggate, gbeta, gbias, gtrace, gtw};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

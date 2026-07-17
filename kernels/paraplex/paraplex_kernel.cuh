@@ -70,24 +70,26 @@ __device__ __forceinline__ float pp_prev(
 struct ParaplexTerms {
     float d_raw;
     float grad_r;
+    float grad_gate;
 };
 
 template <typename scalar_t, typename grad_t>
 __device__ __forceinline__ ParaplexTerms pp_backward_terms(
     const grad_t* grad_act, const grad_t* grad_s,
-    const scalar_t* p_real, const scalar_t* beta_linear,
+    const scalar_t* p_real, const scalar_t* gate_src, const scalar_t* beta_linear,
     const float* bias, const scalar_t* trace, const float* trace_w,
     const bool* reset, int64_t b, int64_t t, int64_t h,
     int64_t T, int64_t H, float m) {
     const int64_t idx = (b * T + t) * H + h;
     const float r = pp_load(p_real + idx);
+    const float g = pp_load(gate_src + idx);
     const float beta = pp_beta(beta_linear, bias, idx, h);
     const float s0 = pp_phase(beta);
     const float prev = pp_prev(beta_linear, bias, trace, reset, b, t, h, T, H);
     const float raw = s0 + prev * trace_w[h];
     const float inv = rsqrtf(1.0f + raw * raw);
     const float s = raw * inv;
-    const float amp = pp_softplus(r);
+    const float amp = pp_softplus(g);
     const float p = r + amp * s;
     float dlog;
     const float gate = pp_gate(amp, m, dlog);
@@ -98,13 +100,18 @@ __device__ __forceinline__ ParaplexTerms pp_backward_terms(
     const float d_s = gs + d_p * amp;
     ParaplexTerms out;
     out.d_raw = d_s * inv * inv * inv;
-    out.grad_r = d_p + d_amp * pp_sigmoid(r);
+    // Two separate inputs now: r feeds only the "value" path (p=r+amp*s),
+    // g feeds only the "gate" path (amp=softplus(g)) -- same sigmoid(.)
+    // derivative as before, just no longer summed into one shared gradient.
+    out.grad_r = d_p;
+    out.grad_gate = d_amp * pp_sigmoid(g);
     return out;
 }
 
 template <typename scalar_t>
 __global__ void paraplex_forward_kernel(
     const scalar_t* __restrict__ p_real,
+    const scalar_t* __restrict__ gate_src,
     const scalar_t* __restrict__ beta_linear,
     const float* __restrict__ bias,
     const scalar_t* __restrict__ trace,
@@ -122,12 +129,13 @@ __global__ void paraplex_forward_kernel(
     const int64_t t = bt % T;
     const int64_t b = bt / T;
     const float r = pp_load(p_real + idx);
+    const float g = pp_load(gate_src + idx);
     const float beta = pp_beta(beta_linear, bias, idx, h);
     const float s0 = pp_phase(beta);
     const float prev = pp_prev(beta_linear, bias, trace, reset, b, t, h, T, H);
     const float raw = s0 + prev * trace_w[h];
     const float s = raw * rsqrtf(1.0f + raw * raw);
-    const float amp = pp_softplus(r);
+    const float amp = pp_softplus(g);
     const float p = r + amp * s;
     float dlog;
     const float gate = pp_gate(amp, m, dlog);
@@ -139,19 +147,19 @@ __global__ void paraplex_forward_kernel(
 template <typename scalar_t, typename grad_t>
 __device__ __forceinline__ float pp_grad_beta_at(
     const grad_t* grad_act, const grad_t* grad_s, const grad_t* grad_next,
-    const scalar_t* p_real, const scalar_t* beta_linear,
+    const scalar_t* p_real, const scalar_t* gate_src, const scalar_t* beta_linear,
     const float* bias, const scalar_t* trace, const float* trace_w,
     const bool* reset, const float* anchor, int mode, float floor,
     float near_eps, float m, int64_t b, int64_t t, int64_t h,
     int64_t T, int64_t H) {
     const ParaplexTerms here = pp_backward_terms(
-        grad_act, grad_s, p_real, beta_linear, bias, trace, trace_w,
+        grad_act, grad_s, p_real, gate_src, beta_linear, bias, trace, trace_w,
         reset, b, t, h, T, H, m);
     float grad_s0 = here.d_raw;
     if (t == T - 1) grad_s0 += (float)grad_next[b * H + h];
     if (t + 1 < T && (reset == nullptr || !reset[b * T + t + 1])) {
         const ParaplexTerms next = pp_backward_terms(
-            grad_act, grad_s, p_real, beta_linear, bias, trace, trace_w,
+            grad_act, grad_s, p_real, gate_src, beta_linear, bias, trace, trace_w,
             reset, b, t + 1, h, T, H, m);
         grad_s0 += next.d_raw * trace_w[h];
     }
@@ -166,6 +174,7 @@ __global__ void paraplex_backward_kernel(
     const grad_t* __restrict__ grad_s,
     const grad_t* __restrict__ grad_next,
     const scalar_t* __restrict__ p_real,
+    const scalar_t* __restrict__ gate_src,
     const scalar_t* __restrict__ beta_linear,
     const float* __restrict__ bias,
     const scalar_t* __restrict__ trace,
@@ -173,6 +182,7 @@ __global__ void paraplex_backward_kernel(
     const bool* __restrict__ reset,
     const float* __restrict__ anchor,
     scalar_t* __restrict__ grad_p_real,
+    scalar_t* __restrict__ grad_gate_src,
     scalar_t* __restrict__ grad_beta,
     scalar_t* __restrict__ grad_trace,
     int mode, float floor, float near_eps, float m,
@@ -185,11 +195,12 @@ __global__ void paraplex_backward_kernel(
     const int64_t t = bt % T;
     const int64_t b = bt / T;
     const ParaplexTerms here = pp_backward_terms(
-        grad_act, grad_s, p_real, beta_linear, bias, trace, trace_w,
+        grad_act, grad_s, p_real, gate_src, beta_linear, bias, trace, trace_w,
         reset, b, t, h, T, H, m);
     pp_store(grad_p_real + idx, here.grad_r);
+    pp_store(grad_gate_src + idx, here.grad_gate);
     pp_store(grad_beta + idx, pp_grad_beta_at(
-        grad_act, grad_s, grad_next, p_real, beta_linear, bias, trace,
+        grad_act, grad_s, grad_next, p_real, gate_src, beta_linear, bias, trace,
         trace_w, reset, anchor, mode, floor, near_eps, m, b, t, h, T, H));
     if (t == 0) {
         const float g = (reset != nullptr && reset[b * T]) ? 0.0f : here.d_raw * trace_w[h];
@@ -247,6 +258,7 @@ __global__ void paraplex_reduce_kernel(
     const grad_t* __restrict__ grad_s,
     const grad_t* __restrict__ grad_next,
     const scalar_t* __restrict__ p_real,
+    const scalar_t* __restrict__ gate_src,
     const scalar_t* __restrict__ beta_linear,
     const float* __restrict__ bias,
     const scalar_t* __restrict__ trace,
@@ -268,10 +280,10 @@ __global__ void paraplex_reduce_kernel(
         const int64_t t = row - b * T;
         const int64_t idx = row * H + h;
         gb += pp_grad_beta_at(
-            grad_act, grad_s, grad_next, p_real, beta_linear, bias, trace,
+            grad_act, grad_s, grad_next, p_real, gate_src, beta_linear, bias, trace,
             trace_w, reset, anchor, mode, floor, near_eps, m, b, t, h, T, H);
         const ParaplexTerms terms = pp_backward_terms(
-            grad_act, grad_s, p_real, beta_linear, bias, trace, trace_w,
+            grad_act, grad_s, p_real, gate_src, beta_linear, bias, trace, trace_w,
             reset, b, t, h, T, H, m);
         const float prev = pp_prev(beta_linear, bias, trace, reset, b, t, h, T, H);
         gw = fmaf(terms.d_raw, prev, gw);

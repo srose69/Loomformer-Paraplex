@@ -14,13 +14,14 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import threading
 import time
 import warnings
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -320,6 +321,22 @@ class Config:
     save_every: int = 0 
     runpoints_path: Optional[str] = None  
     tria_carry_enabled: bool = False
+    # ===AUTO GENERATED=== bookkeeping written by loomcloner.py --scan/--clone.
+    # cloned/cloned_from/cloned_mapping are informational only (which donor,
+    # which mappings/*.json). train_lr is the one that's actually consumed:
+    # a list of {"name": <LoomFormer param-name suffix or exact global name>,
+    # "train": bool, "lr": float} entries, matched by suffix against every
+    # blocks.{i}.<name> and by exact match against global names (emb.weight,
+    # head.weight) -- see apply_train_lr_overrides().
+    cloned: bool = False
+    cloned_from: Optional[str] = None
+    cloned_mapping: Optional[str] = None
+    train_lr: Optional[List[Dict[str, Any]]] = None
+    # --resume as a config field, not just a CLI flag -- loomcloner.py --clone
+    # writes this in automatically so `--train --config X.yaml` alone resumes
+    # the cloned checkpoint without needing a separate --resume on the CLI.
+    # An explicit --resume on the command line still overrides this.
+    resume: Optional[str] = None
     # False (default): ParaplexFFN's amp gate is self-referential, amp=softplus(p_real)
     #   (original design, zero extra parameters).
     # True: amp comes from an independent gate_proj Linear(N,HIDDEN) instead --
@@ -3988,6 +4005,47 @@ def load_model_checkpoint(model: nn.Module, path: str, ablation: bool, device: t
     ddp_print(f"[resume] loaded paraplex weights from {path} (optimizer state is intentionally not restored)")
 
 
+def apply_train_lr_overrides(model: nn.Module, cfg: Config) -> Dict[int, float]:
+    """Consumes cfg.train_lr (written by loomcloner.py --scan, LoomFormer-side
+    names) against the REAL model's named_parameters(): sets requires_grad
+    per entry, and returns {id(param): lr_mult} for every parameter an entry
+    covered (uncovered parameters aren't in the dict -- they use lr_mult=1.0,
+    the normal default, same as an ordinary from-scratch run).
+
+    Returns a MULTIPLIER relative to cfg.lr, not an absolute lr -- the
+    training loop's LR schedule does `g["lr"] = lr_at(cfg, step) *
+    g.get("lr_mult", 1.0)` every step (see train_one_async), so an absolute
+    per-group lr set once at optimizer-construction time would be silently
+    overwritten by that line on the very first step. The YAML's own `lr:`
+    field stays human-readable as an absolute value (matching how it's
+    written); this function does the division against cfg.lr once here.
+
+    Matching: a per-layer name like 'attn.qkv_weight' matches every
+    'blocks.{i}.attn.qkv_weight' (the blocks.{i}. prefix is stripped before
+    comparing) -- ONE entry covers all layers, not one per layer index.
+    A global name like 'emb.weight' matches only that exact parameter name.
+    First matching entry wins if more than one pattern could apply."""
+    overrides = getattr(cfg, "train_lr", None)
+    if not overrides:
+        return {}
+    strip_block_prefix = re.compile(r"^blocks\.\d+\.")
+    mult_by_id: Dict[int, float] = {}
+    matched_count = 0
+    for name, param in model.named_parameters():
+        canonical = strip_block_prefix.sub("", name)
+        for entry in overrides:
+            if entry.get("name") == canonical:
+                param.requires_grad_(bool(entry.get("train", True)))
+                if "lr" in entry:
+                    mult_by_id[id(param)] = float(entry["lr"]) / float(cfg.lr)
+                matched_count += 1
+                break
+    total = sum(1 for _ in model.parameters())
+    ddp_print(f"[loomcloner] train_lr: {matched_count}/{total} parameters matched an override "
+              f"({len(overrides)} entries, {sum(1 for e in overrides if not e.get('train', True))} frozen)")
+    return mult_by_id
+
+
 def optimizer_class_from_name(name: str):
     key = str(name or "adamw").strip().lower()
     if key == "adamw":
@@ -4038,10 +4096,21 @@ class _RunpointWatcher:
         self._old_termios = None
         self._stop = threading.Event()
         self._active = False
+        self._thread: Optional[threading.Thread] = None
 
     def _reader_loop(self) -> None:
+        import select
         while not self._stop.is_set():
             try:
+                # Poll with a short timeout instead of a blocking read(1) --
+                # a blocking read can only notice _stop on its NEXT keystroke,
+                # which is exactly the race that let this thread steal the
+                # first character of a y/N answer meant for _handle_interrupt's
+                # input(). Polling means pause() actually stops this promptly
+                # (~50ms), not "whenever the user happens to type again".
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not r:
+                    continue
                 ch = sys.stdin.read(1)
             except Exception:
                 return
@@ -4070,8 +4139,47 @@ class _RunpointWatcher:
             self._old_termios = None
             return self  # any terminal weirdness at all -- no-op, never crash training
         self._active = True
-        threading.Thread(target=self._reader_loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
         return self
+
+    def pause(self) -> None:
+        """Stop the background reader and restore normal (cooked, echoing)
+        terminal settings -- call this before any input() prompt that needs
+        real keyboard interaction (e.g. the Ctrl-C y/N confirmation). Without
+        this, input() runs while stdin is in cbreak+no-echo mode and this
+        thread is still competing for the same fd: typed characters go
+        missing and nothing gets echoed -- exactly the bug this fixes."""
+        if not self._active:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if self._old_termios is not None:
+            try:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_termios)
+            except Exception:
+                pass
+
+    def resume(self) -> None:
+        """Undo pause() -- only meaningful if training continues after the
+        prompt; a no-op safety net if it was never paused or never entered
+        cbreak mode in the first place."""
+        if not self._active:
+            return
+        try:
+            import termios
+            import tty
+            tty.setcbreak(sys.stdin.fileno())
+            no_echo = termios.tcgetattr(sys.stdin)
+            no_echo[3] &= ~termios.ECHO
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, no_echo)
+        except Exception:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
@@ -4081,10 +4189,9 @@ class _RunpointWatcher:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_termios)
             except Exception:
                 pass
-        # The reader thread is daemon=True and likely blocked inside a single
-        # read() call -- it does not need join(); joining here would hang
-        # waiting for a keystroke that may never come. Process exit (or this
-        # object's garbage collection) reclaims it.
+        # The reader thread now polls with a 0.05s timeout instead of blocking
+        # forever in read(1), so it notices _stop and exits promptly on its own
+        # without needing a join() here.
 
     def consume(self) -> bool:
         if self.requested.is_set():
@@ -4172,6 +4279,7 @@ async def train_one_async(
     model_base = Model(ablation=ablation).to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
+    train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
         grad_bytes = sum(p.numel() * p.element_size() for p in model_compiled.parameters() if p.requires_grad)
@@ -4225,23 +4333,27 @@ async def train_one_async(
     no_decay_param_ids = set()
     if tria_agg is not None:
         no_decay_param_ids.add(id(tria_agg.pool.logit_scale_raw))
-    if no_decay_param_ids:
-        decay_params = [p for p in params if id(p) not in no_decay_param_ids]
-        no_decay_params = [p for p in params if id(p) in no_decay_param_ids]
-        opt = OptimizerClass(
-            [
-                {"params": decay_params},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-    else:
-        opt = OptimizerClass(
-            params,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
+
+    # One param_group per distinct (weight_decay, lr_mult) combination --
+    # unifies the pre-existing no-decay case with train_lr_by_id's per-
+    # parameter lr_mult overrides (loomcloner.py --clone's transplanted-vs-
+    # fresh split). lr_mult (not an absolute lr) because the training loop's
+    # own schedule does g["lr"] = lr_at(cfg, step) * g.get("lr_mult", 1.0)
+    # every step -- setting an absolute lr here would just get overwritten
+    # by that line on the very first step.
+    groups: Dict[Tuple[float, float], List[torch.nn.Parameter]] = {}
+    for p in params:
+        wd = 0.0 if id(p) in no_decay_param_ids else cfg.weight_decay
+        mult = train_lr_by_id.get(id(p), 1.0)
+        groups.setdefault((wd, mult), []).append(p)
+    if len(groups) > 1:
+        summary = ", ".join(f"{len(ps)}@lr_mult={mult:g}/wd={wd:g}" for (wd, mult), ps in groups.items())
+        ddp_print(f"[optimizer] {len(groups)} param groups: {summary}")
+    opt = OptimizerClass(
+        [{"params": ps, "weight_decay": wd, "lr_mult": mult} for (wd, mult), ps in groups.items()],
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
     n_params = count_params(ddp_unwrap_model(model))
 
     if hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
@@ -4316,12 +4428,19 @@ async def train_one_async(
         if ddp_is_main():
             print(f"\n[interrupt] Ctrl-C at step {step}/{cfg.steps} ({tag}, {time.time() - t0:.0f}s elapsed).",
                   file=_REAL_STDOUT, flush=True)
+            runpoint.pause()  # stop the 's'-watcher thread and restore cooked/echo
+                               # terminal mode -- without this, input() below
+                               # competes with that thread for stdin (which
+                               # was in cbreak+no-echo the whole time anyway)
+                               # and silently loses keystrokes.
             try:
                 print("[interrupt] save a checkpoint at this step before exiting? [y/N] ",
                       end="", file=_REAL_STDOUT, flush=True)
                 answer = input().strip().lower()
             except EOFError:
                 answer = "n"
+            finally:
+                runpoint.resume()
             save_flag = 1 if answer in ("y", "yes") else 0
 
         if ddp_is_distributed():
@@ -4883,7 +5002,8 @@ def main() -> None:
     if args.train:
         train_dataset = args.dataset or cfg.train_dataset
         assert train_dataset, "--train needs --dataset or train_dataset in config"
-        asyncio.run(train_async(cfg, train_dataset, dev, args.checkpoint or "loomformer.pt", args.ablation, args.resume, args.resume_step))
+        resume_path = args.resume if args.resume is not None else cfg.resume
+        asyncio.run(train_async(cfg, train_dataset, dev, args.checkpoint or "loomformer.pt", args.ablation, resume_path, args.resume_step))
         return
     if args.export_aoti:
         assert args.checkpoint, "--export-aoti needs --checkpoint"

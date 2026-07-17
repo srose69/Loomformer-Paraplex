@@ -181,9 +181,11 @@ def _configure_visible_cuda_arches() -> None:
     """
     if os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return
-    arch_list = _visible_cuda_arch_list()
-    if arch_list:
-        os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+    # Always set a value before torch.utils.cpp_extension.load(). If CUDA
+    # devices are not visible during build discovery, fall back to the repo's
+    # baseline Pascal target instead of letting PyTorch compile for every arch
+    # it knows about and emit TORCH_CUDA_ARCH_LIST warnings.
+    os.environ["TORCH_CUDA_ARCH_LIST"] = _visible_cuda_arch_list() or "6.1"
 
 
 def _nvcc_arch_flag() -> str:

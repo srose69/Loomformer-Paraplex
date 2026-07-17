@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <cstdlib>
 #include <vector>
 #include <type_traits>
 
@@ -52,6 +53,12 @@ static inline void launch_stacked_bwd_warp(
 #undef BWD_CASE
 
 #undef DEPTH_ATTN_S_DISPATCH
+
+static inline bool depth_attn_warp_disabled() {
+    const char* raw = std::getenv("LOOM_DEPTH_ATTN_DISABLE_WARP");
+    if (raw == nullptr || raw[0] == '\0') return false;
+    return !(raw[0] == '0' && raw[1] == '\0');
+}
 
 std::vector<torch::Tensor> depth_attn_forward_cuda(
     torch::Tensor q, torch::Tensor hist_k, torch::Tensor hist_v) {
@@ -153,7 +160,7 @@ std::tuple<torch::Tensor, torch::Tensor> depth_attn_stacked_forward_cuda(
 
     const int64_t BT = B * T;
     const float inv_sqrt_hd = 1.0f / sqrtf((float)HD);
-    const bool use_warp = (S <= 32) && (HD % 4 == 0);
+    const bool use_warp = (S <= 32) && (HD % 4 == 0) && !depth_attn_warp_disabled();
     const int NWARPS = 4;
     const int threads = 32 * NWARPS;
     const int64_t blocks = use_warp ? (BT * QH + NWARPS - 1) / NWARPS : BT * QH;
@@ -211,7 +218,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> depth_attn_stacked_backw
 
     const int64_t BT = B * T;
     const float inv_sqrt_hd = 1.0f / sqrtf((float)HD);
-    const bool use_warp = (S <= 32) && (HD % 4 == 0);
+    const bool use_warp = (S <= 32) && (HD % 4 == 0) && !depth_attn_warp_disabled();
     const int NWARPS = 4;
     const int threads = 32 * NWARPS;
     const int64_t blocks = use_warp ? (BT * QH + NWARPS - 1) / NWARPS : BT * QH;

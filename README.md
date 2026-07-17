@@ -42,3 +42,5 @@ For context: ResNet-101 has 101 layers and ~1K skip connections. GPT-2 small has
 
 SFT and LoomChat works too! (last is vram-heavy for now but manageable even on my GTX1080, workin' on it) 
 Enjoy 
+
+P.S.  ATOM_META_SCALE=8 nohup python -u loomformer.py --train --config cfg/test.yaml --checkpoint ./test.pt > test.log 2>&1 &

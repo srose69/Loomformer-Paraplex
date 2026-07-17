@@ -10,12 +10,10 @@ import gc
 import signal
 import contextlib
 import glob
-import io
 import json
 import math
 import os
 import random
-import queue
 import subprocess
 import sys
 import threading
@@ -167,66 +165,13 @@ def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tupl
             launch_note = f"CUDA_VISIBLE_DEVICES={visible}"
         if n < 2:
             raise RuntimeError(f"--device {pref or 'cudas'} requested but fewer than 2 CUDA GPUs are visible")
-        torchrun_bootstrap = r"""
-import signal
-
-from torch.distributed.run import main
-
-try:
-    main()
-except KeyboardInterrupt:
-    raise SystemExit(128 + signal.SIGINT)
-except BaseException as exc:
-    try:
-        from torch.distributed.elastic.multiprocessing.api import SignalException
-    except Exception:
-        SignalException = ()
-
-    if SignalException and isinstance(exc, SignalException):
-        sig = int(getattr(exc, "sigval", signal.SIGINT))
-        raise SystemExit(128 + sig)
-
-    raise
-"""
-
-        cmd = [
-            sys.executable,
-            "-c",
-            torchrun_bootstrap,
-            "--standalone",
-            "--nproc_per_node",
-            str(n),
-            __file__,
-        ] + sys.argv[1:]
-
+        cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(n), __file__] + sys.argv[1:]
         if not env.get("OMP_NUM_THREADS"):
             env["OMP_NUM_THREADS"] = str(_auto_omp_threads(n))
-
-        print(
-            f"[ddp] launching ({launch_note}): "
-            f"torchrun --standalone --nproc_per_node {n} ...",
-            flush=True,
-        )
-
+        print(f"[ddp] launching ({launch_note}):", " ".join(cmd), flush=True)
         if "OMP_NUM_THREADS" in env and not os.environ.get("OMP_NUM_THREADS"):
-            print(
-                f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}",
-                flush=True,
-            )
-
-        proc = subprocess.Popen(cmd, env=env)
-
-        while True:
-            try:
-                returncode = proc.wait()
-                break
-            except KeyboardInterrupt:
-                # SIGINT reached torchrun and workers as part of the foreground
-                # process group. Workers handle the checkpoint prompt; the
-                # parent launcher only waits and suppresses its own traceback.
-                continue
-
-        raise SystemExit(returncode)
+            print(f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}", flush=True)
+        raise SystemExit(subprocess.call(cmd, env=env))
 
     world_size = ddp_world_size()
     rank = ddp_rank()
@@ -356,7 +301,7 @@ class Config:
     attn_sdpa_value_fusion: bool = True
     # Debug/perf fallback for old GPUs where FP32 mem-efficient backward is slow:
     # recompute softmax in a custom autograd backward instead of using SDPA bwd.
-    attn_sdpa_recompute_backward: bool = True
+    attn_sdpa_recompute_backward: bool = False
     rope_theta: float = 10000.0
     rope_factor: float = 4.0
     rope_original_seq_len: Optional[int] = None
@@ -375,6 +320,13 @@ class Config:
     save_every: int = 0 
     runpoints_path: Optional[str] = None  
     tria_carry_enabled: bool = False
+    # False (default): ParaplexFFN's amp gate is self-referential, amp=softplus(p_real)
+    #   (original design, zero extra parameters).
+    # True: amp comes from an independent gate_proj Linear(N,HIDDEN) instead --
+    #   the slot a SwiGLU donor's gate_proj maps onto during --rebuild/loomcloner
+    #   transplant. Adds HIDDEN*N parameters per layer; requires the extended
+    #   paraplex CUDA kernel (gate_src argument) to keep the fused fast path.
+    paraplex_gate_proj: bool = False
     use_cuda_tria: bool = False
     graph: bool = False
     save_graph: bool = False  
@@ -724,6 +676,10 @@ IMAG_IN = 0
 PHASE_SECTORS = "head"
 GRAD_CHECKPOINTING = False
 TRIA_CARRY_ENABLED = False
+PARAPLEX_GATE_PROJ = False  # False: amp = softplus(p_real), self-referential (original design)
+                            # True: amp = softplus(gate_proj(u)), independent learned gate
+                            # (donor-transplant path: gate_proj maps 1:1 onto a SwiGLU donor's
+                            # gate_proj matrix -- see loomcloner.py mapping notes)
 TRIA_GAMMA_MAX = 0.25
 TRIA_RAW_GAMMA_INIT = 0.0
 TRIA_TEMPORAL_ENABLED = True
@@ -748,7 +704,7 @@ AMP_DTYPE = "fp32"
 ATTN_IMPL = "sdpa"
 ATTN_SDPA_COMPUTE_DTYPE = "auto"
 ATTN_SDPA_VALUE_FUSION = True
-ATTN_SDPA_RECOMPUTE_BACKWARD = True
+ATTN_SDPA_RECOMPUTE_BACKWARD = False
 _sdpa_bf16_efficient_cache: Dict[Tuple[int, int, int], bool] = {}
 _REAL_STDOUT = sys.stdout
 ROPE_THETA = 10000.0
@@ -820,18 +776,10 @@ def make_w1_imag_live_flat_indices() -> torch.Tensor:
     return torch.tensor(idx, dtype=torch.long)
 
 
-def paraplex_ffn_params() -> int:
-    # w1_real: H*N + H
-    # w1_imag (compact, per-sector, 5 slots: Q/Kctx/C/U/D): H*IMAG_IN live weights only
-    # trace: H, phase bias: H
-    # w2: N*H + N
-    return HIDDEN * (2 * N + IMAG_IN + 3) + N
-
-
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -841,6 +789,7 @@ def apply_config(cfg: Config) -> None:
     TIED_EMBEDDINGS = bool(getattr(cfg, "tied_embeddings", True))
     GRAD_CHECKPOINTING = bool(getattr(cfg, "grad_checkpointing", False))
     TRIA_CARRY_ENABLED = bool(getattr(cfg, "tria_carry_enabled", False))
+    PARAPLEX_GATE_PROJ = bool(getattr(cfg, "paraplex_gate_proj", False))
     TRIA_GAMMA_MAX = float(getattr(cfg, "tria_gamma_max", 0.25))
     TRIA_RAW_GAMMA_INIT = float(getattr(cfg, "tria_raw_gamma_init", 0.0))
     TRIA_TEMPORAL_ENABLED = bool(getattr(cfg, "tria_temporal_enabled", True))
@@ -886,13 +835,6 @@ def apply_config(cfg: Config) -> None:
             f"HEAD_DIM={HEAD_DIM} is not divisible by 4; the optimized warp-per-row "
             "depth_attn CUDA kernel will be disabled and the slower block-per-row fallback "
             "will be used. Set head_dim to a multiple of 4 for the fast path.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    elif os.environ.get("LOOM_DEPTH_ATTN_DISABLE_WARP", "").strip() not in ("", "0"):
-        warnings.warn(
-            "LOOM_DEPTH_ATTN_DISABLE_WARP is set; depth_attn will use the legacy "
-            "block-per-row stacked CUDA path instead of the optimized warp-per-row path.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1056,17 +998,7 @@ def warmup_cuda_kernels() -> None:
     if USE_CUDA_BETA_SPACE:
         _try_load_cuda_beta_space()
     if tria.cuda_tria_enabled():
-        # tria's loader prints every internal kernel name. Keep startup output
-        # compact while preserving compiler diagnostics on stderr.
-        captured = io.StringIO()
-        with contextlib.redirect_stdout(captured):
-            module = tria._try_load_cuda_tria()
-        if module is None:
-            detail = captured.getvalue().strip()
-            if detail:
-                ddp_print(detail.splitlines()[-1])
-        else:
-            ddp_print('[kernels] Tria CUDA kernel bundle loaded')
+        tria._try_load_cuda_tria()
 
 class ByteTokenizer:
     vocab_size = 256
@@ -1676,190 +1608,132 @@ def _encode_batch_any(tok, texts: List[str]) -> List[List[int]]:
 
 
 class ShardStream:
-    _CHUNK_DOCS = 20000
-
     def __init__(self, path: str, cfg: Config, device: torch.device, tokenizer=None):
         self.cfg = cfg
         self.device = device
         self.tok = tokenizer if tokenizer is not None else build_tokenizer(cfg)
         self._bos_id = _tok_special_id(self.tok, "<bos>")
         self._eos_id = _tok_special_id(self.tok, "<eos>")
+
         fmt_cfg = str(getattr(cfg, "dataset_format", "auto") or "auto")
-        self._files = RawCorpus._resolve_files(path, fmt_cfg)
-        if not self._files:
+        files = RawCorpus._resolve_files(path, fmt_cfg)
+        if not files:
             raise ValueError(f"no corpus files found at {path!r} (format={fmt_cfg!r})")
-        self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(self._files[0])
+        self._files = files
+        self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(files[0])
         self._text_field = getattr(cfg, "text_field", "text")
-        self._rank = ddp_rank() if ddp_is_distributed() else 0
-        self._world_size = ddp_world_size() if ddp_is_distributed() else 1
-        row_counts = [self._file_row_count(path) for path in self._files]
-        total_rows = int(sum(row_counts))
-        global_start = total_rows * self._rank // self._world_size
-        global_end = total_rows * (self._rank + 1) // self._world_size
-        self._row_plan: List[Tuple[int, int, int]] = []
-        cursor = 0
-        for file_index, nrows in enumerate(row_counts):
-            a = max(global_start, cursor) - cursor
-            b = min(global_end, cursor + nrows) - cursor
-            if a < b:
-                self._row_plan.append((file_index, int(a), int(b)))
-            cursor += nrows
-        self._assigned_rows = global_end - global_start
-        if self._assigned_rows <= 0 or not self._row_plan:
-            raise ValueError(f"rank {self._rank} received no rows")
-        self._content_need = int(cfg.seq_len) + 1 - (1 if self._bos_id is not None else 0)
-        self._ram_queue: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.prefetch_batches)))
-        self._stop = threading.Event()
-        self._producer_error = None
-        self._gpu_batches = None
-        self._gpu_pos = 0
-        self._producer = threading.Thread(target=self._produce_cpu_batches, daemon=True, name=f"data-rank-{self._rank}")
-        self._producer.start()
-        plan = ", ".join(f"{os.path.basename(self._files[i])}[{a}:{b}]" for i, a, b in self._row_plan)
-        if ddp_is_distributed():
-            plans = [None] * self._world_size
-            dist.all_gather_object(plans, (self._rank, self._assigned_rows, plan))
-            if ddp_is_main():
-                for rank, rows, desc in sorted(plans):
-                    print(f"[data] rank={rank} rows={rows:,} plan={desc}", flush=True)
+        self._single_file = len(self._files) < 2
+
+        rank = ddp_rank() if ddp_is_distributed() else 0
+        self._rng = np.random.default_rng(int(getattr(cfg, "seed", 1)) + 1000003 * int(rank))
+        self._order = list(range(len(self._files)))
+        self._rng.shuffle(self._order)
+        self._pos = 0
+
+        self.current_tokens = self._tokenize_shard(self._next_index())  # first (only, if single-file) shard
+        if self._single_file:
+            self._executor = None
+            self._prefetch_future = None
         else:
-            print(f"[data] rank=0 rows={self._assigned_rows:,} plan={plan}", flush=True)
+            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-tokenize")
+            self._prefetch_future = self._executor.submit(self._tokenize_shard, self._next_index())
 
-    def _file_row_count(self, path: str) -> int:
-        if self._fmt == "parquet":
-            import pyarrow.parquet as pq
-            return int(pq.ParquetFile(path).metadata.num_rows)
-        if self._fmt == "arrow":
-            table, _ = _read_arrow_table_with_container(path)
-            n = int(table.num_rows)
-            del table
-            return n
-        if self._fmt == "jsonl":
-            with open(path, "rb") as f:
-                return sum(1 for line in f if line.strip())
-        if self._fmt == "txt":
-            return 1
-        raise ValueError(f"unsupported raw dataset format {self._fmt!r}")
+    def _next_index(self) -> int:
+        if self._pos >= len(self._order):
+            self._rng.shuffle(self._order)
+            self._pos = 0
+        idx = self._order[self._pos]
+        self._pos += 1
+        return idx
 
-    def _iter_text_chunks(self, path: str, row_start: int, row_end: int):
+    _CHUNK_DOCS = 20000 
+
+    def _iter_text_chunks(self, p: str):
         if self._fmt in ("parquet", "arrow"):
             if self._fmt == "parquet":
                 import pyarrow.parquet as pq
-                table = pq.read_table(path, columns=[self._text_field])
+                table = pq.read_table(p, columns=[self._text_field])
             else:
-                table, _ = _read_arrow_table_with_container(path)
-            col = table.column(self._text_field).slice(row_start, row_end - row_start)
-            for start in range(0, len(col), self._CHUNK_DOCS):
-                yield col.slice(start, min(self._CHUNK_DOCS, len(col) - start)).to_pylist()
-            return
-        if self._fmt == "jsonl":
-            chunk = []
-            row = 0
-            with open(path, "rb") as f:
+                table, _container = _read_arrow_table_with_container(p)
+            col = table.column(self._text_field)
+            n = len(col)
+            for start in range(0, n, self._CHUNK_DOCS):
+                yield col.slice(start, self._CHUNK_DOCS).to_pylist()
+            del table, col  # the decoded table can go as soon as the last slice is yielded
+        elif self._fmt == "jsonl":
+            chunk: List[str] = []
+            with open(p, "rb") as f:
                 for line in f:
-                    if not line.strip():
-                        continue
-                    if row >= row_end:
-                        break
-                    if row >= row_start:
-                        chunk.append(json.loads(line.decode("utf-8", errors="replace")).get(self._text_field, ""))
-                        if len(chunk) >= self._CHUNK_DOCS:
-                            yield chunk
-                            chunk = []
-                    row += 1
+                    chunk.append(json.loads(line.decode("utf-8", errors="replace")).get(self._text_field, ""))
+                    if len(chunk) >= self._CHUNK_DOCS:
+                        yield chunk
+                        chunk = []
             if chunk:
                 yield chunk
-            return
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            yield [f.read()]
+        else:  # txt: one shard IS one file's whole content, one document
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                yield [f.read()]
 
-    def _produce_cpu_batches(self) -> None:
-        try:
-            carry = np.zeros(0, dtype=np.int64)
-            eos = np.array([self._eos_id], dtype=np.int64) if self._eos_id is not None else None
-            first_doc = True
-            while not self._stop.is_set():
-                for file_index, row_start, row_end in self._row_plan:
-                    for texts in self._iter_text_chunks(self._files[file_index], row_start, row_end):
-                        encoded = _encode_batch_any(self.tok, texts)
-                        pieces = []
-                        for ids in encoded:
-                            if not first_doc and eos is not None:
-                                pieces.append(eos)
-                            pieces.append(np.asarray(ids, dtype=np.int64))
-                            first_doc = False
-                        if pieces:
-                            block = np.concatenate(pieces)
-                            carry = np.concatenate((carry, block)) if carry.size else block
-                        batch_tokens = int(self.cfg.batch_size) * self._content_need
-                        while carry.size >= batch_tokens and not self._stop.is_set():
-                            block = carry[:batch_tokens].reshape(int(self.cfg.batch_size), self._content_need)
-                            carry = carry[batch_tokens:]
-                            batch = torch.from_numpy(block.copy())
-                            if self._bos_id is not None:
-                                bos = torch.full((batch.shape[0], 1), int(self._bos_id), dtype=torch.int64)
-                                batch = torch.cat((bos, batch), dim=1)
-                            if self.device.type == "cuda":
-                                batch = batch.pin_memory()
-                            self._ram_queue.put(batch)
-                first_doc = True
-        except BaseException as exc:
-            self._producer_error = exc
-            try:
-                self._ram_queue.put_nowait(None)
-            except queue.Full:
-                pass
+    def _tokenize_shard(self, file_index: int) -> torch.Tensor:
+        p = self._files[file_index]
+        eos_arr = np.array([self._eos_id], dtype=np.int64) if self._eos_id is not None else None
+        pieces: List[np.ndarray] = []
+        first_doc_overall = True
+        for chunk_texts in self._iter_text_chunks(p):
+            encoded = _encode_batch_any(self.tok, chunk_texts)
+            del chunk_texts
+            for doc_ids in encoded:
+                if not first_doc_overall and eos_arr is not None:
+                    pieces.append(eos_arr)
+                pieces.append(np.asarray(doc_ids, dtype=np.int64))
+                first_doc_overall = False
+            del encoded
+        arr = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.int64)
+        del pieces
+        return torch.from_numpy(arr).to(self.device, non_blocking=True)
 
-    def _get_cpu_batch(self) -> torch.Tensor:
-        batch = self._ram_queue.get()
-        if batch is None:
-            raise RuntimeError("data producer failed") from self._producer_error
-        return batch
-
-    async def _load_gpu_chunk(self, count: int) -> None:
-        loop = asyncio.get_running_loop()
-        batches = []
-        for _ in range(count):
-            batches.append(await loop.run_in_executor(None, self._get_cpu_batch))
-        host = torch.stack(batches)
-        self._gpu_batches = host.to(self.device, non_blocking=True)
-        self._gpu_pos = 0
-
-    async def prime(self) -> None:
-        count = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
-        await self._load_gpu_chunk(count)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        if ddp_is_distributed():
-            ready = [None] * self._world_size
-            dist.all_gather_object(ready, (self._rank, count))
-            if ddp_is_main():
-                for rank, n in sorted(ready):
-                    print(f"[data] rank={rank} ready: RAM={int(self.cfg.prefetch_batches)} batches, GPU={n} batches", flush=True)
-        else:
-            print(f"[data] rank=0 ready: RAM={int(self.cfg.prefetch_batches)} batches, GPU={count} batches", flush=True)
-
-    def sample_device_batch(self) -> torch.Tensor:
-        batch = self._get_cpu_batch()
-        return batch.to(self.device, non_blocking=True)
+    def _maybe_swap_shard(self) -> None:
+        if self._single_file:
+            return  # nothing to swap to -- keep serving windows from the one file
+        content_need = self.cfg.seq_len + 1
+        if len(self.current_tokens) < content_need * 4:  # headroom before hard-exhausting the window range
+            self.current_tokens = self._prefetch_future.result()  # blocks only if genuinely not ready -- shouldn't happen in practice
+            self._prefetch_future = self._executor.submit(self._tokenize_shard, self._next_index())
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
     def _sample_batch(self) -> torch.Tensor:
-        return self.sample_device_batch()
+        self._maybe_swap_shard()
+        B = self.cfg.batch_size
+        content_need = self.cfg.seq_len + 1 - (1 if self._bos_id is not None else 0)
+        n = len(self.current_tokens)
+        ix = self._rng.integers(0, n - content_need - 1, size=B)
+        rows = [self.current_tokens[i: i + content_need] for i in ix]
+        if self._bos_id is not None:
+            bos = torch.tensor([self._bos_id], device=self.device, dtype=torch.int64)
+            rows = [torch.cat([bos, r]) for r in rows]
+        return torch.stack(rows)
+
+    def sample_device_batch(self) -> torch.Tensor:
+        return self._sample_batch()  # already resident on self.device
+
+    async def _produce(self, queue: "asyncio.Queue", n: int):
+        loop = asyncio.get_event_loop()
+        for _ in range(n):
+            batch = await loop.run_in_executor(None, self._sample_batch)
+            await queue.put(batch)
+        await queue.put(None)
 
     async def batches(self, n: int):
-        chunk_size = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
-        yielded = 0
-        while yielded < n:
-            if self._gpu_batches is None or self._gpu_pos >= self._gpu_batches.shape[0]:
-                await self._load_gpu_chunk(min(chunk_size, n - yielded))
-            while self._gpu_pos < self._gpu_batches.shape[0] and yielded < n:
-                batch = self._gpu_batches[self._gpu_pos]
-                self._gpu_pos += 1
-                yielded += 1
-                yield batch
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(getattr(self.cfg, "prefetch_batches", 256))))
+        producer = asyncio.create_task(self._produce(queue, n))
+        while True:
+            batch = await queue.get()
+            if batch is None:
+                break
+            yield batch
+        await producer
 
-    def close(self) -> None:
-        self._stop.set()
 
 def make_stream(path: str, cfg: Config, device: torch.device):
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
@@ -2400,7 +2274,7 @@ class _BetaSpaceDirect(torch.autograd.Function):
 class _ParaplexFused(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, p_real, u, q_h, k_h, c_h, d_h, w_imag, bias, trace, trace_w,
+        ctx, p_real, gate_src, u, q_h, k_h, c_h, d_h, w_imag, bias, trace, trace_w,
         reset, anchor, hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         phase_mode, update_anchor, anchor_decay, phase_floor, near_eps, powlu_m,
     ):
@@ -2412,11 +2286,11 @@ class _ParaplexFused(torch.autograd.Function):
             u, q_h, k_h, c_h, d_h, w_imag,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         act, s, next_trace, anchor_snapshot = core_ext.paraplex_forward(
-            p_real, beta, bias, trace, trace_w, reset, anchor,
+            p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
             phase_mode, update_anchor, anchor_decay, powlu_m)
         ctx.mark_non_differentiable(anchor_snapshot)
         ctx.save_for_backward(
-            p_real, beta, bias, trace, trace_w, reset, anchor_snapshot,
+            p_real, gate_src, beta, bias, trace, trace_w, reset, anchor_snapshot,
             r_pack, w_contig)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2], w_imag.shape[0], w_imag.shape[1])
         ctx.meta = (
@@ -2431,13 +2305,13 @@ class _ParaplexFused(torch.autograd.Function):
         beta_ext = _try_load_cuda_beta_space()
         if core_ext is None or beta_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
-        p_real, beta, bias, trace, trace_w, reset, anchor, r_pack, w_contig = ctx.saved_tensors
+        p_real, gate_src, beta, bias, trace, trace_w, reset, anchor, r_pack, w_contig = ctx.saved_tensors
         grad_act = torch.zeros_like(p_real) if grad_act is None else grad_act.to(dtype=p_real.dtype)
         grad_s = torch.zeros_like(p_real) if grad_s is None else grad_s.to(dtype=p_real.dtype)
         grad_next = torch.zeros_like(trace) if grad_next is None else grad_next.to(dtype=trace.dtype)
         hidden_per_q_head, head_dim, n_q_heads, open_sectors, mode, floor, near_eps, m = ctx.meta
-        grad_p, grad_beta, grad_bias, grad_trace, grad_trace_w = core_ext.paraplex_backward(
-            grad_act, grad_s, grad_next, p_real, beta, bias, trace, trace_w,
+        grad_p, grad_gate, grad_beta, grad_bias, grad_trace, grad_trace_w = core_ext.paraplex_backward(
+            grad_act, grad_s, grad_next, p_real, gate_src, beta, bias, trace, trace_w,
             reset, anchor, mode, floor, near_eps, m)
         B, T, N_local, H_local, imag_in = ctx.shapes
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_ext.beta_backward_cuda(
@@ -2445,7 +2319,7 @@ class _ParaplexFused(torch.autograd.Function):
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         QH, HD = n_q_heads, head_dim
         return (
-            grad_p, grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
+            grad_p, grad_gate, grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
             grad_c.view(B, T, QH, HD), grad_d.view(B, T, QH, HD), grad_w,
             grad_bias, grad_trace, grad_trace_w, None, None,
             None, None, None, None, None, None, None, None, None, None,
@@ -2562,6 +2436,13 @@ class ParaplexFFN(nn.Module):
         else:
             self.gate_selector = None
             self.identity_gate = None
+        # Independent gate source (donor-transplant slot -- see PARAPLEX_GATE_PROJ
+        # above). None in the default/original design: amp is self-referential,
+        # derived from p_real with zero extra parameters.
+        if PARAPLEX_GATE_PROJ:
+            self.gate_proj = nn.Linear(N, HIDDEN)
+        else:
+            self.gate_proj = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -2571,6 +2452,8 @@ class ParaplexFFN(nn.Module):
         # Start exactly on the non-recurrent phase path; trace learns in only if useful.
         nn.init.zeros_(self.w1_imag_trace)
         nn.init.zeros_(self.w1_imag_bias)
+        if self.gate_proj is not None:
+            init_linear_fanin(self.gate_proj)
 
     @staticmethod
     def _merge_query_heads(x: torch.Tensor) -> torch.Tensor:
@@ -2633,7 +2516,7 @@ class ParaplexFFN(nn.Module):
         return F.linear(r_all, self._dense_imag_weight())                    # один dense GEMM
 
     def _fused_paraplex(
-        self, p_real: torch.Tensor, u: torch.Tensor, q_h: torch.Tensor,
+        self, p_real: torch.Tensor, gate_src: torch.Tensor, u: torch.Tensor, q_h: torch.Tensor,
         k_ctx_h: torch.Tensor, c_h: torch.Tensor, d_h: torch.Tensor,
         trace: torch.Tensor, reset_mask: Optional[torch.Tensor],
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -2658,7 +2541,7 @@ class ParaplexFFN(nn.Module):
         mode = 1 if PHASE_GRAD_MODE == "secant" else 0
         update_anchor = bool(mode == 1 and self.training)
         act, s, next_trace, anchor_snapshot = _ParaplexFused.apply(
-            cast(p_real), cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
+            cast(p_real), cast(gate_src), cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
             cast(self.w1_imag), self.w1_imag_bias, cast(trace), self.w1_imag_trace,
             reset, self.beta_anchor.detach(), HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS,
             PHASE_SECTORS == "open", mode, update_anchor, self.beta_anchor_decay,
@@ -2695,14 +2578,20 @@ class ParaplexFFN(nn.Module):
             p_real = self.identity_gate(wx, self.w1_real.bias, p_in)
         else:
             p_real = wx + self.w1_real.bias
+        # Independent gate source (donor-transplant path): PARAPLEX_GATE_PROJ off
+        # (default) keeps the original, parameter-free self-referential design --
+        # gate_src IS p_real, amp derives from the same tensor the value path uses.
+        # PARAPLEX_GATE_PROJ on: an independent Linear gives amp its own signal
+        # (the slot a SwiGLU donor's gate_proj maps onto under --rebuild).
+        gate_src = self.gate_proj(u) if self.gate_proj is not None else p_real
         s = None  # only defined on the non-ablation path -- see return_tria note below
-        fused = self._fused_paraplex(p_real, u, q_h, k_ctx_h, c_h, d_h, trace, phase_reset_mask)
+        fused = self._fused_paraplex(p_real, gate_src, u, q_h, k_ctx_h, c_h, d_h, trace, phase_reset_mask)
         if fused is not None:
             act_out, s, trace = fused
             ffn_out = self.w2(act_out)
             return (ffn_out, trace, (p_real, s, act_out)) if return_tria else (ffn_out, trace)
 
-        amp = F.softplus(p_real)
+        amp = F.softplus(gate_src)
         if self.ablation:
             p = p_real + amp
             trace = torch.ones(B, HIDDEN, device=u.device, dtype=u.dtype)
@@ -2893,7 +2782,7 @@ class _RecomputeAttention(torch.autograd.Function):
                 scores = scores.masked_fill(~attn_mask, float("-inf"))
             elif is_causal:
                 T, S = q.shape[-2], k.shape[-2]
-                q_pos = torch.arange(T, device=q.device)[:, None]
+                q_pos = torch.arange(S - T, S, device=q.device)[:, None]
                 k_pos = torch.arange(S, device=q.device)[None, :]
                 causal = (k_pos <= q_pos).view(1, 1, T, S)
                 scores = scores.masked_fill(~causal, float("-inf"))
@@ -2915,7 +2804,7 @@ class _RecomputeAttention(torch.autograd.Function):
             scores = scores.masked_fill(~attn_mask, float("-inf"))
         elif ctx.is_causal:
             T, S = q.shape[-2], k.shape[-2]
-            q_pos = torch.arange(T, device=q.device)[:, None]
+            q_pos = torch.arange(S - T, S, device=q.device)[:, None]
             k_pos = torch.arange(S, device=q.device)[None, :]
             causal = (k_pos <= q_pos).view(1, 1, T, S)
             scores = scores.masked_fill(~causal, float("-inf"))
@@ -3315,25 +3204,11 @@ class Model(nn.Module):
         self.tria_hard_fire_enabled = True
         self.last_tria_document_carry_stats: Optional[dict] = None
         self.last_tria_fire_mask: Optional[torch.Tensor] = None
-        self._disable_structurally_unused_params()
         self.reset_parameters()
-
-    def _disable_structurally_unused_params(self) -> None:
-        if not TRIA_CARRY_ENABLED or not self.blocks:
-            return
-        # Block 0 never receives a tria carrier input, so this gate scalar is
-        # outside the training graph on every step.
-        first_gate = getattr(self.blocks[0].ffn, "identity_gate", None)
-        if first_gate is not None:
-            first_gate.raw_alpha.requires_grad_(False)
-        # The last block never emits p_out to another block, so its selector is
-        # also unreachable from the loss.
-        last_selector = getattr(self.blocks[-1].ffn, "gate_selector", None)
-        if last_selector is not None:
-            last_selector.logits.requires_grad_(False)
 
     def reset_parameters(self) -> None:
         init_embedding_fanin(self.emb)
+
     def _build_tria_document_reset_mask(
         self,
         idx: torch.Tensor,
@@ -3939,7 +3814,6 @@ def compute_raw_bytes_per_token_meta(
         "docs": int(docs),
         "total_docs": int(len(corpus)),
         "total_chars": int(corpus.total_chars),
-        "estimated_tokens": int(round(corpus.total_chars / max(1e-12, bpt))),
         "exact": bool(exact),
         "sample_stride": int(sample_stride),
         "source": "computed_from_raw_corpus" if exact else "estimated_from_raw_corpus_sample",
@@ -3976,19 +3850,10 @@ def ensure_eval_bytes_per_token_meta(dataset: str, cfg: "Config", device: torch.
     bpt, meta_path, ok = load_bytes_per_token(dataset)
     if ok or _is_prepared_token_dataset(dataset, cfg):
         return bpt, meta_path, ok
-    max_docs = 4096
     if ddp_is_main():
-        ddp_print(
-            f"[meta] {meta_path} missing; estimating eval bytes/token from "
-            f"{dataset} with active tokenizer (sample_docs={max_docs})..."
-        )
-        bpt, meta_path = compute_raw_bytes_per_token_meta(dataset, cfg, meta_path, max_docs=max_docs)
-        try:
-            with open(meta_path, encoding="utf-8") as _f:
-                _exact = bool(json.load(_f).get("exact", False))
-        except Exception:
-            _exact = False
-        ddp_print(f"[meta] wrote {meta_path} bytes/token={bpt:.6f} exact={str(_exact).lower()}")
+        ddp_print(f"[meta] {meta_path} missing; computing eval bytes/token from {dataset} with active tokenizer...")
+        bpt, meta_path = compute_raw_bytes_per_token_meta(dataset, cfg, meta_path, max_docs=None)
+        ddp_print(f"[meta] wrote {meta_path} bytes/token={bpt:.6f} exact=true")
     ddp_barrier(device)
     return load_bytes_per_token(dataset)
 
@@ -4008,17 +3873,6 @@ def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
         if nbytes % item != 0:
             raise ValueError(f"prepared dataset byte size is not uint16-aligned: {dataset} has {nbytes} bytes")
         return nbytes // item
-    meta_path = dataset + ".meta.json"
-    if os.path.exists(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            meta = json.load(f)
-        cached_tokens = int(meta.get("estimated_tokens", meta.get("tokens", 0)) or 0)
-        total_chars = int(meta.get("total_chars", 0) or 0)
-        bpt = float(meta.get("bytes_per_token", 0.0) or 0.0)
-        if total_chars > 0 and math.isfinite(bpt) and bpt > 0.0:
-            cached_tokens = int(round(total_chars / bpt))
-        if cached_tokens > 0:
-            return cached_tokens
     if cfg is None:
         raise ValueError("dataset_token_count needs cfg to estimate a raw-format corpus")
     tok = build_tokenizer(cfg)
@@ -4028,57 +3882,11 @@ def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
     sample_chars = sample_tokens = 0
     for fi, key, length in sample:
         text = corpus._read_doc_text(fi, key, length)
-        sample_chars += len(text.encode("utf-8"))
+        sample_chars += len(text)
         sample_tokens += len(tok.encode(text))
     ratio = sample_chars / max(1, sample_tokens)
-    estimated_tokens = int(round(corpus.total_chars / max(1e-6, ratio)))
-    payload = {
-        "tokens": int(sample_tokens),
-        "bytes": int(sample_chars),
-        "bytes_per_token": float(ratio),
-        "vocab": int(cfg.vocab),
-        "format": str(corpus.fmt),
-        "text_field": str(getattr(cfg, "text_field", "text")),
-        "docs": int(len(sample)),
-        "total_docs": int(len(corpus)),
-        "total_chars": int(corpus.total_chars),
-        "estimated_tokens": int(estimated_tokens),
-        "exact": False,
-        "source": "estimated_from_raw_corpus_sample",
-    }
-    tmp = meta_path + f".tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, meta_path)
-    return estimated_tokens
+    return int(corpus.total_chars / max(1e-6, ratio))
 
-
-def depth_attn_param_count() -> int:
-    return 3 * N * N + 2 * LAYERS * N
-
-
-def common_param_count() -> int:
-    emb = VOCAB * N
-    head = 0 if TIED_EMBEDDINGS else VOCAB * N
-    # Attention: q/o are N x N; k/v are KV_DIM x N. LayerNorms: two per block.
-    attn = 2 * N * N + 2 * KV_DIM * N
-    norms = 4 * N
-    return emb + head + LAYERS * (attn + norms) + depth_attn_param_count()
-
-
-def tria_param_count() -> int:
-    if not TRIA_CARRY_ENABLED:
-        return 0
-    k = 32       
-    per_layer = 10
-    # reader + aggregator + final cross-attention (gamma/raw_gamma) params only --
-    # the adaptive probe/threshold heads were removed (spec §15.1).
-    model_level = (9 * k + k) + (9 * k) + (2 * N * N + 1)
-    return LAYERS * per_layer + model_level
-
-
-def model_param_count_formula() -> int:
-    return common_param_count() + LAYERS * paraplex_ffn_params() + tria_param_count()
 
 
 def format_big_int(n: int) -> str:
@@ -4086,7 +3894,7 @@ def format_big_int(n: int) -> str:
 
 
 
-def print_training_budget(cfg: Config, dataset: str) -> None:
+def print_training_budget(cfg: Config, dataset: str, ablation: bool = False) -> None:
     data_tokens = dataset_token_count(dataset, cfg)
     global_bs = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
@@ -4095,7 +3903,13 @@ def print_training_budget(cfg: Config, dataset: str) -> None:
     run_epochs = run_tokens / max(1, data_tokens)
     print(f"  budget   {format_big_int(run_tokens)} tokens over {cfg.steps:,} steps "
           f"({run_epochs:.3f} epochs of {format_big_int(data_tokens)})")
-    params = model_param_count_formula()
+    # Real count, not a hand-maintained formula: a throwaway CPU-only instance
+    # (no .to(device), no compile -- Model() construction itself never touches
+    # CUDA, kernels load lazily on first forward()) costs a few seconds even at
+    # ~1B params and is immediately discarded. This was a formula before and it
+    # silently drifted out of sync the moment PARAPLEX_GATE_PROJ was added --
+    # one source of truth (the real nn.Module tree) instead of two.
+    params = count_params(Model(ablation=ablation))
     tpp = run_tokens / max(1, params)
     epoch_tokens_per_param = data_tokens / max(1, params)
     print(f"           paraplex: {format_big_int(params)} params  ·  "
@@ -4344,8 +4158,6 @@ async def train_one_async(
             ddp_print("[resume] fast-forward done.")
         ddp_print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
                   f"LR schedule/log step numbering continue (unchanged if cfg.steps/warmup_steps match the original run).")
-    if isinstance(stream, ShardStream):
-        await stream.prime()
     eval_dataset = val_dataset or dataset
     eval_stream = stream if os.path.abspath(eval_dataset) == os.path.abspath(dataset) else make_stream(eval_dataset, cfg, device)
     train_eos_id = getattr(stream, "_eos_id", None) if bool(getattr(cfg, "doc_reset_attn", True)) else None
@@ -4355,15 +4167,6 @@ async def train_one_async(
         eval_bpt = train_bpt
     else:
         eval_bpt, _, _ = ensure_eval_bytes_per_token_meta(eval_dataset, cfg, device)
-
-    ddp_barrier(device)
-    if ddp_is_main():
-        print("[data] all ranks ready", flush=True)
-    apply_config(cfg)
-    print_architecture_report(cfg, device, ablation, dataset, val_dataset)
-    if ddp_is_main():
-        print_training_budget(cfg, dataset)
-    ddp_print("=" * 64)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
     model_base = Model(ablation=ablation).to(device)
@@ -4415,8 +4218,7 @@ async def train_one_async(
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
 
-    named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
-    params = [p for _, p in named_params]
+    params = [p for p in model.parameters() if p.requires_grad]
     OptimizerClass, optimizer_name = optimizer_class_from_name(cfg.optimizer)
     base_model = ddp_unwrap_model(model)
     tria_agg = getattr(base_model, "tria_agg", None)
@@ -4442,7 +4244,7 @@ async def train_one_async(
         )
     n_params = count_params(ddp_unwrap_model(model))
 
-    if bool(getattr(cfg, "graph", False)) and hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
+    if hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
         ddp_print("[compile] torch.compile warmup -- tracing + JIT compiling fused kernels (this may take a while)...")
         _warm_batch2 = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
         _wx2, _wy2 = _warm_batch2[:, :-1], _warm_batch2[:, 1:]
@@ -4477,74 +4279,6 @@ async def train_one_async(
     tokens_seen_global = 0
     data_wait_s = 0.0 
     batch_iter = stream.batches((int(cfg.steps) - start_step) * accum_steps).__aiter__()
-
-    def _tensor_stats(t: torch.Tensor) -> str:
-        tf = t.detach().float()
-        finite = torch.isfinite(tf)
-        finite_count = int(finite.sum().item())
-        total = tf.numel()
-        if finite_count > 0:
-            vals = tf[finite]
-            amin = float(vals.amin().item())
-            amax = float(vals.amax().item())
-        else:
-            amin = float("nan")
-            amax = float("nan")
-        nan_count = int(torch.isnan(tf).sum().item())
-        inf_count = int(torch.isinf(tf).sum().item())
-        return (
-            f"shape={tuple(t.shape)} finite={finite_count}/{total} "
-            f"nan={nan_count} inf={inf_count} min={amin:.9g} max={amax:.9g}"
-        )
-
-    def _first_nonfinite(which: str) -> Optional[str]:
-        for name, p in named_params:
-            t = p.grad if which == "grad" else p
-            if t is None:
-                continue
-            if not torch.isfinite(t.detach()).all():
-                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
-                return (
-                    f"{name}: {which} {_tensor_stats(t)} | "
-                    f"param {_tensor_stats(p)} | {grad_stats}"
-                )
-        return None
-
-    def _collect_nonfinite(which: str, limit: int = 10) -> List[str]:
-        out: List[str] = []
-        for name, p in named_params:
-            t = p.grad if which == "grad" else p
-            if t is None:
-                continue
-            if not torch.isfinite(t.detach()).all():
-                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
-                out.append(
-                    f"{name}: {which} {_tensor_stats(t)} | "
-                    f"param {_tensor_stats(p)} | {grad_stats}"
-                )
-                if len(out) >= limit:
-                    break
-        return out
-
-    def _summarize_nonfinite(which: str) -> str:
-        counts: Dict[str, int] = {}
-        total = 0
-        for name, p in named_params:
-            t = p.grad if which == "grad" else p
-            if t is None:
-                continue
-            if not torch.isfinite(t.detach()).all():
-                total += 1
-                prefix = name.split(".", 2)
-                if len(prefix) >= 2 and prefix[0] == "blocks":
-                    key = ".".join(prefix[:2])
-                else:
-                    key = prefix[0]
-                counts[key] = counts.get(key, 0) + 1
-        if total == 0:
-            return "(none)"
-        parts = [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-        return f"total={total} by_module=" + ", ".join(parts)
 
     def _save_checkpoint(path_override: Optional[str] = None) -> None:
         if ckpt_out and ddp_is_main():
@@ -4604,7 +4338,6 @@ async def train_one_async(
 
         if ddp_is_distributed():
             ddp_barrier(device)
-            dist.destroy_process_group()
         raise SystemExit(130)  # 128+SIGINT: conventional shell exit code for Ctrl-C
 
     step = start_step
@@ -4643,13 +4376,6 @@ async def train_one_async(
                     # Read before custom CUDA backward: if the same scalar changes
                     # afterwards, a backward kernel corrupted forward storage.
                     loss_before_backward = float(loss.detach().item())
-                    if not math.isfinite(loss_before_backward):
-                        raise RuntimeError(
-                            "non-finite training loss before backward: "
-                            f"loss={loss_before_backward:.9g} "
-                            f"max_logit={float(logits.detach().abs().amax().item()):.9g} "
-                            f"optimizer={optimizer_name} step={step} micro={micro_idx + 1}/{accum_steps}"
-                        )
                     if bool(getattr(cfg, "graph", False)) and loss_before_backward > 20.0:
                         anchors = [block.ffn.beta_anchor.detach().clone() for block in model_base.blocks]
                         with torch.no_grad(), amp_autocast(device):
@@ -4669,56 +4395,23 @@ async def train_one_async(
                             refeeds_since_log.add_(raw_model_for_tria.last_tria_fire_mask.detach().sum())
                     (total_loss / float(accum_steps)).backward()
                     loss_after_backward = float(loss.detach().item())
-                    if math.isfinite(loss_before_backward) and math.isfinite(loss_after_backward) and loss_after_backward != loss_before_backward:
+                    if loss_after_backward != loss_before_backward:
                         raise RuntimeError(
                             "training loss tensor changed during backward: "
                             f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
                             "a custom CUDA backward kernel wrote into forward storage"
-                        )
-                    if not math.isfinite(loss_after_backward):
-                        bad_grad = _first_nonfinite("grad")
-                        bad_grad_list = " || ".join(_collect_nonfinite("grad"))
-                        bad_grad_summary = _summarize_nonfinite("grad")
-                        raise RuntimeError(
-                            "non-finite training loss after backward: "
-                            f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
-                            f"summary={bad_grad_summary}; "
-                            f"first_nonfinite_grad={bad_grad or '(none found)'}; "
-                            f"examples={bad_grad_list or '(none found)'}"
                         )
                     raw_model_for_tria.last_tria_depth_carry = None
                     raw_model_for_tria.last_tria_document_carry_stats = None
                 train_loss_sum += loss_before_backward
                 train_tokens_step += int(y.numel())
 
-            bad_grad = _first_nonfinite("grad")
-            if bad_grad is not None:
-                bad_grad_list = " || ".join(_collect_nonfinite("grad"))
-                bad_grad_summary = _summarize_nonfinite("grad")
-                raise RuntimeError(
-                    "non-finite gradient detected before optimizer step: "
-                    f"optimizer={optimizer_name} step={step} lr={lr_at(cfg, step - 1):.9g} "
-                    f"summary={bad_grad_summary}; "
-                    f"first={bad_grad}; "
-                    f"examples={bad_grad_list}"
-                )
             if cfg.grad_clip and cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
             lr = lr_at(cfg, step - 1)
             for g in opt.param_groups:
                 g["lr"] = lr * float(g.get("lr_mult", 1.0))
             opt.step()
-            bad_param = _first_nonfinite("param")
-            if bad_param is not None:
-                bad_param_list = " || ".join(_collect_nonfinite("param"))
-                bad_param_summary = _summarize_nonfinite("param")
-                raise RuntimeError(
-                    "non-finite parameter detected after optimizer step: "
-                    f"optimizer={optimizer_name} step={step} lr={lr:.9g} "
-                    f"summary={bad_param_summary}; "
-                    f"first={bad_param}; "
-                    f"examples={bad_param_list}"
-                )
 
             train_loss_local = train_loss_sum / float(accum_steps)
             train_loss_log = ddp_mean_float(train_loss_local, device)
@@ -4800,6 +4493,7 @@ async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out:
     set_seed(int(cfg.seed) + 1000003 * int(ddp_rank()))
     build_tokenizer(cfg)
     restore_temporal_tria_from_checkpoint(cfg, resume)
+    apply_config(cfg)
 
     if ddp_is_main():
         maybe_auto_val_split(cfg, dataset)
@@ -4807,6 +4501,11 @@ async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out:
     if not ddp_is_main() and not cfg.val_dataset:
         maybe_auto_val_split(cfg, dataset)
     val_dataset = str(cfg.val_dataset).strip() if cfg.val_dataset else None
+
+    print_architecture_report(cfg, device, ablation, dataset, val_dataset)
+    if ddp_is_main():
+        print_training_budget(cfg, dataset, ablation)
+    ddp_print("=" * 64)
 
     results = {}
     results["paraplex"] = await train_one_async(

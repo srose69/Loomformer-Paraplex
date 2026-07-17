@@ -47,7 +47,7 @@
   "global": {
     "model.embed_tokens.weight": {"to": "emb.weight",  "op": "copy"},
     "lm_head.weight":            {"to": "head.weight", "op": "copy", "optional": true, "note": "absent when tie_word_embeddings=true -- emb.weight covers both"},
-    "model.norm.weight":         {"to": null, "op": "drop", "note": "no LoomFormer destination -- see config_notes"}
+    "model.norm.weight": {"to": "ln_final.weight", "op": "copy", "requires_config": {"final_norm": true}, "note": "only transplanted when the target config sets final_norm: true (see loomformer.py's FINAL_NORM_ENABLED) -- dropped otherwise, LoomFormer has no destination without it"}
   },
 
   "train_lr_overrides": [
@@ -58,6 +58,7 @@
     {"pattern": "ffn.gate_proj.weight","train": true, "lr_scale": 0.1, "note": "transplanted from donor (gate_proj), only present if paraplex_gate_proj=true"},
     {"pattern": "emb.weight",         "train": true, "lr_scale": 0.1, "note": "transplanted from donor (requires matching tokenizer)"},
     {"pattern": "head.weight",        "train": true, "lr_scale": 0.1, "note": "transplanted from donor if untied and present"},
+    {"pattern": "ln_final.weight",    "train": true, "lr_scale": 0.1, "note": "exact RMSNorm->RMSNorm transplant (unlike ln_attn/ln_ffn, no LN/RMS mismatch here) -- only present if final_norm=true"},
     {"pattern": "ln_attn.weight",     "train": true, "lr_scale": 1.0, "note": "RMSNorm->LayerNorm approximation -- full LR to help it self-correct"},
     {"pattern": "ln_attn.bias",       "train": true, "lr_scale": 1.0, "note": "no donor equivalent (RMSNorm has no bias) -- zero-init, full LR"},
     {"pattern": "ln_ffn.weight",      "train": true, "lr_scale": 1.0, "note": "RMSNorm->LayerNorm approximation -- full LR to help it self-correct"},

@@ -13,6 +13,7 @@ import glob
 import json
 import math
 import os
+import queue
 import random
 import re
 import subprocess
@@ -1625,132 +1626,190 @@ def _encode_batch_any(tok, texts: List[str]) -> List[List[int]]:
 
 
 class ShardStream:
+    _CHUNK_DOCS = 20000
+
     def __init__(self, path: str, cfg: Config, device: torch.device, tokenizer=None):
         self.cfg = cfg
         self.device = device
         self.tok = tokenizer if tokenizer is not None else build_tokenizer(cfg)
         self._bos_id = _tok_special_id(self.tok, "<bos>")
         self._eos_id = _tok_special_id(self.tok, "<eos>")
-
         fmt_cfg = str(getattr(cfg, "dataset_format", "auto") or "auto")
-        files = RawCorpus._resolve_files(path, fmt_cfg)
-        if not files:
+        self._files = RawCorpus._resolve_files(path, fmt_cfg)
+        if not self._files:
             raise ValueError(f"no corpus files found at {path!r} (format={fmt_cfg!r})")
-        self._files = files
-        self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(files[0])
+        self._fmt = fmt_cfg if fmt_cfg != "auto" else RawCorpus._infer_format(self._files[0])
         self._text_field = getattr(cfg, "text_field", "text")
-        self._single_file = len(self._files) < 2
-
-        rank = ddp_rank() if ddp_is_distributed() else 0
-        self._rng = np.random.default_rng(int(getattr(cfg, "seed", 1)) + 1000003 * int(rank))
-        self._order = list(range(len(self._files)))
-        self._rng.shuffle(self._order)
-        self._pos = 0
-
-        self.current_tokens = self._tokenize_shard(self._next_index())  # first (only, if single-file) shard
-        if self._single_file:
-            self._executor = None
-            self._prefetch_future = None
+        self._rank = ddp_rank() if ddp_is_distributed() else 0
+        self._world_size = ddp_world_size() if ddp_is_distributed() else 1
+        row_counts = [self._file_row_count(path) for path in self._files]
+        total_rows = int(sum(row_counts))
+        global_start = total_rows * self._rank // self._world_size
+        global_end = total_rows * (self._rank + 1) // self._world_size
+        self._row_plan: List[Tuple[int, int, int]] = []
+        cursor = 0
+        for file_index, nrows in enumerate(row_counts):
+            a = max(global_start, cursor) - cursor
+            b = min(global_end, cursor + nrows) - cursor
+            if a < b:
+                self._row_plan.append((file_index, int(a), int(b)))
+            cursor += nrows
+        self._assigned_rows = global_end - global_start
+        if self._assigned_rows <= 0 or not self._row_plan:
+            raise ValueError(f"rank {self._rank} received no rows")
+        self._content_need = int(cfg.seq_len) + 1 - (1 if self._bos_id is not None else 0)
+        self._ram_queue: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.prefetch_batches)))
+        self._stop = threading.Event()
+        self._producer_error = None
+        self._gpu_batches = None
+        self._gpu_pos = 0
+        self._producer = threading.Thread(target=self._produce_cpu_batches, daemon=True, name=f"data-rank-{self._rank}")
+        self._producer.start()
+        plan = ", ".join(f"{os.path.basename(self._files[i])}[{a}:{b}]" for i, a, b in self._row_plan)
+        if ddp_is_distributed():
+            plans = [None] * self._world_size
+            dist.all_gather_object(plans, (self._rank, self._assigned_rows, plan))
+            if ddp_is_main():
+                for rank, rows, desc in sorted(plans):
+                    print(f"[data] rank={rank} rows={rows:,} plan={desc}", flush=True)
         else:
-            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-tokenize")
-            self._prefetch_future = self._executor.submit(self._tokenize_shard, self._next_index())
+            print(f"[data] rank=0 rows={self._assigned_rows:,} plan={plan}", flush=True)
 
-    def _next_index(self) -> int:
-        if self._pos >= len(self._order):
-            self._rng.shuffle(self._order)
-            self._pos = 0
-        idx = self._order[self._pos]
-        self._pos += 1
-        return idx
+    def _file_row_count(self, path: str) -> int:
+        if self._fmt == "parquet":
+            import pyarrow.parquet as pq
+            return int(pq.ParquetFile(path).metadata.num_rows)
+        if self._fmt == "arrow":
+            table, _ = _read_arrow_table_with_container(path)
+            n = int(table.num_rows)
+            del table
+            return n
+        if self._fmt == "jsonl":
+            with open(path, "rb") as f:
+                return sum(1 for line in f if line.strip())
+        if self._fmt == "txt":
+            return 1
+        raise ValueError(f"unsupported raw dataset format {self._fmt!r}")
 
-    _CHUNK_DOCS = 20000 
-
-    def _iter_text_chunks(self, p: str):
+    def _iter_text_chunks(self, path: str, row_start: int, row_end: int):
         if self._fmt in ("parquet", "arrow"):
             if self._fmt == "parquet":
                 import pyarrow.parquet as pq
-                table = pq.read_table(p, columns=[self._text_field])
+                table = pq.read_table(path, columns=[self._text_field])
             else:
-                table, _container = _read_arrow_table_with_container(p)
-            col = table.column(self._text_field)
-            n = len(col)
-            for start in range(0, n, self._CHUNK_DOCS):
-                yield col.slice(start, self._CHUNK_DOCS).to_pylist()
-            del table, col  # the decoded table can go as soon as the last slice is yielded
-        elif self._fmt == "jsonl":
-            chunk: List[str] = []
-            with open(p, "rb") as f:
+                table, _ = _read_arrow_table_with_container(path)
+            col = table.column(self._text_field).slice(row_start, row_end - row_start)
+            for start in range(0, len(col), self._CHUNK_DOCS):
+                yield col.slice(start, min(self._CHUNK_DOCS, len(col) - start)).to_pylist()
+            return
+        if self._fmt == "jsonl":
+            chunk = []
+            row = 0
+            with open(path, "rb") as f:
                 for line in f:
-                    chunk.append(json.loads(line.decode("utf-8", errors="replace")).get(self._text_field, ""))
-                    if len(chunk) >= self._CHUNK_DOCS:
-                        yield chunk
-                        chunk = []
+                    if not line.strip():
+                        continue
+                    if row >= row_end:
+                        break
+                    if row >= row_start:
+                        chunk.append(json.loads(line.decode("utf-8", errors="replace")).get(self._text_field, ""))
+                        if len(chunk) >= self._CHUNK_DOCS:
+                            yield chunk
+                            chunk = []
+                    row += 1
             if chunk:
                 yield chunk
-        else:  # txt: one shard IS one file's whole content, one document
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                yield [f.read()]
+            return
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            yield [f.read()]
 
-    def _tokenize_shard(self, file_index: int) -> torch.Tensor:
-        p = self._files[file_index]
-        eos_arr = np.array([self._eos_id], dtype=np.int64) if self._eos_id is not None else None
-        pieces: List[np.ndarray] = []
-        first_doc_overall = True
-        for chunk_texts in self._iter_text_chunks(p):
-            encoded = _encode_batch_any(self.tok, chunk_texts)
-            del chunk_texts
-            for doc_ids in encoded:
-                if not first_doc_overall and eos_arr is not None:
-                    pieces.append(eos_arr)
-                pieces.append(np.asarray(doc_ids, dtype=np.int64))
-                first_doc_overall = False
-            del encoded
-        arr = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.int64)
-        del pieces
-        return torch.from_numpy(arr).to(self.device, non_blocking=True)
+    def _produce_cpu_batches(self) -> None:
+        try:
+            carry = np.zeros(0, dtype=np.int64)
+            eos = np.array([self._eos_id], dtype=np.int64) if self._eos_id is not None else None
+            first_doc = True
+            while not self._stop.is_set():
+                for file_index, row_start, row_end in self._row_plan:
+                    for texts in self._iter_text_chunks(self._files[file_index], row_start, row_end):
+                        encoded = _encode_batch_any(self.tok, texts)
+                        pieces = []
+                        for ids in encoded:
+                            if not first_doc and eos is not None:
+                                pieces.append(eos)
+                            pieces.append(np.asarray(ids, dtype=np.int64))
+                            first_doc = False
+                        if pieces:
+                            block = np.concatenate(pieces)
+                            carry = np.concatenate((carry, block)) if carry.size else block
+                        batch_tokens = int(self.cfg.batch_size) * self._content_need
+                        while carry.size >= batch_tokens and not self._stop.is_set():
+                            block = carry[:batch_tokens].reshape(int(self.cfg.batch_size), self._content_need)
+                            carry = carry[batch_tokens:]
+                            batch = torch.from_numpy(block.copy())
+                            if self._bos_id is not None:
+                                bos = torch.full((batch.shape[0], 1), int(self._bos_id), dtype=torch.int64)
+                                batch = torch.cat((bos, batch), dim=1)
+                            if self.device.type == "cuda":
+                                batch = batch.pin_memory()
+                            self._ram_queue.put(batch)
+                first_doc = True
+        except BaseException as exc:
+            self._producer_error = exc
+            try:
+                self._ram_queue.put_nowait(None)
+            except queue.Full:
+                pass
 
-    def _maybe_swap_shard(self) -> None:
-        if self._single_file:
-            return  # nothing to swap to -- keep serving windows from the one file
-        content_need = self.cfg.seq_len + 1
-        if len(self.current_tokens) < content_need * 4:  # headroom before hard-exhausting the window range
-            self.current_tokens = self._prefetch_future.result()  # blocks only if genuinely not ready -- shouldn't happen in practice
-            self._prefetch_future = self._executor.submit(self._tokenize_shard, self._next_index())
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+    def _get_cpu_batch(self) -> torch.Tensor:
+        batch = self._ram_queue.get()
+        if batch is None:
+            raise RuntimeError("data producer failed") from self._producer_error
+        return batch
 
-    def _sample_batch(self) -> torch.Tensor:
-        self._maybe_swap_shard()
-        B = self.cfg.batch_size
-        content_need = self.cfg.seq_len + 1 - (1 if self._bos_id is not None else 0)
-        n = len(self.current_tokens)
-        ix = self._rng.integers(0, n - content_need - 1, size=B)
-        rows = [self.current_tokens[i: i + content_need] for i in ix]
-        if self._bos_id is not None:
-            bos = torch.tensor([self._bos_id], device=self.device, dtype=torch.int64)
-            rows = [torch.cat([bos, r]) for r in rows]
-        return torch.stack(rows)
+    async def _load_gpu_chunk(self, count: int) -> None:
+        loop = asyncio.get_running_loop()
+        batches = []
+        for _ in range(count):
+            batches.append(await loop.run_in_executor(None, self._get_cpu_batch))
+        host = torch.stack(batches)
+        self._gpu_batches = host.to(self.device, non_blocking=True)
+        self._gpu_pos = 0
+
+    async def prime(self) -> None:
+        count = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
+        await self._load_gpu_chunk(count)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        if ddp_is_distributed():
+            ready = [None] * self._world_size
+            dist.all_gather_object(ready, (self._rank, count))
+            if ddp_is_main():
+                for rank, n in sorted(ready):
+                    print(f"[data] rank={rank} ready: RAM={int(self.cfg.prefetch_batches)} batches, GPU={n} batches", flush=True)
+        else:
+            print(f"[data] rank=0 ready: RAM={int(self.cfg.prefetch_batches)} batches, GPU={count} batches", flush=True)
 
     def sample_device_batch(self) -> torch.Tensor:
-        return self._sample_batch()  # already resident on self.device
+        batch = self._get_cpu_batch()
+        return batch.to(self.device, non_blocking=True)
 
-    async def _produce(self, queue: "asyncio.Queue", n: int):
-        loop = asyncio.get_event_loop()
-        for _ in range(n):
-            batch = await loop.run_in_executor(None, self._sample_batch)
-            await queue.put(batch)
-        await queue.put(None)
+    def _sample_batch(self) -> torch.Tensor:
+        return self.sample_device_batch()
 
     async def batches(self, n: int):
-        queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(getattr(self.cfg, "prefetch_batches", 256))))
-        producer = asyncio.create_task(self._produce(queue, n))
-        while True:
-            batch = await queue.get()
-            if batch is None:
-                break
-            yield batch
-        await producer
+        chunk_size = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
+        yielded = 0
+        while yielded < n:
+            if self._gpu_batches is None or self._gpu_pos >= self._gpu_batches.shape[0]:
+                await self._load_gpu_chunk(min(chunk_size, n - yielded))
+            while self._gpu_pos < self._gpu_batches.shape[0] and yielded < n:
+                batch = self._gpu_batches[self._gpu_pos]
+                self._gpu_pos += 1
+                yielded += 1
+                yield batch
 
+    def close(self) -> None:
+        self._stop.set()
 
 def make_stream(path: str, cfg: Config, device: torch.device):
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
@@ -3221,7 +3280,22 @@ class Model(nn.Module):
         self.tria_hard_fire_enabled = True
         self.last_tria_document_carry_stats: Optional[dict] = None
         self.last_tria_fire_mask: Optional[torch.Tensor] = None
+        self._disable_structurally_unused_params()
         self.reset_parameters()
+
+    def _disable_structurally_unused_params(self) -> None:
+        if not TRIA_CARRY_ENABLED or not self.blocks:
+            return
+        # Block 0 never receives a tria carrier input, so this gate scalar is
+        # outside the training graph on every step.
+        first_gate = getattr(self.blocks[0].ffn, "identity_gate", None)
+        if first_gate is not None:
+            first_gate.raw_alpha.requires_grad_(False)
+        # The last block never emits p_out to another block, so its selector is
+        # also unreachable from the loss.
+        last_selector = getattr(self.blocks[-1].ffn, "gate_selector", None)
+        if last_selector is not None:
+            last_selector.logits.requires_grad_(False)
 
     def reset_parameters(self) -> None:
         init_embedding_fanin(self.emb)
@@ -4265,6 +4339,8 @@ async def train_one_async(
             ddp_print("[resume] fast-forward done.")
         ddp_print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
                   f"LR schedule/log step numbering continue (unchanged if cfg.steps/warmup_steps match the original run).")
+    if isinstance(stream, ShardStream):
+        await stream.prime()
     eval_dataset = val_dataset or dataset
     eval_stream = stream if os.path.abspath(eval_dataset) == os.path.abspath(dataset) else make_stream(eval_dataset, cfg, device)
     train_eos_id = getattr(stream, "_eos_id", None) if bool(getattr(cfg, "doc_reset_attn", True)) else None
@@ -4274,6 +4350,15 @@ async def train_one_async(
         eval_bpt = train_bpt
     else:
         eval_bpt, _, _ = ensure_eval_bytes_per_token_meta(eval_dataset, cfg, device)
+
+    ddp_barrier(device)
+    if ddp_is_main():
+        print("[data] all ranks ready", flush=True)
+    apply_config(cfg)
+    print_architecture_report(cfg, device, ablation, dataset, val_dataset)
+    if ddp_is_main():
+        print_training_budget(cfg, dataset, ablation)
+    ddp_print("=" * 64)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
     model_base = Model(ablation=ablation).to(device)
@@ -4326,7 +4411,8 @@ async def train_one_async(
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    params = [p for _, p in named_params]
     OptimizerClass, optimizer_name = optimizer_class_from_name(cfg.optimizer)
     base_model = ddp_unwrap_model(model)
     tria_agg = getattr(base_model, "tria_agg", None)
@@ -4391,6 +4477,74 @@ async def train_one_async(
     tokens_seen_global = 0
     data_wait_s = 0.0 
     batch_iter = stream.batches((int(cfg.steps) - start_step) * accum_steps).__aiter__()
+
+    def _tensor_stats(t: torch.Tensor) -> str:
+        tf = t.detach().float()
+        finite = torch.isfinite(tf)
+        finite_count = int(finite.sum().item())
+        total = tf.numel()
+        if finite_count > 0:
+            vals = tf[finite]
+            amin = float(vals.amin().item())
+            amax = float(vals.amax().item())
+        else:
+            amin = float("nan")
+            amax = float("nan")
+        nan_count = int(torch.isnan(tf).sum().item())
+        inf_count = int(torch.isinf(tf).sum().item())
+        return (
+            f"shape={tuple(t.shape)} finite={finite_count}/{total} "
+            f"nan={nan_count} inf={inf_count} min={amin:.9g} max={amax:.9g}"
+        )
+
+    def _first_nonfinite(which: str) -> Optional[str]:
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
+                return (
+                    f"{name}: {which} {_tensor_stats(t)} | "
+                    f"param {_tensor_stats(p)} | {grad_stats}"
+                )
+        return None
+
+    def _collect_nonfinite(which: str, limit: int = 10) -> List[str]:
+        out: List[str] = []
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                grad_stats = _tensor_stats(p.grad) if p.grad is not None else "grad=None"
+                out.append(
+                    f"{name}: {which} {_tensor_stats(t)} | "
+                    f"param {_tensor_stats(p)} | {grad_stats}"
+                )
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _summarize_nonfinite(which: str) -> str:
+        counts: Dict[str, int] = {}
+        total = 0
+        for name, p in named_params:
+            t = p.grad if which == "grad" else p
+            if t is None:
+                continue
+            if not torch.isfinite(t.detach()).all():
+                total += 1
+                prefix = name.split(".", 2)
+                if len(prefix) >= 2 and prefix[0] == "blocks":
+                    key = ".".join(prefix[:2])
+                else:
+                    key = prefix[0]
+                counts[key] = counts.get(key, 0) + 1
+        if total == 0:
+            return "(none)"
+        parts = [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        return f"total={total} by_module=" + ", ".join(parts)
 
     def _save_checkpoint(path_override: Optional[str] = None) -> None:
         if ckpt_out and ddp_is_main():
@@ -4457,6 +4611,7 @@ async def train_one_async(
 
         if ddp_is_distributed():
             ddp_barrier(device)
+            dist.destroy_process_group()
         raise SystemExit(130)  # 128+SIGINT: conventional shell exit code for Ctrl-C
 
     step = start_step
@@ -4509,28 +4664,68 @@ async def train_one_async(
                             f"compiled_max_logit={float(logits.detach().abs().amax().item()):.9g}, "
                             f"eager_max_logit={float(eager_logits.detach().abs().amax().item()):.9g}"
                         )
+                    if not math.isfinite(loss_before_backward):
+                        raise RuntimeError(
+                            "non-finite training loss before backward: "
+                            f"loss={loss_before_backward:.9g} "
+                            f"max_logit={float(logits.detach().abs().amax().item()):.9g} "
+                            f"optimizer={optimizer_name} step={step} micro={micro_idx + 1}/{accum_steps}"
+                        )
                     if raw_model_for_tria.last_tria_fire_mask is not None:
                         with torch.no_grad():
                             refeeds_since_log.add_(raw_model_for_tria.last_tria_fire_mask.detach().sum())
                     (total_loss / float(accum_steps)).backward()
                     loss_after_backward = float(loss.detach().item())
-                    if loss_after_backward != loss_before_backward:
+                    if math.isfinite(loss_before_backward) and math.isfinite(loss_after_backward) and loss_after_backward != loss_before_backward:
                         raise RuntimeError(
                             "training loss tensor changed during backward: "
                             f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
                             "a custom CUDA backward kernel wrote into forward storage"
+                        )
+                    if not math.isfinite(loss_after_backward):
+                        bad_grad = _first_nonfinite("grad")
+                        bad_grad_list = " || ".join(_collect_nonfinite("grad"))
+                        bad_grad_summary = _summarize_nonfinite("grad")
+                        raise RuntimeError(
+                            "non-finite training loss after backward: "
+                            f"before={loss_before_backward:.9g}, after={loss_after_backward:.9g}; "
+                            f"summary={bad_grad_summary}; "
+                            f"first_nonfinite_grad={bad_grad or '(none found)'}; "
+                            f"examples={bad_grad_list or '(none found)'}"
                         )
                     raw_model_for_tria.last_tria_depth_carry = None
                     raw_model_for_tria.last_tria_document_carry_stats = None
                 train_loss_sum += loss_before_backward
                 train_tokens_step += int(y.numel())
 
+            bad_grad = _first_nonfinite("grad")
+            if bad_grad is not None:
+                bad_grad_list = " || ".join(_collect_nonfinite("grad"))
+                bad_grad_summary = _summarize_nonfinite("grad")
+                raise RuntimeError(
+                    "non-finite gradient detected before optimizer step: "
+                    f"optimizer={optimizer_name} step={step} lr={lr_at(cfg, step - 1):.9g} "
+                    f"summary={bad_grad_summary}; "
+                    f"first={bad_grad}; "
+                    f"examples={bad_grad_list}"
+                )
             if cfg.grad_clip and cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
             lr = lr_at(cfg, step - 1)
             for g in opt.param_groups:
                 g["lr"] = lr * float(g.get("lr_mult", 1.0))
             opt.step()
+            bad_param = _first_nonfinite("param")
+            if bad_param is not None:
+                bad_param_list = " || ".join(_collect_nonfinite("param"))
+                bad_param_summary = _summarize_nonfinite("param")
+                raise RuntimeError(
+                    "non-finite parameter detected after optimizer step: "
+                    f"optimizer={optimizer_name} step={step} lr={lr:.9g} "
+                    f"summary={bad_param_summary}; "
+                    f"first={bad_param}; "
+                    f"examples={bad_param_list}"
+                )
 
             train_loss_local = train_loss_sum / float(accum_steps)
             train_loss_log = ddp_mean_float(train_loss_local, device)
@@ -4612,7 +4807,6 @@ async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out:
     set_seed(int(cfg.seed) + 1000003 * int(ddp_rank()))
     build_tokenizer(cfg)
     restore_temporal_tria_from_checkpoint(cfg, resume)
-    apply_config(cfg)
 
     if ddp_is_main():
         maybe_auto_val_split(cfg, dataset)
@@ -4620,11 +4814,6 @@ async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out:
     if not ddp_is_main() and not cfg.val_dataset:
         maybe_auto_val_split(cfg, dataset)
     val_dataset = str(cfg.val_dataset).strip() if cfg.val_dataset else None
-
-    print_architecture_report(cfg, device, ablation, dataset, val_dataset)
-    if ddp_is_main():
-        print_training_budget(cfg, dataset, ablation)
-    ddp_print("=" * 64)
 
     results = {}
     results["paraplex"] = await train_one_async(

@@ -345,6 +345,14 @@ class Config:
     #   transplant. Adds HIDDEN*N parameters per layer; requires the extended
     #   paraplex CUDA kernel (gate_src argument) to keep the fused fast path.
     paraplex_gate_proj: bool = False
+    # False (default, matches every checkpoint trained before this option
+    # existed): head reads the last block's residual stream directly, no
+    # final normalization -- LoomFormer's own long-standing design.
+    # True: one RMSNorm right before head, stabilizing the scale that's
+    # drifted across LAYERS blocks of pre-norm residual accumulation --
+    # the slot a Llama-family donor's model.norm.weight maps onto during
+    # --rebuild/loomcloner transplant (previously silently dropped).
+    final_norm: bool = False
     use_cuda_tria: bool = False
     graph: bool = False
     save_graph: bool = False  
@@ -698,6 +706,8 @@ PARAPLEX_GATE_PROJ = False  # False: amp = softplus(p_real), self-referential (o
                             # True: amp = softplus(gate_proj(u)), independent learned gate
                             # (donor-transplant path: gate_proj maps 1:1 onto a SwiGLU donor's
                             # gate_proj matrix -- see loomcloner.py mapping notes)
+FINAL_NORM_ENABLED = False  # False: head reads the residual stream directly (original design)
+                            # True: one RMSNorm before head -- see Config.final_norm
 TRIA_GAMMA_MAX = 0.25
 TRIA_RAW_GAMMA_INIT = 0.0
 TRIA_TEMPORAL_ENABLED = True
@@ -797,7 +807,7 @@ def make_w1_imag_live_flat_indices() -> torch.Tensor:
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -808,6 +818,7 @@ def apply_config(cfg: Config) -> None:
     GRAD_CHECKPOINTING = bool(getattr(cfg, "grad_checkpointing", False))
     TRIA_CARRY_ENABLED = bool(getattr(cfg, "tria_carry_enabled", False))
     PARAPLEX_GATE_PROJ = bool(getattr(cfg, "paraplex_gate_proj", False))
+    FINAL_NORM_ENABLED = bool(getattr(cfg, "final_norm", False))
     TRIA_GAMMA_MAX = float(getattr(cfg, "tria_gamma_max", 0.25))
     TRIA_RAW_GAMMA_INIT = float(getattr(cfg, "tria_raw_gamma_init", 0.0))
     TRIA_TEMPORAL_ENABLED = bool(getattr(cfg, "tria_temporal_enabled", True))
@@ -3241,6 +3252,24 @@ def act_fn(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x) if ACTIVATION == "gelu" else powlu(x, POWLU_M)
 
 
+class RMSNorm(nn.Module):
+    """Standard RMSNorm (Zhang & Sennrich 2019) -- root-mean-square rescale,
+    no mean subtraction, no bias. Used only as the optional final norm before
+    `head` (Config.final_norm) -- LoomFormer's own per-block norms stay full
+    LayerNorm (ln_attn/ln_ffn), unchanged."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (xf * rms).to(dtype) * self.weight
+
+
 class Block(nn.Module):
     def __init__(self, ablation: bool = False) -> None:
         super().__init__()
@@ -3260,6 +3289,7 @@ class Model(nn.Module):
         self.head = nn.Linear(N, VOCAB, bias=False)
         if TIED_EMBEDDINGS:
             self.head.weight = self.emb.weight
+        self.ln_final = RMSNorm(N) if FINAL_NORM_ENABLED else None
         self.last_tria_depth_carry: Optional[torch.Tensor] = None
         self.last_tria_document_carry: Optional[torch.Tensor] = None
         self.capture_tria_depth_carry: bool = False
@@ -3296,6 +3326,12 @@ class Model(nn.Module):
         last_selector = getattr(self.blocks[-1].ffn, "gate_selector", None)
         if last_selector is not None:
             last_selector.logits.requires_grad_(False)
+
+    def _head_in(self, x: torch.Tensor) -> torch.Tensor:
+        """Single choke point all 4 head()-call sites go through -- one
+        place to apply ln_final consistently instead of 4 independent
+        `if self.ln_final is not None` checks that could drift apart."""
+        return self.head(self.ln_final(x) if self.ln_final is not None else x)
 
     def reset_parameters(self) -> None:
         init_embedding_fanin(self.emb)
@@ -3596,7 +3632,7 @@ class Model(nn.Module):
         if not key_carries:
             self.last_tria_depth_carry = None
             self.last_tria_document_carry = None
-            return self.head(h_full)
+            return self._head_in(h_full)
 
         document_keys = torch.stack(key_carries, dim=1)
         valid_keys = torch.stack(key_valid, dim=1)
@@ -3610,7 +3646,7 @@ class Model(nn.Module):
         a_keys = self.tria_agg(document_keys)
         h_full = self.tria_final_ca(
             a_keys, h_full, attn_mask, carry_key_mask=valid_keys, key_positions=positions)
-        return self.head(h_full)
+        return self._head_in(h_full)
 
     def _forward_flat(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
                        position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -3666,7 +3702,7 @@ class Model(nn.Module):
                         "fire_count": int(carry_key_mask.detach().sum().item()),
                     }
             h = self.tria_final_ca(a, h, attn_mask, carry_key_mask=carry_key_mask)
-        return self.head(h)  # [B,T,VOCAB]
+        return self._head_in(h)  # [B,T,VOCAB]
 
     @torch.no_grad()
     def step(self, idx_t: torch.Tensor, pos_t: int, states):
@@ -3787,7 +3823,7 @@ class Model(nn.Module):
             h, tria_ca_cache = self.tria_final_ca.step(
                 a_t, h, tria_ca_cache, pos_t, SEQ_LEN, carry_key_mask=fire_now[:, None])
             tria_temporal_state = TriaTemporalState(carry=document_carry_t, refeed_pending=fire_now)
-        return self.head(h[:, -1, :]), (new_caches, tria_ca_cache, tria_temporal_state)
+        return self._head_in(h[:, -1, :]), (new_caches, tria_ca_cache, tria_temporal_state)
 
 
 

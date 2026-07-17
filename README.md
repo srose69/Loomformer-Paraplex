@@ -2,21 +2,20 @@
 
 LoomFormer: a Transformer-based LM built from Paraplex neurons.
 
-Paraplex = the pseudo-complex paravector neuron (scalar+vector, Clifford Cl(0,n)
-paravector, behaves like a complex number). 
+Paraplex = the pseudo-complex paravector neuron (scalar+vector, Clifford Cl(0,n) paravector, behaves like a complex number). 
 
 LoomFormer = the architecture: normal causal GQA attention + Paraplex FFN + DepthAttn (AttnRes-style softmax-over-depth skip). 
 "Loom" for the pseudo-complex & pseudo paravector numbers; 
 "-former" for the... dunno. for the style.
 
-Tria.. too difficult to explain, but it works and useful! 
-Read the code tho
+Tria... too difficult to explain, but it works and is useful! 
+Read the code tho.
 
 !!! VANILLA TRANSFORMERS L00MINATION PIPELINE COMING !!!
 
-SOON NORMAL README & docs WILL may BE!
+SOON A NORMAL README & DOCS WILL (MAYBE) BE READY!
 
-Checkpoints here
+Checkpoints here:
 https://huggingface.co/srs6901/LoomFormer-Paraplex/
  
 (it converged! full_eval_loss 3.2584  bits/tok 4.7009  bpb 1.3288  eval_tokens 45040704 on 150k steps from FSS1STR at 27.3k tok/s on single L40S, budget 4,608,000,000 tokens over 120,000 steps (0.98 epochs of 4,684,230,241), 112,999,621 params · 40.8 tok/param  ·  41.5 data-tok/param)
@@ -42,7 +41,7 @@ https://huggingface.co/srs6901/LoomFormer-Paraplex/
 
 For context: ResNet-101 has 101 layers and ~1K skip connections. GPT-2 small has ~24 true layers. LoomFormer-nano: more depth than ResNet-101, orders of magnitude more connections, at 113M parameters.
 
-SFT and LoomChat works too! (last is vram-heavy for now but manageable even on my GTX1080, workin' on it) 
+SFT and LoomChat work too! (the latter is vram-heavy for now but manageable even on my GTX1080, workin' on it) 
 Enjoy 
 
-P.S.  ATOM_META_SCALE=8 nohup python -u loomformer.py --train --config cfg/test.yaml --checkpoint ./test.pt > test.log 2>&1 &
+P.S. ATOM_META_SCALE=8 nohup python -u loomformer.py --train --config cfg/test.yaml --checkpoint ./test.pt > test.log 2>&1 &

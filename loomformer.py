@@ -735,6 +735,7 @@ ATTN_SDPA_VALUE_FUSION = True
 ATTN_SDPA_RECOMPUTE_BACKWARD = True
 _sdpa_bf16_efficient_cache: Dict[Tuple[int, int, int], bool] = {}
 _REAL_STDOUT = sys.stdout
+_activation_checkpoint_tls = threading.local()
 ROPE_THETA = 10000.0
 ROPE_FACTOR = 4.0
 ROPE_ORIGINAL_SEQ_LEN = 0
@@ -743,6 +744,24 @@ ROPE_BETA_SLOW = 1.0
 ROPE_ATTENTION_FACTOR: Optional[float] = None
 DEEPNORM_BETA = 1.0
 FANIN_GAIN = 0.88
+
+
+def _checkpoint_anchor_override(module: nn.Module) -> Optional[torch.Tensor]:
+    overrides = getattr(_activation_checkpoint_tls, "anchor_overrides", None)
+    return None if overrides is None else overrides.get(id(module))
+
+
+@contextlib.contextmanager
+def _activation_checkpoint_recompute_context(holder: dict):
+    previous = getattr(_activation_checkpoint_tls, "anchor_overrides", None)
+    overrides = holder.get("anchor_overrides")
+    if overrides is None:
+        raise RuntimeError("activation-checkpoint anchor snapshots were not captured")
+    _activation_checkpoint_tls.anchor_overrides = overrides
+    try:
+        yield
+    finally:
+        _activation_checkpoint_tls.anchor_overrides = previous
 
 
 def fanin_std(fan_in: int, gain: float = FANIN_GAIN) -> float:
@@ -2656,11 +2675,13 @@ class ParaplexFFN(nn.Module):
             else reset_mask.to(device=u.device, dtype=torch.bool).contiguous()
         )
         mode = 1 if PHASE_GRAD_MODE == "secant" else 0
-        update_anchor = bool(mode == 1 and self.training)
+        anchor_override = _checkpoint_anchor_override(self)
+        anchor = self.beta_anchor.detach() if anchor_override is None else anchor_override
+        update_anchor = bool(mode == 1 and self.training and anchor_override is None)
         act, s, next_trace, anchor_snapshot = _ParaplexFused.apply(
             cast(p_real), cast(gate_src), cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
             cast(self.w1_imag), self.w1_imag_bias, cast(trace), self.w1_imag_trace,
-            reset, self.beta_anchor.detach(), HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS,
+            reset, anchor, HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS,
             PHASE_SECTORS == "open", mode, update_anchor, self.beta_anchor_decay,
             max(PHASE_GRAD_FLOOR, 0.0), 1e-4, POWLU_M,
         )
@@ -2714,7 +2735,8 @@ class ParaplexFFN(nn.Module):
             trace = torch.ones(B, HIDDEN, device=u.device, dtype=u.dtype)
         else:
             beta_base = self._beta_space(u, q_h, k_ctx_h, c_h, d_h) + self.w1_imag_bias
-            if PHASE_GRAD_MODE == "secant" and self.training:
+            anchor_override = _checkpoint_anchor_override(self)
+            if PHASE_GRAD_MODE == "secant" and self.training and anchor_override is None:
                 # FP32 RMS is a representative phase radius. A global amin over
                 # B*T*H inevitably approaches zero as the model grows and turns
                 # the adaptive secant anchor into a permanent zero anchor.
@@ -2722,7 +2744,8 @@ class ParaplexFFN(nn.Module):
                     batch_scale = phase_anchor_scale(beta_base)
                     self.beta_anchor.mul_(self.beta_anchor_decay).add_(
                         batch_scale.to(self.beta_anchor.dtype), alpha=1.0 - self.beta_anchor_decay)
-            s_base = phase_sin(beta_base, self.beta_anchor if PHASE_GRAD_MODE == "secant" else None)
+            anchor = self.beta_anchor if anchor_override is None else anchor_override
+            s_base = phase_sin(beta_base, anchor if PHASE_GRAD_MODE == "secant" else None)
             trace_mat = prev_token_trace(
                 s_base, trace if phase_trace is not None else None, phase_reset_mask)
             s = sin_space_combine(s_base, trace_mat * self.w1_imag_trace.view(1, 1, HIDDEN))
@@ -3525,7 +3548,15 @@ class Model(nn.Module):
         k_new_out = []
         v_new_out = []
         phase_out = []
-        with tria.depth_replay_scope(seed=accT_seed, seed_valid=seed_valid):
+        # Outer activation checkpointing already recomputes the complete chunk.
+        # Keeping Tria's inner replay tape as well would retain strong references
+        # to every layer's r/i/o and defeat most of the memory saving.
+        replay_scope = (
+            contextlib.nullcontext()
+            if GRAD_CHECKPOINTING
+            else tria.depth_replay_scope(seed=accT_seed, seed_valid=seed_valid)
+        )
+        with replay_scope:
             for bi, block in enumerate(self.blocks):
                 ls = layer_states[bi]
                 h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry, p = self._run_block_chunk(
@@ -3541,8 +3572,35 @@ class Model(nn.Module):
                           chunk_mask: Optional[torch.Tensor], layer_states: list,
                           accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor]):
         n_blocks = len(self.blocks)
-        flat = self._run_chunk_stack_impl(
-            h_emb_chunk, position_ids_chunk, chunk_mask, layer_states, accT_seed, seed_valid)
+        if GRAD_CHECKPOINTING and self.training:
+            holder: dict = {}
+
+            def context_fn():
+                return (
+                    contextlib.nullcontext(),
+                    _activation_checkpoint_recompute_context(holder),
+                )
+
+            flat = torch.utils.checkpoint.checkpoint(
+                self._run_chunk_stack_impl,
+                h_emb_chunk,
+                position_ids_chunk,
+                chunk_mask,
+                layer_states,
+                accT_seed,
+                seed_valid,
+                use_reentrant=False,
+                context_fn=context_fn,
+            )
+            # Forward updates the secant EMA once. Recompute must use exactly
+            # that per-layer snapshot without updating the persistent buffer again.
+            holder["anchor_overrides"] = {
+                id(block.ffn): block.ffn.beta_anchor.detach().clone()
+                for block in self.blocks
+            }
+        else:
+            flat = self._run_chunk_stack_impl(
+                h_emb_chunk, position_ids_chunk, chunk_mask, layer_states, accT_seed, seed_valid)
         h = flat[0]
         carry = flat[1]
         k_new = flat[2:2 + n_blocks]
@@ -4473,15 +4531,16 @@ async def train_one_async(
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
-        grad_bytes = sum(p.numel() * p.element_size() for p in model_compiled.parameters() if p.requires_grad)
-        bucket_mb = max(25, int(grad_bytes / 1024 / 1024) + 16)
         model = DDP(
             model_compiled,
             device_ids=[ddp_local_rank()],
             output_device=ddp_local_rank(),
             find_unused_parameters=False,
-            bucket_cap_mb=bucket_mb,
+            bucket_cap_mb=64,
+            gradient_as_bucket_view=True,
+            static_graph=True,
         )
+        ddp_print("[ddp] buckets=64MiB gradient_as_bucket_view=true static_graph=true")
     else:
         model = model_compiled
 
@@ -4901,6 +4960,7 @@ def print_architecture_report(cfg: Config, device: torch.device, ablation: bool,
     ddp_print(f"  shape    d_model={N}  heads={N_Q_HEADS}q/{N_KV_HEADS}kv({grp})  "
                f"head_dim={HEAD_DIM}  layers={LAYERS}")
     ddp_print(f"  ffn      hidden={HIDDEN}  phase={PHASE_SECTORS}  attn={ATTN_IMPL}")
+    ddp_print(f"  memory   activation_checkpoint={'temporal-chunk' if GRAD_CHECKPOINTING else 'off'}")
     ddp_print(f"  rope     yarn  theta={ROPE_THETA:g}  factor={ROPE_FACTOR:g}x  "
                f"orig_len={ROPE_ORIGINAL_SEQ_LEN}")
     if HEAD_DIM < 8:

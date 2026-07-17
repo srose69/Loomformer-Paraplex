@@ -29,7 +29,7 @@ a code change.
 
 CLI:
   loomcloner.py --scan  <donor_dir> --mapping mappings/llama.json --out chk.yaml
-                [--steps N] [--lr F] [--paraplex-gate-proj]
+                [--steps N] [--lr F] [--paraplex-gate-proj] [--final-norm]
   loomcloner.py --clone <config.yaml> --donor <donor_dir> --mapping mappings/llama.json
                 --out cloned.pt
 """
@@ -135,7 +135,7 @@ def _hidden_round_up(model_dim: int, hidden_mult: float, n_q_heads: int) -> int:
 
 def build_yaml_text(donor_cfg: Dict[str, Any], mapping: Dict[str, Any], donor_dir: str,
                      tokenizer_path: str, dataset_placeholder: str,
-                     steps: int, lr: float, paraplex_gate_proj: bool) -> str:
+                     steps: int, lr: float, paraplex_gate_proj: bool, final_norm: bool) -> str:
     fields = _resolve_config_fields(donor_cfg, mapping)
     model_dim = int(fields["model_dim"])
     n_q_heads = int(fields["n_q_heads"])
@@ -273,6 +273,7 @@ phase_grad_mode: secant
 attn_impl: sdpa
 
 paraplex_gate_proj: {"true" if paraplex_gate_proj else "false"}   # {"gate_proj transplanted from donor's SwiGLU gate_proj" if paraplex_gate_proj else "donor's gate_proj will be DROPPED -- see mapping notes"}
+final_norm: {"true" if final_norm else "false"}   # {"model.norm.weight transplanted to ln_final -- exact RMSNorm match" if final_norm else "donor's model.norm.weight will be DROPPED -- LoomFormer has no destination without this flag"}
 
 use_cuda_beta_space: true
 use_cuda_phase_sin: true
@@ -375,6 +376,10 @@ def remap_donor_to_loomformer(donor_tensors: Dict[str, torch.Tensor], mapping: D
         if dkey not in donor_tensors:
             if not rule.get("optional", False) and rule.get("op") != "drop":
                 print(f"[loomcloner] WARNING: global key {dkey!r} not found in donor, and not marked optional")
+            continue
+        req = rule.get("requires_config")
+        if req and not all(bool(getattr(cfg, k, False)) == v for k, v in req.items()):
+            dropped.append(dkey)
             continue
         if rule["op"] == "drop":
             dropped.append(dkey)
@@ -479,6 +484,7 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--paraplex-gate-proj", action="store_true")
+    ap.add_argument("--final-norm", action="store_true", help="transplant donor's model.norm.weight onto ln_final (requires loomformer.py's final_norm support)")
     ap.add_argument("--dataset", type=str, default="./datasets/REPLACE_ME")
     args = ap.parse_args()
 
@@ -493,7 +499,7 @@ def main() -> None:
         tok_path = next((os.path.join(args.scan, t) for t in tok_candidates
                           if os.path.exists(os.path.join(args.scan, t))), os.path.join(args.scan, "tokenizer.json"))
         text = build_yaml_text(donor_cfg, mapping, args.scan, tok_path, args.dataset,
-                                args.steps, args.lr, args.paraplex_gate_proj)
+                                args.steps, args.lr, args.paraplex_gate_proj, args.final_norm)
         with open(args.out, "w") as f:
             f.write(text)
         print(f"[loomcloner] wrote {args.out} (mapping={mapping.get('family')})")

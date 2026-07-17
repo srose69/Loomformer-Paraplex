@@ -27,13 +27,6 @@
 // while real held-out perplexity moved by <0.001 nats (negligible) --
 // the bound only engages for rare outliers, near-identity everywhere else.
 //
-// NOT YET VALIDATED ON REAL GPU HARDWARE (this environment has none) --
-// the PyTorch reference path (tria.py) is the one that was actually run and
-// measured; this CUDA change mirrors it by construction (same abc_bound,
-// same tanh, same chain rule) but needs a real-hardware forward/backward
-// parity check (matching this codebase's own existing practice of gating
-// _CUDA_TRIA_ENABLED behind exactly that kind of validation) before
-// trusting it in production the way the PyTorch path already is.
 __device__ __forceinline__ void tria_carrier_build9(
     float r, float i, float o, float alpha, int axis, float m[9],
     float abc_bound = 1.0f) {

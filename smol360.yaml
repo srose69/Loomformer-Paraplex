@@ -1,0 +1,146 @@
+# SmolLM2-360M-Instruct -- clone
+# ===AUTO GENERATED=== by loomcloner.py --scan, from SmolLM2-360M-Instruct/config.json
+# mapping: llama
+resume: smol360.pt
+optimizer: atom
+steps: 8000
+lr: 1e-04
+weight_decay: 0.01
+grad_clip: 1.55
+warmup_steps: 266
+min_lr_frac: 0.1
+seed: 1
+log_every: 10
+eval_every: 50
+eval_batches: 4
+device: cuda:0, cuda:1
+grad_accum_steps: 1
+grad_checkpointing: false
+graph: false
+save_graph: false
+amp_dtype: bf16
+save_every: 500
+runpoints_path: null
+
+seq_len: 2048
+batch_size: 2
+prefetch_batches: 256
+
+rope_theta: 100000
+rope_original_seq_len: 8192
+rope_factor: 1.0
+rope_beta_fast: 32.0
+rope_beta_slow: 1.0
+rope_attention_factor: null
+
+tria_carry_enabled: true
+use_cuda_tria: true
+tria_gamma_max: 0.80
+tria_raw_gamma_init: 0.25
+tria_temporal_enabled: true
+tria_temporal_auto: false
+tria_temporal_window: 128
+tria_temporal_window_min: 32
+tria_target_refeeds_per_sequence: 7
+tria_min_refeeds_per_sequence: 1
+tria_carrier_alpha: 0.0375
+tria_carrier_alpha_candidates: [0.0125, 0.025, 0.0375, 0.05, 0.0625, 0.075]
+tria_temporal_max_condition: 3.0
+tria_temporal_min_effective_rank: 2.70
+tria_temporal_population_pass_fraction: 0.90
+tria_temporal_calib_seeds: 1
+tria_temporal_calib_batch: 1
+tria_temporal_calib_tokens: 512
+tria_temporal_calib_device: auto
+tria_temporal_calib_parallel_sweep: 2
+
+# tokenizer: the DONOR's own -- see loomcloner design notes, using LoomFormer's
+# own tokenizer instead would make emb.weight/head.weight untransplantable.
+tokenizer: SmolLM2-360M-Instruct/tokenizer.json
+vocab: 49152
+tied_embeddings: true
+
+train_dataset: ./datasets/fw-edu   
+val_dataset: null
+auto_val_split_pct: 1.0
+
+dataset_format: auto
+text_field: text
+dataset_cache: null
+
+model_dim: 960
+
+n_q_heads: 15
+head_dim: 64                    # d_model = 15 * 64 = 960
+
+n_kv_heads: 5
+gqa_group_size: null
+
+hidden: 2565                        # round_up(model_dim*hidden_mult, n_q_heads) -- see zero-pad note above
+hidden_mult: 2.666667          # = donor intermediate_size / hidden_size, NOT rounded -- see mapping notes
+layers: 32
+
+# NOTE: donor intermediate_size=2560 is not divisible by n_q_heads=15
+# (LoomFormer requires this -- HIDDEN_PER_Q_HEAD=HIDDEN//N_Q_HEADS feeds per-head
+# phase slicing). hidden is rounded up to 2565; --clone zero-pads the donor's
+# up_proj/gate_proj/down_proj by 5 channel(s) to match.
+
+phase_sectors: head
+residual_init: beta
+activation: pvpowlu
+powlu_m: 3.0
+phase_grad_floor: 0.05
+phase_grad_mode: secant
+attn_impl: sdpa
+
+final_norm: true
+paraplex_gate_proj: true   
+attn_sdpa_recompute_backward: false
+
+use_cuda_beta_space: true
+use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true
+
+# ===AUTO GENERATED=== cloned-model bookkeeping. Consumed by the training
+# script to set per-parameter requires_grad/lr; LoomFormer-side names (not
+# donor names) so they match model.named_parameters() directly. `train_lr`
+# entries match by SUFFIX against every 'blocks.{i}.<pattern>' or exact
+# global name (emb.weight, head.weight) -- one entry covers all layers.
+cloned: true
+cloned_from: SmolLM2-360M-Instruct
+cloned_mapping: llama
+train_lr:
+  - name: attn.qkv_weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor
+  - name: attn.o.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor
+  - name: ffn.w1_real.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor (up_proj)
+  - name: ffn.w2.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor (down_proj)
+  - name: ffn.gate_proj.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor (gate_proj), only present if paraplex_gate_proj=true
+  - name: emb.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor (requires matching tokenizer)
+  - name: head.weight
+    train: yes
+    lr: 3.00e-06  # transplanted from donor if untied and present
+  - name: ln_attn.weight
+    train: yes
+    lr: 3.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
+  - name: ln_attn.bias
+    train: yes
+    lr: 3.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR
+  - name: ln_ffn.weight
+    train: yes
+    lr: 3.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
+  - name: ln_ffn.bias
+    train: yes
+    lr: 3.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR

@@ -978,7 +978,7 @@ def apply_config(cfg: Config) -> None:
     cfg.attn_impl = ATTN_IMPL
     cfg.attn_sdpa_compute_dtype = ATTN_SDPA_COMPUTE_DTYPE
     ATTN_SDPA_VALUE_FUSION = bool(getattr(cfg, "attn_sdpa_value_fusion", True))
-    ATTN_SDPA_RECOMPUTE_BACKWARD = bool(getattr(cfg, "attn_sdpa_recompute_backward", False))
+    ATTN_SDPA_RECOMPUTE_BACKWARD = bool(getattr(cfg, "attn_sdpa_recompute_backward", True))
     PHASE_SECTORS = str(getattr(cfg, "phase_sectors", "head") or "head").lower()
     if PHASE_SECTORS not in ("head", "open"):
         raise ValueError(f"phase_sectors must be 'head' or 'open', got {PHASE_SECTORS!r}")

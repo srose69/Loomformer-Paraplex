@@ -1,38 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-loomcloner.py -- transplant a pretrained donor transformer's attention/FFN
-weights into a freshly-shaped LoomFormer checkpoint ("--rebuild" from the
-design discussion this came out of).
-
-Two stages, run separately on purpose (scan is cheap and donor-only; clone
-needs the donor's actual weight files and does the real work):
-
-  1. --scan   reads the donor's own config.json, fills a LoomFormer YAML
-              1:1 from it (every field resolved, nothing left as a guess),
-              ending with `cloned: true` and a per-parameter train/lr
-              override list (LoomFormer-side names, so the training script
-              can match them directly against model.named_parameters() --
-              no donor-name translation needed at train time).
-
-  2. --clone  loads the donor's real weights, remaps names per the chosen
-              mappings/*.json, builds a LoomFormer Model from the YAML
-              --scan produced, loads everything that has a mapped source
-              (strict=False -- Tria/Paraplex-specific parameters have no
-              donor equivalent and keep their own identity-anchored init),
-              saves a normal LoomFormer checkpoint.
-
-Mapping files (mappings/*.json) describe ONE donor architecture family each
-(name translation + config-field translation + train/lr policy) -- kept out
-of this file's own code on purpose, so a new donor family is a JSON file, not
-a code change.
-
-CLI:
-  loomcloner.py --scan  <donor_dir> --mapping mappings/llama.json --out chk.yaml
-                [--steps N] [--lr F] [--paraplex-gate-proj] [--final-norm]
-  loomcloner.py --clone <config.yaml> --donor <donor_dir> --mapping mappings/llama.json
-                --out cloned.pt
-"""
+"""Build LoomFormer configs and checkpoints from pretrained donor models."""
 
 from __future__ import annotations
 
@@ -65,9 +33,7 @@ def load_mapping(mapping_path: str) -> Dict[str, Any]:
 
 
 def read_safetensors_header(path: str) -> Dict[str, Any]:
-    """Reads just the JSON header (key -> {shape, dtype}) without loading any
-    tensor data -- this is all --scan needs, and --clone uses it too before
-    deciding what to actually read off disk."""
+    """Read a Safetensors JSON header without loading tensor data."""
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(n))
@@ -86,9 +52,7 @@ def find_safetensors_files(donor_dir: str) -> List[str]:
 
 
 def detect_mapping(donor_cfg: Dict[str, Any], mappings_dir: str) -> str:
-    """Auto-pick a mapping file by donor_cfg['architectures'], used when the
-    caller didn't pass --mapping explicitly. Falls back to raising with a
-    clear message (never guesses silently)."""
+    """Find a mapping whose declared architectures match the donor config."""
     archs = set(donor_cfg.get("architectures", []))
     for p in sorted(Path(mappings_dir).glob("*.json")):
         m = load_mapping(str(p))
@@ -312,9 +276,7 @@ def _load_donor_tensors(donor_dir: str) -> Dict[str, torch.Tensor]:
 
 
 def _pad_hidden_dim(tensor: torch.Tensor, target_hidden: int, axis: int) -> torch.Tensor:
-    """Zero-pads `tensor` along `axis` up to target_hidden -- never truncates
-    (that would discard real, trained donor parameters). A no-op if the
-    donor's width already matches."""
+    """Zero-pad one tensor axis to ``target_hidden``, rejecting truncation."""
     current = tensor.shape[axis]
     if current == target_hidden:
         return tensor
@@ -402,10 +364,7 @@ def remap_donor_to_loomformer(donor_tensors: Dict[str, torch.Tensor], mapping: D
 
 
 def _upsert_resume_field(yaml_path: str, resume_value: str) -> None:
-    """Text-level edit, not yaml.dump -- round-tripping through PyYAML would
-    strip every comment in the --scan-generated file. Replaces an existing
-    top-level `resume:` line if present, otherwise inserts one right before
-    the first real config line (`optimizer:`, which --scan always emits)."""
+    """Replace or insert the top-level YAML ``resume`` field while preserving comments."""
     with open(yaml_path, encoding="utf-8") as f:
         lines = f.readlines()
     new_line = f"resume: {resume_value}\n"

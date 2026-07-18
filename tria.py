@@ -63,9 +63,7 @@ def build_tria_pytorch(
 
 
 def _local_normalize(m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """maxabs-normalize STRICTLY per (B,T,H) -- max over the last two axes
-    only. See module docstring for why a global max is a real, verified bug,
-    not a style preference."""
+    """Max-absolute-normalize each matrix over its final two dimensions."""
     work = m.float() if m.dtype in (torch.float16, torch.bfloat16) else m
     scale = work.abs().amax(dim=(-1, -2), keepdim=True).clamp_min(eps)
     normalized = work / scale
@@ -73,16 +71,12 @@ def _local_normalize(m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def carry_init_pytorch(tria_1: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """carry_1 = normalize(Tria_1). Base case: no carry_0, no matmul -- layer 1
-    has nothing to chain with (spec §5, layer-1 boundary condition)."""
+    """Normalize the first layer's Tria matrix."""
     return _local_normalize(tria_1, eps)
 
 
 def carry_step_pytorch(tria_l: torch.Tensor, carry_prev: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """carry_L = normalize(Tria_L @ carry_{L-1}), L>=2. matmul is batched over
-    the leading (B,T,H) dims (torch.matmul broadcasts over all but the last two
-    axes) -- an ordinary batched 3x3 @ 3x3, nothing exotic in the PyTorch path.
-    """
+    """Left-multiply the previous carry by the current Tria matrix and normalize."""
     m = torch.matmul(tria_l, carry_prev)
     return _local_normalize(m, eps)
 
@@ -144,11 +138,7 @@ def set_graph_mode_enabled(enabled: bool) -> None:
 
 
 def set_cuda_tria_enabled(enabled: bool) -> None:
-    """Enable/disable the fused CUDA Tria step at runtime from Config.
-
-    Default stays env-driven/off so old configs remain safe; loomformer.apply_config
-    calls this when cfg.use_cuda_tria is present.
-    """
+    """Enable or disable fused CUDA Tria operations at runtime."""
     global _CUDA_TRIA_ENABLED
     _CUDA_TRIA_ENABLED = bool(enabled)
 
@@ -190,9 +180,7 @@ def _tria_cuda_op_enabled(name: str) -> bool:
 
 
 def _try_load_cuda_tria():
-    """Lazy build/load of the fused Tria CUDA module. Fails closed to PyTorch -- same
-    pattern as _try_load_cuda_beta_space/_try_load_cuda_phase_sin in
-    loomformer.py. Target-GPU validation is separate from the CPU reference tests."""
+    """Lazily build and load the fused CUDA module, returning ``None`` on failure."""
     global _cuda_tria_module, _cuda_tria_tried
     if _cuda_tria_tried:
         return _cuda_tria_module
@@ -694,9 +682,7 @@ def _cast_tria_args(dtype: torch.dtype, *xs: torch.Tensor) -> Tuple[torch.Tensor
 
 
 class _GateSlotMixFused(torch.autograd.Function):
-    """Spec §4's per-layer gate mix, fused: p = Sum_k w[k]*slot_k(carry). Saves
-    only carry (already alive for the carry chain) and w (9 elements) -- no
-    [B,T,H,9] intermediate ever materialized, forward or backward."""
+    """Autograd wrapper for the fused CUDA weighted slot reduction."""
 
     @staticmethod
     def forward(ctx, carry, w):
@@ -718,10 +704,7 @@ class _GateSlotMixFused(torch.autograd.Function):
 
 
 class _SlotAttentionPoolFused(torch.autograd.Function):
-    """SharedTriaReader.attention_pool_slots, fused: one query-attention pool
-    over H per (b,t), computed directly on the 9-dim slots. Saves carry (already
-    alive) and the tiny per-row log-sum-exp [B,T] -- backward recomputes
-    score[h]/weight[h] from carry instead of persisting [B,T,H] weights."""
+    """Autograd wrapper for fused CUDA attention pooling over Tria slots."""
 
     @staticmethod
     def forward(ctx, carry, score_w):
@@ -744,9 +727,7 @@ class _SlotAttentionPoolFused(torch.autograd.Function):
 
 
 def _cuda_slot_op_applicable(carry: torch.Tensor, small: torch.Tensor) -> bool:
-    """Shared applicability check for the gate-mix/attention-pool fused
-    kernels -- same dtype/device contract as _cuda_tria_applicable, just for
-    the (carry, small-9-vector) argument shape these two ops share."""
+    """Return whether two tensors satisfy the fused slot kernels' device and dtype requirements."""
     if not (carry.is_cuda and small.is_cuda):
         return False
     if carry.dtype not in (torch.float32, torch.float16, torch.bfloat16):
@@ -767,7 +748,7 @@ def _cuda_slot_op_applicable(carry: torch.Tensor, small: torch.Tensor) -> bool:
 def tria_init(
     r_1: torch.Tensor, i_1: torch.Tensor, o_1: torch.Tensor, axis: int = 0
 ) -> torch.Tensor:
-    """carry_1 = normalize(carrier_tria_1)."""
+    """Build and normalize the initial carrier matrix."""
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
     if _tria_cuda_op_enabled("init") and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda:
@@ -840,7 +821,7 @@ def tria_step(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor, carry_prev: torch.Tensor,
     axis: int = 0,
 ) -> torch.Tensor:
-    """carry_L = normalize(carrier_tria(r,i,o) @ carry_prev)."""
+    """Build a carrier matrix, compose it with ``carry_prev``, and normalize."""
     axis = _axis(axis)
     alpha = float(_TRIA_CARRIER_ALPHA)
     if _tria_cuda_op_enabled("step") and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda:
@@ -929,12 +910,7 @@ def temporal_carry_combine_pytorch(
     right_resets: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Combine an earlier interval (`left`) with a later interval (`right`).
-
-    Without a reset in the later interval, composition is normalize(right @ left)
-    because newer token matrices multiply from the left. If `right_resets` is
-    true, the later interval already starts a new segment and discards `left`.
-    """
+    """Compose adjacent intervals, discarding ``left`` where ``right`` resets."""
     combined = _local_normalize(torch.matmul(right, left), eps)
     mask = right_resets[..., None, None, None]
     return torch.where(mask, right, combined)
@@ -947,11 +923,7 @@ def temporal_segment_combine(
     b_has_reset: torch.Tensor,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Associative combine for scan elements.
-
-    `a` is the left/earlier interval, `b` is the right/later interval. If the
-    later interval contains any reset, it is already independent of `a`.
-    """
+    """Associatively combine two scan intervals and their reset flags."""
     composed = _local_normalize(torch.matmul(b_matrix, a_matrix), eps)
     out_matrix = torch.where(b_has_reset[..., None, None, None], b_matrix, composed)
     out_has_reset = a_has_reset | b_has_reset
@@ -963,12 +935,7 @@ def temporal_carry_reference(
     reset_mask: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Sequential reference implementation for tests and analysis only.
-
-    depth_carry: [B,T,H,3,3]
-    reset_mask:  [B,T] bool
-    returns:     [B,T,H,3,3]
-    """
+    """Compute segmented temporal carry sequentially for ``[B,T,H,3,3]`` input."""
     if depth_carry.dim() != 5 or depth_carry.shape[-2:] != (3, 3):
         raise ValueError(f"depth_carry must be [B,T,H,3,3], got {tuple(depth_carry.shape)}")
     if reset_mask.shape != depth_carry.shape[:2]:
@@ -997,11 +964,7 @@ def temporal_carry_pytorch(
     reset_mask: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Hillis-Steele segmented inclusive prefix scan over T.
-
-    This is differentiable and uses ceil(log2(T)) scan stages instead of a
-    sequential Python loop over tokens.
-    """
+    """Compute differentiable segmented temporal carry with PyTorch."""
     if depth_carry.dim() != 5 or depth_carry.shape[-2:] != (3, 3):
         raise ValueError(f"depth_carry must be [B,T,H,3,3], got {tuple(depth_carry.shape)}")
     if reset_mask.shape != depth_carry.shape[:2]:
@@ -1098,12 +1061,7 @@ def temporal_carry_cuda_forward(
     depth_carry: torch.Tensor,
     reset_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward-only CUDA streaming temporal carry.
-
-    This helper returns the forward output and scale saved by the streaming
-    recurrence kernel. It exists for parity/perf benchmarking and
-    inference-style no-grad execution.
-    """
+    """Return the CUDA temporal-carry output and its normalization scale."""
     if depth_carry.dim() != 5 or depth_carry.shape[-2:] != (3, 3):
         raise ValueError(f"depth_carry must be [B,T,H,3,3], got {tuple(depth_carry.shape)}")
     if reset_mask.shape != depth_carry.shape[:2]:
@@ -1178,10 +1136,7 @@ def temporal_carry_cuda(
     depth_carry: torch.Tensor,
     reset_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Differentiable CUDA streaming temporal carry (fused forward + reverse
-    recurrent backward). Not yet the default `temporal_carry()` path --
-    see that function's docstring -- but ready for parity/perf validation
-    against `temporal_carry_pytorch` ahead of promoting it."""
+    """Compute temporal carry with the differentiable fused CUDA kernel."""
     if depth_carry.dim() != 5 or depth_carry.shape[-2:] != (3, 3):
         raise ValueError(f"depth_carry must be [B,T,H,3,3], got {tuple(depth_carry.shape)}")
     if reset_mask.shape != depth_carry.shape[:2]:
@@ -1196,12 +1151,7 @@ def temporal_carry(
     reset_mask: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Production API for temporal document carry.
-
-    Uses the registered custom_op when graph_helper has installed it, otherwise
-    the fused CUDA streaming recurrence when enabled and applicable, otherwise
-    the differentiable PyTorch reference.
-    """
+    """Compute temporal carry with the best enabled backend for the inputs."""
     cuda_applicable = (
         depth_carry.is_cuda
         and reset_mask.is_cuda
@@ -1216,7 +1166,7 @@ def temporal_carry(
 
 
 def tria_slots(carry: torch.Tensor) -> torch.Tensor:
-    """carry: [B,T,H,3,3] -> [B,T,H,9], row-major flatten of the 9 positions."""
+    """Flatten ``[B,T,H,3,3]`` carry matrices to row-major ``[B,T,H,9]`` slots."""
     B, T, H = carry.shape[:3]
     return carry.reshape(B, T, H, 9)
 

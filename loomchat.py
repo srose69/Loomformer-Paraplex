@@ -1,27 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-loomchat.py -- interactive chat / inference for LoomFormer .aio archives.
-
-Split out from loomformer.py on purpose: loomformer.py is the model plus everything
-close to training; loomchat.py is everything about TALKING to an already-trained
-archive. Imports Model/tria from loomformer -- does
-not duplicate them (one source of truth for the architecture and for "how a turn
-becomes text", see loomformer.ChatTemplate / chat_template.jinja / sft.md).
-
-UX modeled on Claude Code's terminal conventions: `/` at the start of input opens
-the command surface (typing narrows it, like Claude Code's slash-command filter);
-settings are edited either via one-line commands (`/window 96`, `/device cuda:1`,
-matching Claude Code's `/model opus` directness) or via `/settings` for a full
-current-state view; Esc (or Ctrl-C as a fallback on terminals where raw single-key
-reads aren't available) interrupts an in-flight generation without killing the
-session, the same relationship Claude Code's Esc has to a running turn.
-
-CLI:
-  loomchat.py model.aio [--device cuda:0]
-              [--dtype bf16] [--system "..."] [--temperature 0.7] [--top-p 0.9]
-              [--top-k 0] [--max-new 512] [--window N] [--alpha F]
-"""
+"""Interactive chat and inference for packaged LoomFormer models."""
 
 from __future__ import annotations
 
@@ -166,7 +145,7 @@ class EscWatcher:
 # ============================================================================
 
 def sample_next(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> int:
-    """logits: 1D tensor (VOCAB,). temperature<=0 -> greedy argmax."""
+    """Sample from 1-D logits, using greedy selection at non-positive temperature."""
     if temperature <= 0:
         return int(torch.argmax(logits, dim=-1).item())
     logits = logits.float() / temperature
@@ -357,8 +336,7 @@ def _autocast(settings: Settings):
 
 def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
                    settings: Settings, esc: Optional[EscWatcher] = None) -> Tuple[Dict, bool]:
-    """Runs one assistant turn to completion (streaming to stdout as it goes).
-    Returns (message_dict, was_interrupted)."""
+    """Stream one assistant turn and return its message and interruption status."""
     device = torch.device(settings.device)
     ids = chat.render_prompt_ids(messages)
     room = lf.SEQ_LEN - len(ids)
@@ -456,8 +434,7 @@ def print_settings(settings: Settings) -> None:
 # ============================================================================
 
 def apply_setting(name: str, value: str, settings: Settings, model) -> Optional[str]:
-    """Mutates `settings` (and, for device/dtype/window/alpha, the live model /
-    tria module too) in place. Returns an error string, or None on success."""
+    """Apply a runtime setting and return a validation error or ``None``."""
     try:
         if name == "device":
             new_device = torch.device(value)

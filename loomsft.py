@@ -1,46 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-loomsft.py -- SFT on top of LoomFormer.
-
-Consumes the jsonl schema documented in sft_format.json (OpenAI-style messages,
-with first-class tool_calls/tool_call_id). Does NOT convert other formats into
-this shape -- get your data there yourself.
-
-Design, rewritten from the ground up around one change: render+tokenize every
-example EXACTLY ONCE, up front, and never again.
-
-The previous version re-rendered the Jinja template and re-tokenized from raw
-JSON on every single batch draw, for the lifetime of training -- across many
-epochs over a fixed, static file, that is the same handful of megabytes of
-text being re-parsed and re-templated thousands of times over. Jinja rendering
-is an inherently per-example Python-level operation (it doesn't batch), so the
-only way to stop paying for it repeatedly is to pay for it once and cache the
-result. A 150k-line dataset renders+tokenizes in a few minutes on CPU, held
-entirely in RAM (a few hundred MB of int32 token ids) -- after that, every
-training step is pure array slicing and concatenation, no JSON, no Jinja, no
-tokenizer calls, ever again.
-
-No <CARRY> handling. Tria's temporal refeed runs on its normal dense grid,
-exactly like pretrain -- SFT does not place, mask, or otherwise think about
-<CARRY> at all. (If that ever changes, it belongs back in here as a targeted
-addition, not as the default.)
-
-Packing: multiple pre-tokenized examples per row instead of padding each to
-seq_len alone (real SFT examples are usually much shorter than seq_len; a
-pad-to-seq_len batch wastes most of its compute on padding). Packing is
-block-diagonal, not a naive concat:
-  - packed examples cannot attend across each other's boundary
-  - every packed segment gets its own local position ids (0..len-1)
-  - the last position of every segment is excluded from the loss: under
-    block-diagonal attention it structurally cannot see the next example, so
-    "predicting" that example's first token is not a learnable signal.
-
-CLI:
-  loomsft.py --sft-dataset train.jsonl --config sft.yaml --init-checkpoint pretrain.pt \
-             --checkpoint sft.pt [--val-dataset held_out.jsonl] [--steps N]
-  loomsft.py --smoke-test
-"""
+"""Supervised fine-tuning for LoomFormer with pretokenized example packing."""
 
 from __future__ import annotations
 
@@ -111,9 +71,7 @@ def _iter_jsonl(path: str):
 
 
 def _iter_examples(path: str):
-    """Reads jsonl OR a HF-style .arrow file with a 'messages' column (same
-    dual-format convenience as loomformer's own dataset loading) -- but always
-    the sft_format.json schema either way."""
+    """Yield numbered examples from JSONL or an Arrow ``messages`` column."""
     if path.endswith(".arrow") or path.endswith(".feather"):
         import pyarrow as pa
         import pyarrow.ipc as ipc
@@ -206,11 +164,7 @@ def _need_pad_id(tok) -> int:
 
 
 class Packer:
-    """Greedy first-fit packing over an in-memory pool of already-tokenized
-    examples. Holds a shuffled permutation of the pool and walks it; reshuffles
-    and starts over once exhausted (a fresh "epoch" of example ORDER -- the
-    pool itself, and every example's tokenization, is fixed and was computed
-    exactly once in preprocess_dataset)."""
+    """Greedily pack a reusable pool of tokenized examples into fixed-length rows."""
 
     def __init__(self, pool: List[TokenizedExample], seq_len: int, pad_id: int,
                  shuffle: bool, seed: int = 0):
@@ -236,10 +190,7 @@ class Packer:
         return ex
 
     def fast_forward(self, n_rows: int) -> None:
-        """Advances the same RNG/cursor state that pack_one_row() would, without
-        building PackedRow objects or tensors -- used on --resume to skip past
-        already-seen draws cheaply (no torch, no numpy stacking, just the
-        example-order bookkeeping)."""
+        """Advance packing order by ``n_rows`` without constructing rows."""
         T = self.T
         for _ in range(n_rows):
             cursor = 0
@@ -297,8 +248,7 @@ class Packer:
 
 def print_sft_header(cfg: "lf.Config", device: torch.device, init_checkpoint: str,
                      train_path: str, val_path: Optional[str]) -> None:
-    """1:1 with loomformer.print_architecture_report, plus SFT-specific fields
-    (init checkpoint, train/val dataset paths)."""
+    """Print the model architecture and SFT dataset paths."""
     width = 64
     rule = "=" * width
     print(rule)
@@ -317,10 +267,7 @@ def print_sft_header(cfg: "lf.Config", device: torch.device, init_checkpoint: st
 
 
 def print_sft_training_budget(cfg: "lf.Config", model, train_pool: List[TokenizedExample]) -> None:
-    """Same shape as loomformer.print_training_budget, but every number here
-    comes from the ACTUAL preprocessed pool (real render+tokenize output),
-    not an estimate -- this only makes sense printed after preprocess_dataset,
-    never before it."""
+    """Print token and parameter statistics for the preprocessed training pool."""
     pool_tokens = int(sum(len(ex.ids) for ex in train_pool))
     pool_loss_tokens = int(sum(int(ex.mask.sum()) for ex in train_pool))
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
@@ -343,14 +290,7 @@ def print_sft_training_budget(cfg: "lf.Config", model, train_pool: List[Tokenize
 
 
 class BatchPrefetcher:
-    """Packing (Python loop over segments + broadcasting the block-diagonal
-    mask) is real CPU work, and without overlap the GPU sits idle for exactly
-    that long on EVERY step -- a wave in GPU utilization at the per-step
-    period, not something that shows up in a log averaged every log_every
-    steps. One background thread stays one batch ahead in a bounded queue;
-    the training loop only ever waits on a queue.get(), which returns
-    immediately once the GPU is done with the previous step's forward/backward
-    (i.e. the two overlap instead of serializing)."""
+    """Prepare packed batches in a background thread and bounded queue."""
 
     def __init__(self, packer: Packer, batch_size: int, device: torch.device, depth: int = 2):
         self.packer = packer

@@ -50,11 +50,7 @@ def device_auto(pref: Optional[str] = None) -> torch.device:
 
 
 def _parse_cuda_device_list(pref: str) -> Optional[List[int]]:
-    """Parse a DDP subset selector like 'cuda:0,cuda:1' or '0,1'.
-
-    A single 'cuda:1' remains a normal single-process device. Commas opt into
-    torchrun self-launch over the selected visible devices.
-    """
+    """Parse a comma-separated CUDA device list, or return ``None`` for a scalar selector."""
     raw = str(pref or "").strip().lower().replace(" ", "")
     if "," not in raw:
         return None
@@ -411,7 +407,7 @@ class Config:
 
     @staticmethod
     def from_dict(d: dict) -> "Config":
-        """Strict config construction: one spelling per field, no aliases or silent drops."""
+        """Build a config after rejecting unknown fields and coercing float strings."""
         import dataclasses
         field_map = {f.name: f for f in dataclasses.fields(Config)}
         unknown = sorted(set(d) - set(field_map))
@@ -427,7 +423,7 @@ class Config:
 
     @staticmethod
     def from_checkpoint_dict(d: dict) -> "Config":
-        """Validated one-time migration for the supplied pre-cleanup checkpoint."""
+        """Migrate supported legacy checkpoint fields and build a validated config."""
         values = dict(d)
         legacy_window = values.pop("tria_temporal_deadline", None)
         current_window = values.get("tria_temporal_window")
@@ -676,7 +672,7 @@ def apply_temporal_tria_auto_calibration(cfg: Config) -> None:
 
 
 def restore_temporal_tria_from_checkpoint(cfg: Config, path: Optional[str]) -> bool:
-    """Restore resolved calibration values before model/config initialization."""
+    """Restore Tria calibration into ``cfg`` and report whether values were found."""
     if not path:
         return False
     blob = torch.load(path, map_location="cpu", weights_only=True)
@@ -788,14 +784,14 @@ def residual_std(fan_in: int, gain: float = FANIN_GAIN) -> float:
 
 
 def fixed_rms(x: torch.Tensor, target: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
-    """Rescale only the last dimension, preserving dtype and kernel-facing shapes."""
+    """Scale each last-dimension vector by ``target / sqrt(mean(x²) + eps)``."""
     work = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
     scale = torch.rsqrt(work.square().mean(dim=-1, keepdim=True) + eps) * float(target)
     return x * scale.to(dtype=x.dtype)
 
 
 def capped_rms(x: torch.Tensor, maximum: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
-    """Cap runaway branch RMS without amplifying a small or intentionally quiet branch."""
+    """Apply RMS scaling up to ``maximum`` without amplifying the input."""
     work = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
     rms = torch.sqrt(work.square().mean(dim=-1, keepdim=True) + eps)
     scale = (float(maximum) / rms).clamp(max=1.0)
@@ -1343,7 +1339,7 @@ class RawCorpus:
         raise ValueError(self.fmt)
 
     def iter_sampled_texts(self, docs):
-        """Read sampled Parquet rows without materializing whole shards."""
+        """Yield sampled texts, reading only the required Parquet row groups."""
         if self.fmt != "parquet":
             for fi, key, length in docs:
                 yield self._read_doc_text(fi, key, length)
@@ -1661,8 +1657,7 @@ def _auto_split_bin(files: List[str], val_path: str, pct: float) -> Dict[str, in
 
 
 def maybe_auto_val_split(cfg: Config, dataset: str) -> Optional[str]:
-    """Destructive pretrain helper: create val split by physically cutting tail rows
-    from each top-level corpus shard, then rewrite the original shards as train-only."""
+    """Return a validation path, optionally cutting shard tails into a new split."""
     if cfg.val_dataset:
         return str(cfg.val_dataset)
     pct = _auto_val_split_pct(cfg)
@@ -2085,7 +2080,7 @@ def phase_sin(beta: torch.Tensor, anchor: Optional[torch.Tensor] = None) -> torc
 
 
 def phase_anchor_scale(beta: torch.Tensor, floor: float = 1e-4) -> torch.Tensor:
-    """Representative FP32 phase radius for the secant-gradient EMA."""
+    """Return the detached FP32 RMS phase radius, clamped to ``floor``."""
     beta_f = beta.detach().float()
     return beta_f.square().mean().sqrt().clamp_min(float(floor))
 
@@ -2348,7 +2343,7 @@ _cuda_paraplex_tried = False
 
 
 def _cuda_autocast_dtype_or_none():
-    """Return active CUDA autocast dtype, compatibly across PyTorch versions."""
+    """Return the active CUDA autocast dtype, or ``None`` when disabled."""
     try:
         if torch.is_autocast_enabled("cuda"):
             return torch.get_autocast_dtype("cuda")
@@ -2505,11 +2500,7 @@ class _ParaplexFused(torch.autograd.Function):
 
 def beta_space_cuda(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
                     hidden_per_q_head, head_dim, n_q_heads, open_sectors):
-    """Optional CUDA fast path for ParaplexFFN._beta_space.
-
-    Returns None when the fast path is not applicable so callers can fall back to the
-    original dense PyTorch implementation without changing model semantics.
-    """
+    """Compute beta space with CUDA, or return ``None`` when unsupported."""
     if not (u.is_cuda and q_h.is_cuda and k_ctx_h.is_cuda and c_h.is_cuda and d_h.is_cuda and w1_imag_compact.is_cuda):
         return None
     if u.dtype not in (torch.float32, torch.bfloat16):
@@ -3353,25 +3344,18 @@ def powlu(x: torch.Tensor, m: float = 3.0) -> torch.Tensor:
 
 
 def powlu_gate(x2: torch.Tensor, m: float = 3.0) -> torch.Tensor:
-    """f(x2) from PowLU's GLU-style wiring -- valid ONLY for x2 > 0 (caller guarantees this,
-    e.g. softplus output). No clamp/where needed: the fractional-power branch is the ONLY
-    branch that can ever fire, by construction, not by masking."""
+    """Apply the positive-input PowLU gate used by the GLU path."""
     exponent = m / (torch.sqrt(x2) + 1.0)
     return x2.pow(exponent) * torch.sigmoid(x2)
 
 
 def act_fn(x: torch.Tensor) -> torch.Tensor:
-    """Outer activation dispatcher -- stays OUTSIDE the primitive for both FFN types.
-    Only used for "gelu"/"powlu"; "pvpowlu" is wired directly at each FFN's call site
-    since it needs a second, architecture-specific input (see FFN forward methods)."""
+    """Apply the configured GELU or PowLU activation."""
     return F.gelu(x) if ACTIVATION == "gelu" else powlu(x, POWLU_M)
 
 
 class RMSNorm(nn.Module):
-    """Standard RMSNorm (Zhang & Sennrich 2019) -- root-mean-square rescale,
-    no mean subtraction, no bias. Used only as the optional final norm before
-    `head` (Config.final_norm) -- LoomFormer's own per-block norms stay full
-    LayerNorm (ln_attn/ln_ffn), unchanged."""
+    """RMS normalization with a learned scale and no bias."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -3443,9 +3427,7 @@ class Model(nn.Module):
             last_selector.logits.requires_grad_(False)
 
     def _head_in(self, x: torch.Tensor) -> torch.Tensor:
-        """Single choke point all 4 head()-call sites go through -- one
-        place to apply ln_final consistently instead of 4 independent
-        `if self.ln_final is not None` checks that could drift apart."""
+        """Apply the optional final norm and output head."""
         return self.head(self.ln_final(x) if self.ln_final is not None else x)
 
     def reset_parameters(self) -> None:
@@ -3600,12 +3582,7 @@ class Model(nn.Module):
     def _run_chunk_stack_impl(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
                               chunk_mask: Optional[torch.Tensor], layer_states: list,
                               accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor]):
-        """Pure tensor-producing implementation for one complete temporal chunk.
-
-        The whole depth stack is one checkpoint region. This reduces Python and
-        dispatcher boundaries from chunks*layers to chunks while preserving exact
-        BPTT through the temporal seed and the disjoint per-layer K/V chunks.
-        """
+        """Run the full block stack for one temporal chunk and return tensor state."""
         n_blocks = len(self.blocks)
         k0, v0 = self.depth_attn.project(h_emb_chunk)
         hist_k = [k0]
@@ -4308,25 +4285,11 @@ def load_model_checkpoint(model: nn.Module, path: str, ablation: bool, device: t
 
 
 def apply_train_lr_overrides(model: nn.Module, cfg: Config) -> Dict[int, float]:
-    """Consumes cfg.train_lr (written by loomcloner.py --scan, LoomFormer-side
-    names) against the REAL model's named_parameters(): sets requires_grad
-    per entry, and returns {id(param): lr_mult} for every parameter an entry
-    covered (uncovered parameters aren't in the dict -- they use lr_mult=1.0,
-    the normal default, same as an ordinary from-scratch run).
+    """Apply ``cfg.train_lr`` freeze/LR overrides and return parameter LR multipliers.
 
-    Returns a MULTIPLIER relative to cfg.lr, not an absolute lr -- the
-    training loop's LR schedule does `g["lr"] = lr_at(cfg, step) *
-    g.get("lr_mult", 1.0)` every step (see train_one_async), so an absolute
-    per-group lr set once at optimizer-construction time would be silently
-    overwritten by that line on the very first step. The YAML's own `lr:`
-    field stays human-readable as an absolute value (matching how it's
-    written); this function does the division against cfg.lr once here.
-
-    Matching: a per-layer name like 'attn.qkv_weight' matches every
-    'blocks.{i}.attn.qkv_weight' (the blocks.{i}. prefix is stripped before
-    comparing) -- ONE entry covers all layers, not one per layer index.
-    A global name like 'emb.weight' matches only that exact parameter name.
-    First matching entry wins if more than one pattern could apply."""
+    Block indices are ignored when matching names, and the first matching entry wins.
+    Returned values are each entry's absolute LR divided by ``cfg.lr``.
+    """
     overrides = getattr(cfg, "train_lr", None)
     if not overrides:
         return {}
@@ -4452,12 +4415,7 @@ class _RunpointWatcher:
         return self
 
     def pause(self) -> None:
-        """Stop the background reader and restore normal (cooked, echoing)
-        terminal settings -- call this before any input() prompt that needs
-        real keyboard interaction (e.g. the Ctrl-C y/N confirmation). Without
-        this, input() runs while stdin is in cbreak+no-echo mode and this
-        thread is still competing for the same fd: typed characters go
-        missing and nothing gets echoed -- exactly the bug this fixes."""
+        """Stop the key reader and restore the terminal's original settings."""
         if not self._active:
             return
         self._stop.set()
@@ -4471,9 +4429,7 @@ class _RunpointWatcher:
                 pass
 
     def resume(self) -> None:
-        """Undo pause() -- only meaningful if training continues after the
-        prompt; a no-op safety net if it was never paused or never entered
-        cbreak mode in the first place."""
+        """Restart the key reader in non-echoing cbreak mode after ``pause``."""
         if not self._active:
             return
         try:

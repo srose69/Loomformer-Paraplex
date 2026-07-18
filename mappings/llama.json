@@ -28,7 +28,7 @@
   "config_notes": [
     "hidden_mult is intermediate_size/hidden_size, NOT necessarily a round number (e.g. SmolLM2-360M: 2560/960 = 2.6667) -- do not round to a 'clean' value, LoomFormer's own hidden=round_up(model_dim*hidden_mult, n_q_heads) must reconstruct intermediate_size exactly or the w1_real/w2/gate_proj shapes will not match the donor's.",
     "RMSNorm vs LayerNorm mismatch: donor norms have weight only, no bias, and do not subtract the mean (LoomFormer's ln_attn/ln_ffn are full LayerNorm, weight+bias). weight is transplanted 1:1 as an approximation; bias defaults to LoomFormer's own zero-init. This is a known, accepted approximation -- see the RMSNorm/LayerNorm caveat in the design discussion. ln_attn/ln_ffn are therefore NOT included in train_lr_overrides' frozen/low-lr list: they need full LR to help absorb this mismatch.",
-    "model.norm.weight (the final pre-lm_head RMSNorm) has NO destination: LoomFormer applies `head` directly to the last block's residual stream with no final norm layer. It is dropped -- see 'drop' entries below. If this turns out to matter empirically, the fix is a small companion feature (an optional ln_final in Model, analogous to how paraplex_gate_proj was added) -- NOT part of this mapping file.",
+    "model.norm.weight maps exactly to optional ln_final.weight when the target config enables final_norm. Without final_norm it is intentionally dropped.",
     "gate_proj only has a destination when the target LoomFormer config sets paraplex_gate_proj: true (see loomformer.py's PARAPLEX_GATE_PROJ). Without it, gate_proj is dropped and that donor matrix's learned behavior is not transplanted at all."
   ],
 

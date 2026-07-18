@@ -266,6 +266,11 @@ layers: {layers}
 {hidden_mismatch_note}
 phase_sectors: head
 residual_init: beta
+# LoomFormer-only residual stabilization. These tensors have no donor-side
+# equivalent and intentionally remain at their own beta initialization.
+depth_attn_readout: per-sublayer
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0
 activation: pvpowlu
 powlu_m: 3.0
 phase_grad_floor: 0.05

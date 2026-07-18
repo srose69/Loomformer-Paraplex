@@ -99,6 +99,11 @@ layers: 12
 # phase / residual / activation knobs
 phase_sectors: head             # head | open
 residual_init: beta             # beta | fanin
+# Remove the global depth-residual choke point and all post-LN scale gauges.
+# These operations wrap the existing kernels; they do not replace their paths.
+depth_attn_readout: per-sublayer
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0
 activation: pvpowlu             # gelu | powlu | pvpowlu
 powlu_m: 3.0
 phase_grad_floor: 0.05

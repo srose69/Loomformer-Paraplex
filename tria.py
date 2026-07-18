@@ -1303,21 +1303,6 @@ class SharedTriaReader(nn.Module):
         # spread out instead of waiting for training to get there.
         with torch.no_grad():
             self.key_proj.weight.normal_(mean=0.0, std=1.5)
-        # REMOVED: a shared, all-channel `tau` parameter used to sit here,
-        # multiplying score_w = (key_proj^T query) elementwise. It was
-        # dropped: score_w = (key_projᵀ query) ⊙ tau is ONE 9-dim vector
-        # expressed through THREE freely-interchangeable factors (key_proj,
-        # query, tau) -- norm can move between them with zero effect on the
-        # actual score, so per-parameter movement ("tau barely moved") says
-        # nothing about whether score_w itself moved, and the optimizer sees
-        # a badly-conditioned, factorized space instead of the one quantity
-        # that actually matters. See make_score_w() below and each
-        # AttentionPool's logit_scale for the replacement: a normalized
-        # DIRECTION (from key_proj/query alone) times ONE learned, positive,
-        # per-consumer SCALE -- decouples "which slot channels matter" from
-        # "how peaked is the softmax", with the scale no longer shareable
-        # with a competing consumer's needs (aggregator and gate-reduction
-        # used to share this one tau, coupling their different objectives).
 
     def forward(self, carry: torch.Tensor) -> torch.Tensor:
         # Inspection/test path: carry [B,T,H,3,3] -> [B,T,H,9] -> [B,T,H,k].

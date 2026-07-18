@@ -1,30 +1,28 @@
-# training
+# chk
 optimizer: atom                 # atom | adamw
-steps: 4500                      # tiny temporal-Tria check: short run, dense logs, cuda Tria
-                                 # layer kernels + temporal scan on
-lr: 5e-4
+steps: 2000                       # stabilization check: compare exact init against step 100
+lr: 3e-5
 weight_decay: 0.01
 grad_clip: 1.2
-warmup_steps: 20
+warmup_steps: 10
 min_lr_frac: 0.1
 seed: 1
-log_every: 1                     # debug: print every step to measure temporal Tria speed
+log_every: 10                     # debug: print every step to measure temporal Tria speed
 eval_every: 25                   # keep eval off the per-step speed measurement
 eval_batches: 1
-device: cuda:0
+device: cuda:0, cuda:1
 grad_accum_steps: 1
 grad_checkpointing: False
+save_every: 100
+save_initial_checkpoint: true
 graph: False
 save_graph: False
-amp_dtype: bf16                  # cuda:0 here is Pascal (GTX 1080, no bf16 tensor cores) --
-                                  # bf16 autocast silently falls back to fp32 anyway on this
-                                  # GPU (see amp_dtype note above), so being explicit avoids
-                                  # any autocast overhead for no benefit.
+amp_dtype: bf16                  # local Pascal cards do not have BF16 tensor cores
 
 # sequence / batch
 seq_len: 512                     # short -- tiny model, fast steps, enough room for temporal
                                   # renewal windows inside each packed segment
-batch_size: 1 
+batch_size: 60 
 prefetch_batches: 512
 
 # positional encoding
@@ -38,7 +36,7 @@ rope_attention_factor: null     # null => YaRN default mscale = 0.1*log(factor)+
 # tria small temporal carry
 tria_carry_enabled: true
 use_cuda_tria: true             # depth-wise Tria CUDA kernels; temporal scan uses CUDA when available
-tria_temporal_enabled: True
+tria_temporal_enabled: true
 tria_temporal_window: 128
 tria_temporal_auto: false        # choose carrier alpha and W from startup stability calibration
 tria_temporal_window_min: 32
@@ -52,20 +50,17 @@ tria_temporal_min_effective_rank: 2.70  # smallest accepted entropy rank (max 3)
 tria_temporal_population_pass_fraction: 0.90  # required stable fraction of BxH streams
 
 # data / tokenizer
-tokenizer: ./tokenizer_256k_1024.json  # trained ONLY on the 256k snippet, vocab=1024 --
-                                        # tiny model should actually be able to discriminate
-                                        # these tokens (unlike the full-corpus 4096-vocab
-                                        # tokenizer, which the tiny model was likely too weak
-                                        # to use well)
+tokenizer: tokenizer_256k_1024.json
 vocab: 4096                     # overwritten by tokenizer when tokenizer is set
+tied_embeddings: false
 
 # pretrain datasets
 train_dataset: ./datasets/fss1str_256k   # fixed ~256k-token snippet (tmp/build_snippet_dataset.py) --
                                           # looping over this small, finite slice for ~4 epochs lets the
                                           # tiny model actually get good at predicting THIS text much
                                           # sooner than one pass over the full 5.3B-token corpus spread thin
-val_dataset: ./datasets/fss1str_256k/val/val_split.arrow  # separate slice, not sampled from train
-auto_val_split_pct: 0.0          # disabled -- val_dataset is explicit and pre-built here, no need
+val_dataset: null  # separate slice, not sampled from train
+auto_val_split_pct: 0.1          # disabled -- val_dataset is explicit and pre-built here, no need
                                   # (and no destructive splitting of this tiny fixed snippet)
 
 # on-the-fly corpus format
@@ -94,23 +89,26 @@ n_kv_heads: null
 gqa_group_size: 2
 
 # Paraplex FFN
+paraplex_gate_proj: true
 hidden: null                    # null => round_up(model_dim * hidden_mult, n_q_heads)
 hidden_mult: 4.0                # hidden = 1024 for model_dim=256
-layers: 9                       # tried 5 (width=128 fixed): eval_loss got WORSE (5.99 vs 5.88
-                                 # full_eval) and tria firing collapsed back to ~10-200/step
-                                 # (was 5900-9400 at layers=3) -- confirms Levine et al. 2020:
-                                 # at this narrow width self-attention is depth-inefficient,
-                                 # reverted to 3.
+layers: 10                       # short architecture-stability run
 
 # phase / residual / activation knobs
 phase_sectors: head             # head | open
 residual_init: beta             # beta | fanin
+depth_attn_readout: per-sublayer
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0
 activation: pvpowlu             # gelu | powlu | pvpowlu
 powlu_m: 3.0
 phase_grad_floor: 0.05
 phase_grad_mode: secant 
 attn_impl: sdpa                 # sdpa | manual
+attn_sdpa_recompute_backward: true
 
 # precision / CUDA fast paths
 use_cuda_beta_space: true
 use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true

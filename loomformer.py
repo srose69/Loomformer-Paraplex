@@ -268,6 +268,14 @@ class Config:
     # control for testing whether beta-scaling is still load-bearing now that the skip
     # term itself is DepthAttn (softmax-over-history) instead of a fixed alpha*h.
     residual_init: str = "beta"
+    # The shared depth readout is cheap, but it is also a single low-rank failure
+    # point used by every attention and FFN residual.  "per-sublayer" gives each
+    # of the 2*layers calls its own output projection.  qkv_rms fixes the scale of
+    # the vectors entering the existing depth-attention kernel; residual_rms
+    # caps runaway post-LayerNorm branches without amplifying quiet branches.
+    depth_attn_readout: str = "shared"  # shared | per-sublayer
+    depth_attn_qkv_rms: bool = False
+    residual_branch_rms_cap: Optional[float] = None
     # outer activation (stays OUTSIDE the primitive for both FFN types, per the original
     # design: "activations are outside, that's what's inside" -- w2(activation(p))):
     #   "gelu"  = default, unchanged.
@@ -321,6 +329,7 @@ class Config:
     grad_checkpointing: bool = False
     save_every: int = 0 
     runpoints_path: Optional[str] = None  
+    save_initial_checkpoint: bool = False
     tria_carry_enabled: bool = False
     # ===AUTO GENERATED=== bookkeeping written by loomcloner.py --scan/--clone.
     # cloned/cloned_from/cloned_mapping are informational only (which donor,
@@ -722,6 +731,9 @@ USE_CUDA_PHASE_SIN = True
 USE_CUDA_BETA_SPACE = True
 USE_CUDA_PVPOWLU = True
 USE_CUDA_DEPTH_ATTN = True
+DEPTH_ATTN_READOUT = "shared"
+DEPTH_ATTN_QKV_RMS = False
+RESIDUAL_BRANCH_RMS_CAP: Optional[float] = None
 GRAPH_MODE_ENABLED = False
 _graph_pvpowlu_op = None
 _graph_phase_sin_op = None
@@ -775,6 +787,21 @@ def residual_std(fan_in: int, gain: float = FANIN_GAIN) -> float:
     return fanin_std(fan_in, gain) * beta
 
 
+def fixed_rms(x: torch.Tensor, target: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+    """Rescale only the last dimension, preserving dtype and kernel-facing shapes."""
+    work = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    scale = torch.rsqrt(work.square().mean(dim=-1, keepdim=True) + eps) * float(target)
+    return x * scale.to(dtype=x.dtype)
+
+
+def capped_rms(x: torch.Tensor, maximum: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+    """Cap runaway branch RMS without amplifying a small or intentionally quiet branch."""
+    work = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    rms = torch.sqrt(work.square().mean(dim=-1, keepdim=True) + eps)
+    scale = (float(maximum) / rms).clamp(max=1.0)
+    return x * scale.to(dtype=x.dtype)
+
+
 def init_linear_fanin(m: nn.Linear, gain: float = FANIN_GAIN, zero_bias: bool = True) -> None:
     nn.init.normal_(m.weight, mean=0.0, std=fanin_std(m.weight.shape[1], gain))
     if zero_bias and m.bias is not None:
@@ -826,7 +853,7 @@ def make_w1_imag_live_flat_indices() -> torch.Tensor:
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -954,6 +981,16 @@ def apply_config(cfg: Config) -> None:
     RESIDUAL_INIT = str(getattr(cfg, "residual_init", "beta") or "beta").lower()
     if RESIDUAL_INIT not in ("beta", "fanin"):
         raise ValueError(f"residual_init must be 'beta' or 'fanin', got {RESIDUAL_INIT!r}")
+    DEPTH_ATTN_READOUT = str(getattr(cfg, "depth_attn_readout", "shared") or "shared").lower()
+    if DEPTH_ATTN_READOUT not in ("shared", "per-sublayer"):
+        raise ValueError(
+            "depth_attn_readout must be 'shared' or 'per-sublayer', "
+            f"got {DEPTH_ATTN_READOUT!r}")
+    DEPTH_ATTN_QKV_RMS = bool(getattr(cfg, "depth_attn_qkv_rms", False))
+    raw_branch_cap = getattr(cfg, "residual_branch_rms_cap", None)
+    RESIDUAL_BRANCH_RMS_CAP = None if raw_branch_cap is None else float(raw_branch_cap)
+    if RESIDUAL_BRANCH_RMS_CAP is not None and RESIDUAL_BRANCH_RMS_CAP <= 0.0:
+        raise ValueError("residual_branch_rms_cap must be positive or null")
     ACTIVATION = str(getattr(cfg, "activation", "gelu") or "gelu").lower()
     if ACTIVATION not in ("gelu", "powlu", "pvpowlu"):
         raise ValueError(f"activation must be 'gelu', 'powlu' or 'pvpowlu', got {ACTIVATION!r}")
@@ -2228,6 +2265,10 @@ class _DepthAttnListFused(torch.autograd.Function):
 def depth_attn_online_list_cuda(q: torch.Tensor, hist_k, hist_v) -> Optional[torch.Tensor]:
     if not hist_k:
         return None
+    if not USE_CUDA_DEPTH_ATTN or not q.is_cuda:
+        return None
+    if any(not k.is_cuda or not v.is_cuda for k, v in zip(hist_k, hist_v)):
+        return None
     dtype = hist_k[0].dtype
     if dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return None
@@ -3243,14 +3284,22 @@ class DepthAttn(nn.Module):
         super().__init__()
         n_sub = 2 * LAYERS
         self.kv_weight = nn.Parameter(torch.empty(2 * N, N))
-        self.w_o = nn.Linear(N, N, bias=False)
+        if DEPTH_ATTN_READOUT == "per-sublayer":
+            self.w_o_weight = nn.Parameter(torch.empty(n_sub, N, N))
+            self.w_o = None
+        else:
+            self.register_parameter("w_o_weight", None)
+            self.w_o = nn.Linear(N, N, bias=False)
         self.q_params = nn.Parameter(torch.empty(n_sub, N_Q_HEADS, HEAD_DIM))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.kv_weight[:N], mean=0.0, std=fanin_std(N))
         nn.init.normal_(self.kv_weight[N:], mean=0.0, std=residual_std(N))
-        init_linear_residual(self.w_o)
+        if self.w_o_weight is not None:
+            nn.init.normal_(self.w_o_weight, mean=0.0, std=residual_std(N))
+        else:
+            init_linear_residual(self.w_o)
         nn.init.normal_(self.q_params, mean=0.0, std=fanin_std(HEAD_DIM))
 
     def project(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3259,10 +3308,17 @@ class DepthAttn(nn.Module):
         k, v = torch.split(kv, (N, N), dim=-1)
         k = k.view(B, T, N_Q_HEADS, HEAD_DIM)
         v = v.view(B, T, N_Q_HEADS, HEAD_DIM)
+        if DEPTH_ATTN_QKV_RMS:
+            # Match the expected initialization RMS, rather than forcing K/V to
+            # unit scale and silently sharpening depth softmax at step zero.
+            k = fixed_rms(k, FANIN_GAIN)
+            v = fixed_rms(v, FANIN_GAIN * DEEPNORM_BETA)
         return k, v
 
     def forward(self, sub_idx: int, hist_k, hist_v) -> Tuple[torch.Tensor, torch.Tensor]:
         q_row = self.q_params[sub_idx]
+        if DEPTH_ATTN_QKV_RMS:
+            q_row = fixed_rms(q_row, fanin_std(HEAD_DIM))
         if torch.is_tensor(hist_k):
             if q_row.dtype != hist_k.dtype:
                 q_row = q_row.to(hist_k.dtype)
@@ -3278,7 +3334,13 @@ class DepthAttn(nn.Module):
             if d is None:
                 d = _depth_attn_online_list_pytorch(q_row, hist_k, hist_v)
             B, T = hist_k[0].shape[:2]
-        return self.w_o(d.reshape(B, T, N)), d
+        d_flat = d.reshape(B, T, N)
+        skip = (
+            F.linear(d_flat, self.w_o_weight[sub_idx])
+            if self.w_o_weight is not None
+            else self.w_o(d_flat)
+        )
+        return skip, d
 
 
 
@@ -3422,6 +3484,9 @@ class Model(nn.Module):
         sub_idx = sub_idx0
         tria_axis = (sub_idx0 // 2) % 3
         skip, _ = self.depth_attn(sub_idx, hist_k, hist_v)
+        if RESIDUAL_BRANCH_RMS_CAP is not None:
+            skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
+            attn_out = capped_rms(attn_out, RESIDUAL_BRANCH_RMS_CAP)
         h = block.ln_attn(skip + attn_out)
         k_i, v_i = self.depth_attn.project(h)
         hist_k = [*hist_k, k_i]
@@ -3473,6 +3538,9 @@ class Model(nn.Module):
             carry_new = carry_prev
             p_out = None
 
+        if RESIDUAL_BRANCH_RMS_CAP is not None:
+            skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
+            ffn_out = capped_rms(ffn_out, RESIDUAL_BRANCH_RMS_CAP)
         h = block.ln_ffn(skip + ffn_out)
         if not is_last_block:
             k_i, v_i = self.depth_attn.project(h)
@@ -4534,6 +4602,22 @@ async def train_one_async(
     model_base = model_base.to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
+    if bool(getattr(cfg, "save_initial_checkpoint", False)):
+        if resume_in:
+            raise ValueError("save_initial_checkpoint requires a fresh run without resume")
+        if ckpt_out and ddp_is_main():
+            root, ext = os.path.splitext(ckpt_out)
+            init_path = f"{root}.init{ext or '.pt'}"
+            saved_cfg = asdict(cfg)
+            saved_cfg["batch_size"] = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
+            if saved_cfg.get("tria_temporal_window") is not None:
+                saved_cfg["tria_temporal_auto"] = False
+            torch.save(
+                {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
+                 "ablation": ablation, "model": model_base.state_dict(), "step": 0},
+                init_path,
+            )
+            ddp_print(f"[train] saved initial {tag} -> {init_path}")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
@@ -4717,17 +4801,23 @@ async def train_one_async(
         parts = [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
         return f"total={total} by_module=" + ", ".join(parts)
 
-    def _save_checkpoint(path_override: Optional[str] = None) -> None:
+    def _save_checkpoint(path_override: Optional[str] = None,
+                         step_override: Optional[int] = None) -> None:
         if ckpt_out and ddp_is_main():
             save_path = path_override or ckpt_out
             raw_model = ddp_unwrap_model(model)
             saved_cfg = asdict(cfg)
+            # DDP mutates cfg.batch_size to the per-rank batch at startup. A
+            # checkpoint is portable configuration, so persist the user-facing
+            # global batch rather than silently halving it on the next launch.
+            saved_cfg["batch_size"] = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
             # Persist resolved geometry, not a request to calibrate it again.
             if saved_cfg.get("tria_temporal_window") is not None:
                 saved_cfg["tria_temporal_auto"] = False
+            saved_step = int(step if step_override is None else step_override)
             torch.save(
                 {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
-                 "ablation": ablation, "model": raw_model.state_dict(), "step": step},
+                 "ablation": ablation, "model": raw_model.state_dict(), "step": saved_step},
                 save_path,
             )
             print(f"[train] saved {tag} -> {save_path}")
@@ -4746,7 +4836,7 @@ async def train_one_async(
             runpoint_path = f"{root}.runpoint_step{current_step}{ext}"
         print(f"\n[runpoint] step {current_step}/{cfg.steps} -- saving, training continues.",
               file=_REAL_STDOUT, flush=True)
-        _save_checkpoint(path_override=runpoint_path)
+        _save_checkpoint(path_override=runpoint_path, step_override=current_step)
 
     def _handle_interrupt() -> None:
         save_flag = 0
@@ -4795,8 +4885,10 @@ async def train_one_async(
         for step in range(start_step + 1, int(cfg.steps) + 1):
             if interrupt.requested:
                 _handle_interrupt()
-            if runpoint.consume() or (cfg.save_every and step % int(cfg.save_every) == 0):
-                _save_runpoint(step)
+            if runpoint.consume():
+                # The request was observed between iterations; the previous
+                # optimizer update is the latest completed state.
+                _save_runpoint(step - 1)
             opt.zero_grad(set_to_none=True)
             train_loss_sum = 0.0
             train_tokens_step = 0
@@ -4934,6 +5026,8 @@ async def train_one_async(
                         f"lr {lr:.2e}  tokens {format_big_int(tokens_seen_global)}  "
                         f"data_wait {data_wait_s:.0f}s({wait_pct:.0f}%)  ({elapsed:.0f}s)"
                     )
+            if cfg.save_every and step % int(cfg.save_every) == 0:
+                _save_runpoint(step)
 
     seconds = time.time() - t0
     _save_checkpoint()
@@ -4966,6 +5060,9 @@ def print_architecture_report(cfg: Config, device: torch.device, ablation: bool,
     ddp_print(f"  shape    d_model={N}  heads={N_Q_HEADS}q/{N_KV_HEADS}kv({grp})  "
                f"head_dim={HEAD_DIM}  layers={LAYERS}")
     ddp_print(f"  ffn      hidden={HIDDEN}  phase={PHASE_SECTORS}  attn={ATTN_IMPL}")
+    branch_cap = "off" if RESIDUAL_BRANCH_RMS_CAP is None else f"{RESIDUAL_BRANCH_RMS_CAP:g}"
+    ddp_print(f"  depth    readout={DEPTH_ATTN_READOUT}  qkv_rms={DEPTH_ATTN_QKV_RMS}  "
+               f"branch_rms_cap={branch_cap}")
     ddp_print(f"  memory   activation_checkpoint={'temporal-chunk' if GRAD_CHECKPOINTING else 'off'}")
     ddp_print(f"  rope     yarn  theta={ROPE_THETA:g}  factor={ROPE_FACTOR:g}x  "
                f"orig_len={ROPE_ORIGINAL_SEQ_LEN}")

@@ -95,6 +95,7 @@ _TRIA_DISABLE_OPS = {
     for part in os.environ.get("LOOM_TRIA_DISABLE_OPS", "").split(",")
     if part.strip()
 }
+_TRIA_FALLBACK_PRINTED = set()
 
 # Fixed, non-learned carrier geometry. alpha is selected/configured by loomformer.py
 # (optionally by startup calibration); axis is supplied per depth layer. No tensor
@@ -208,6 +209,18 @@ def _tria_cuda_op_enabled(name: str) -> bool:
         and aliases.get(key, "") not in _TRIA_DISABLE_OPS
     )
 
+
+def _warn_cuda_fallback(name: str, error: BaseException) -> None:
+    key = name.strip().lower().replace("-", "_")
+    if key in _TRIA_FALLBACK_PRINTED:
+        return
+    _TRIA_FALLBACK_PRINTED.add(key)
+    print(
+        f"[tria] CUDA {key} failed ({type(error).__name__}: {error}); "
+        "using SLOWER PyTorch fallback.",
+        flush=True,
+    )
+
 # CUDA source for the fused tria-step kernels now lives under kernels/tria/
 # -- one subfolder per kernel group (tria_init, tria_init_gate, tria_step,
 # tria_step_gate, gate_slot_mix, slot_attention_pool, temporal_carry),
@@ -255,7 +268,7 @@ def _try_load_cuda_tria():
         )
     except Exception as e:
         _cuda_tria_module = None
-        print(f"[tria] CUDA fused tria-step unavailable ({type(e).__name__}: {e}); using PyTorch.")
+        _warn_cuda_fallback("module_load", e)
     return _cuda_tria_module
 
 
@@ -809,8 +822,8 @@ def tria_init(
                 return carry_1
             try:
                 return _capture_depth_output(_TriaInitFused.apply(r_fast, i_fast, o_fast, alpha, axis))
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_init", error)
     return _capture_depth_output(carry_init_pytorch(build_tria_pytorch(r_1, i_1, o_1, alpha, axis)))
 
 
@@ -839,8 +852,8 @@ def tria_init_seed(
             try:
                 return _capture_depth_output(_TriaInitSeedFused.apply(
                     r_fast, i_fast, o_fast, seed_fast, valid, alpha, axis))
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_init_seed", error)
     return _capture_depth_output(tria_init_seed_reference(r, i, o, seed, valid, axis))
 
 
@@ -860,8 +873,8 @@ def tria_init_seed_and_gate(
                 carry, p = _TriaInitSeedAndGateFused.apply(
                     r_fast, i_fast, o_fast, seed_fast, valid, w_fast, alpha, axis)
                 return _capture_depth_output(carry), p
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_init_seed_gate", error)
     carry = tria_init_seed_reference(r, i, o, seed, valid, axis)
     return _capture_depth_output(carry), (tria_slots(carry) * w).sum(dim=-1)
 
@@ -883,8 +896,8 @@ def tria_step(
             try:
                 return _capture_depth_output(
                     _TriaStepFused.apply(r_fast, i_fast, o_fast, carry_fast, alpha, axis))
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_step", error)
     return _capture_depth_output(
         carry_step_pytorch(build_tria_pytorch(r, i, o, alpha, axis), carry_prev))
 
@@ -907,13 +920,19 @@ def tria_init_and_gate(
                 carry_1, p_out = _TriaInitAndGateFused.apply(
                     r_fast, i_fast, o_fast, w_fast, alpha, axis)
                 return _capture_depth_output(carry_1), p_out
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_init_gate", error)
     carry_1 = tria_init(r_1, i_1, o_1, axis=axis)
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_1, w):
         p_out = _graph_gate_slot_mix_op(carry_1, w)
+    elif _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_1, w):
+        try:
+            p_out = _GateSlotMixFused.apply(carry_1, w)
+        except RuntimeError as error:
+            _warn_cuda_fallback("gate_slot_mix", error)
+            p_out = (tria_slots(carry_1) * w).sum(dim=-1)
     else:
-        p_out = _GateSlotMixFused.apply(carry_1, w) if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_1, w) else (tria_slots(carry_1) * w).sum(dim=-1)
+        p_out = (tria_slots(carry_1) * w).sum(dim=-1)
     return _capture_depth_output(carry_1), p_out
 
 
@@ -935,13 +954,19 @@ def tria_step_and_gate(
                 carry_new, p_out = _TriaStepAndGateFused.apply(
                     r_fast, i_fast, o_fast, carry_fast, w_fast, alpha, axis)
                 return _capture_depth_output(carry_new), p_out
-            except RuntimeError:
-                pass
+            except RuntimeError as error:
+                _warn_cuda_fallback("tria_step_gate", error)
     carry_new = tria_step(r, i, o, carry_prev, axis=axis)
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_new, w):
         p_out = _graph_gate_slot_mix_op(carry_new, w)
+    elif _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_new, w):
+        try:
+            p_out = _GateSlotMixFused.apply(carry_new, w)
+        except RuntimeError as error:
+            _warn_cuda_fallback("gate_slot_mix", error)
+            p_out = (tria_slots(carry_new) * w).sum(dim=-1)
     else:
-        p_out = _GateSlotMixFused.apply(carry_new, w) if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_new, w) else (tria_slots(carry_new) * w).sum(dim=-1)
+        p_out = (tria_slots(carry_new) * w).sum(dim=-1)
     return _capture_depth_output(carry_new), p_out
 
 
@@ -1244,8 +1269,8 @@ class GateSelector(nn.Module):
                 return _graph_gate_slot_mix_op(carry, w)
             try:
                 return _GateSlotMixFused.apply(carry, w)
-            except RuntimeError:
-                pass  # module unavailable this run -- fall through to PyTorch
+            except RuntimeError as error:
+                _warn_cuda_fallback("gate_slot_mix", error)
         slots = tria_slots(carry)                       # [B,T,H,9] view
         return (slots * w).sum(dim=-1)                   # [B,T,H]
 
@@ -1340,8 +1365,8 @@ class SharedTriaReader(nn.Module):
             try:
                 pooled_slots = _SlotAttentionPoolFused.apply(carry, score_w)
                 return self.proj(pooled_slots.to(self.proj.weight.dtype))  # [B,T,k]
-            except RuntimeError:
-                pass  # module unavailable this run -- fall through to PyTorch
+            except RuntimeError as error:
+                _warn_cuda_fallback("slot_attention_pool", error)
         slots = tria_slots(carry)                                  # [B,T,H,9] view
         scores = (slots * score_w).sum(dim=-1)                      # [B,T,H]
         weights = torch.softmax(scores, dim=-1)                     # [B,T,H]
@@ -1454,8 +1479,8 @@ def final_ca_sparse(
     if q.is_cuda and k.is_cuda and v.is_cuda and _tria_cuda_op_enabled("final_ca_sparse"):
         try:
             return _FinalCASparseFused.apply(q, k, v, allowed, float(scale))
-        except RuntimeError:
-            pass
+        except RuntimeError as error:
+            _warn_cuda_fallback("final_ca_sparse", error)
     return final_ca_sparse_reference(q, k, v, allowed, scale)
 
 

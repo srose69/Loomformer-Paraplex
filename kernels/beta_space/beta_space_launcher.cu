@@ -182,6 +182,45 @@ static inline void check_common_inputs(
     TORCH_CHECK(w1_imag_compact.size(1) == expected_imag_in, "IMAG_IN mismatch");
 }
 
+static torch::Tensor pack_beta_inputs(
+    const torch::Tensor& u, const torch::Tensor& q_h, const torch::Tensor& k_ctx_h,
+    const torch::Tensor& c_h, const torch::Tensor& d_h,
+    int64_t hidden_per_q_head, int64_t head_dim, int64_t n_q_heads,
+    int64_t imag_in, bool open_sectors) {
+    const int64_t M = u.size(0) * u.size(1);
+    const int64_t N = u.size(2);
+    auto r_pack = torch::empty({n_q_heads, M, imag_in}, u.options());
+    const int threads = 256;
+    const int64_t pack_total4 = n_q_heads * M * (imag_in / 4);
+    if (u.scalar_type() == at::kFloat) {
+        if (!open_sectors) {
+            pack_r_mask4_head_kernel<float><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                u.data_ptr<float>(), q_h.data_ptr<float>(), k_ctx_h.data_ptr<float>(),
+                c_h.data_ptr<float>(), d_h.data_ptr<float>(), r_pack.data_ptr<float>(),
+                M, N, imag_in, head_dim, n_q_heads);
+        } else {
+            pack_r_mask4_open_kernel<float><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                u.data_ptr<float>(), q_h.data_ptr<float>(), k_ctx_h.data_ptr<float>(),
+                c_h.data_ptr<float>(), d_h.data_ptr<float>(), r_pack.data_ptr<float>(),
+                M, N, imag_in, head_dim, n_q_heads);
+        }
+    } else {
+        if (!open_sectors) {
+            pack_r_mask4_head_kernel<at::BFloat16><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                u.data_ptr<at::BFloat16>(), q_h.data_ptr<at::BFloat16>(), k_ctx_h.data_ptr<at::BFloat16>(),
+                c_h.data_ptr<at::BFloat16>(), d_h.data_ptr<at::BFloat16>(), r_pack.data_ptr<at::BFloat16>(),
+                M, N, imag_in, head_dim, n_q_heads);
+        } else {
+            pack_r_mask4_open_kernel<at::BFloat16><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                u.data_ptr<at::BFloat16>(), q_h.data_ptr<at::BFloat16>(), k_ctx_h.data_ptr<at::BFloat16>(),
+                c_h.data_ptr<at::BFloat16>(), d_h.data_ptr<at::BFloat16>(), r_pack.data_ptr<at::BFloat16>(),
+                M, N, imag_in, head_dim, n_q_heads);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return r_pack;
+}
+
 
 std::vector<torch::Tensor> beta_forward_cuda(
     torch::Tensor u, torch::Tensor q_h, torch::Tensor k_ctx_h,
@@ -209,37 +248,10 @@ std::vector<torch::Tensor> beta_forward_cuda(
     int64_t K = w_c.size(1);
     TORCH_CHECK((N % 4) == 0 && (head_dim % 4) == 0 && (K % 4) == 0, "maskpack path requires N, head_dim, IMAG_IN divisible by 4");
 
-    auto r_pack = torch::empty({n_q_heads, M, K}, u_c.options());
+    auto r_pack = pack_beta_inputs(
+        u_c, q_c, k_c, c_c, d_c,
+        hidden_per_q_head, head_dim, n_q_heads, K, open_sectors);
     auto out2d = torch::empty({M, HIDDEN}, u_c.options());
-
-    const int threads = 256;
-    int64_t pack_total4 = n_q_heads * M * (K / 4);
-    if (dtype == at::kFloat) {
-        if (!open_sectors) {
-            pack_r_mask4_head_kernel<float><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                u_c.data_ptr<float>(), q_c.data_ptr<float>(), k_c.data_ptr<float>(),
-                c_c.data_ptr<float>(), d_c.data_ptr<float>(), r_pack.data_ptr<float>(),
-                M, N, K, head_dim, n_q_heads);
-        } else {
-            pack_r_mask4_open_kernel<float><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                u_c.data_ptr<float>(), q_c.data_ptr<float>(), k_c.data_ptr<float>(),
-                c_c.data_ptr<float>(), d_c.data_ptr<float>(), r_pack.data_ptr<float>(),
-                M, N, K, head_dim, n_q_heads);
-        }
-    } else {
-        if (!open_sectors) {
-            pack_r_mask4_head_kernel<at::BFloat16><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                u_c.data_ptr<at::BFloat16>(), q_c.data_ptr<at::BFloat16>(), k_c.data_ptr<at::BFloat16>(),
-                c_c.data_ptr<at::BFloat16>(), d_c.data_ptr<at::BFloat16>(), r_pack.data_ptr<at::BFloat16>(),
-                M, N, K, head_dim, n_q_heads);
-        } else {
-            pack_r_mask4_open_kernel<at::BFloat16><<<(pack_total4 + threads - 1) / threads, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                u_c.data_ptr<at::BFloat16>(), q_c.data_ptr<at::BFloat16>(), k_c.data_ptr<at::BFloat16>(),
-                c_c.data_ptr<at::BFloat16>(), d_c.data_ptr<at::BFloat16>(), r_pack.data_ptr<at::BFloat16>(),
-                M, N, K, head_dim, n_q_heads);
-        }
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
     row_gemm_batched(handle, dtype,
@@ -372,7 +384,38 @@ std::vector<torch::Tensor> beta_backward_cuda(
     return {grad_u, grad_q, grad_k, grad_c, grad_d, grad_w};
 }
 
+std::vector<torch::Tensor> beta_backward_cuda_recompute(
+    torch::Tensor grad_out,
+    torch::Tensor u, torch::Tensor q_h, torch::Tensor k_ctx_h,
+    torch::Tensor c_h, torch::Tensor d_h, torch::Tensor w1_imag_compact,
+    int64_t hidden_per_q_head, int64_t head_dim, int64_t n_q_heads,
+    bool open_sectors) {
+    check_common_inputs(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
+                        hidden_per_q_head, head_dim, n_q_heads, open_sectors);
+    c10::cuda::CUDAGuard device_guard(u.device());
+    auto u_c = u.contiguous();
+    auto q_c = q_h.contiguous();
+    auto k_c = k_ctx_h.contiguous();
+    auto c_c = c_h.contiguous();
+    auto d_c = d_h.contiguous();
+    auto w_c = w1_imag_compact.contiguous();
+    const int64_t B = u_c.size(0);
+    const int64_t T = u_c.size(1);
+    const int64_t N = u_c.size(2);
+    const int64_t HIDDEN = w_c.size(0);
+    const int64_t K = w_c.size(1);
+    TORCH_CHECK((N % 4) == 0 && (head_dim % 4) == 0 && (K % 4) == 0,
+                "maskpack path requires N, head_dim, IMAG_IN divisible by 4");
+    auto r_pack = pack_beta_inputs(
+        u_c, q_c, k_c, c_c, d_c,
+        hidden_per_q_head, head_dim, n_q_heads, K, open_sectors);
+    return beta_backward_cuda(
+        grad_out, r_pack, w_c, B, T, N, HIDDEN, K,
+        hidden_per_q_head, head_dim, n_q_heads, open_sectors);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("beta_forward_cuda", &beta_forward_cuda, "beta_forward_cuda");
     m.def("beta_backward_cuda", &beta_backward_cuda, "beta_backward_cuda");
+    m.def("beta_backward_cuda_recompute", &beta_backward_cuda_recompute, "beta_backward_cuda_recompute");
 }

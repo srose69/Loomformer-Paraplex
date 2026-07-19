@@ -3,6 +3,10 @@
 import argparse
 import json
 import math
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint")
     parser.add_argument("--data", required=True)
+    parser.add_argument("--tokenizer")
     parser.add_argument("--tokens", type=int, default=1536)
     parser.add_argument("--sequences", type=int, default=4)
     parser.add_argument("--device", default="cuda")
@@ -97,6 +102,8 @@ def main():
     args = parse_args()
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = lf.Config.from_checkpoint_dict(dict(blob["cfg"]))
+    if args.tokenizer is not None:
+        cfg.tokenizer = args.tokenizer
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)

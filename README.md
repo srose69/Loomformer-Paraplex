@@ -42,6 +42,7 @@ by **srose69** (SimpleRose)
 - [Reference checkpoint](#reference-checkpoint)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [How it works](#how-it-works)
+  - [Notation](#notation)
   - [Causal GQA](#causal-gqa)
   - [DepthAttn](#depthattn)
   - [Paraplex](#paraplex)
@@ -113,7 +114,7 @@ D
 +b_{\mathrm{imag}}.
 ```
 
-The full `U` sector inside `W_imag` is a second projection of the same model-stream input `u`; the remaining sectors condition that projection on query, attended key, attention context and depth context. The two weight parts therefore form one effective pseudo-complex parameterization rather than two unrelated branches. No complex dtype or closed complex multiplication is required for this pairing.
+The full `U` sector inside `W_imag` is a second projection of the same model-stream input `u`; the remaining sectors condition that projection on query, attended key, attention context and depth context (the sector labels `C` and `D` stand for the attention value context `V^ctx` and the depth context `d`). The two weight parts therefore form one effective pseudo-complex parameterization rather than two unrelated branches. No complex dtype or closed complex multiplication is required for this pairing.
 
 `W_imag` is itself pseudo-paravector-valued. Its own-stream `U` sector acts as the scalar component, while the context sectors form the vector component:
 
@@ -201,7 +202,7 @@ After the last block, each token has a finished depth carrier `D_t` of shape `[H
 ```text
 D_s, D_s+1, ... , D_b
           │
-          └── temporal composition ─► A_b
+          └── temporal composition ─► accT_b
                                        ├── sparse final cross-attention key/value
                                        └── seed for Tria layer 1 of the next segment
 ```
@@ -209,6 +210,25 @@ D_s, D_s+1, ... , D_b
 The refeed seed is consumed once at the next segment start. Temporal accumulation is then restarted from that newly depth-composed token, which prevents the boundary carrier from being multiplied into the path twice.
 
 ## How it works
+
+### Notation
+
+| Symbol | Meaning |
+| --- | --- |
+| `u_t` | residual-stream input of the FFN at token `t` |
+| `Q`, `K^ctx`, `V^ctx` | query, attended-key and attention-value contexts from causal GQA |
+| `d_t` | depth context from the second DepthAttn read; sector label `D` inside `W_imag` |
+| `C` (sector label) | the `V^ctx` sector inside `W_imag` |
+| `m_s` | pooled DepthAttn read at sublayer `s` |
+| `R`, `I`, `O` | Paraplex real, phase and output coordinates |
+| `A` | positive PvPowLU amplitude `softplus(g)` |
+| `a`, `b`, `c` | bounded pairwise relations `tanh(RI)`, `tanh(RO)`, `tanh(IO)` |
+| `K(a,b,c)` | skew-symmetric Tria generator (distinct from attention keys `K`) |
+| `T_{l,t,h}` | local Tria operator |
+| `C_l` | depth carrier after layer `l`; `D_t = C_{L,t}` is the finished depth carrier |
+| `accT_t` | temporal Tria accumulator (code name `accT`) |
+| `b_k` | token position of a fired temporal boundary |
+| `I_3`, `𝒩(·)` | identity matrix; max-absolute normalization |
 
 ### Causal GQA
 
@@ -238,9 +258,9 @@ For sublayer `s`, a learned query `q_s` reads that history:
 \pi_{s,j} = \mathrm{softmax}_{j}
 \left(\frac{\langle q_s,k_j\rangle}{\sqrt{d_h}}\right),
 \qquad
-D_s = \sum_{j\le s}\pi_{s,j}v_j,
+m_s = \sum_{j\le s}\pi_{s,j}v_j,
 \qquad
-\mathrm{skip}_s = W^{\mathrm{depth}}_{o,s}D_s.
+\mathrm{skip}_s = W^{\mathrm{depth}}_{o,s}m_s.
 ```
 
 The softmax axis is **depth**, not token position. There are two reads per block:
@@ -636,13 +656,13 @@ be the final depth-composed carrier produced at the end of the block stack for t
 Inside a segment with no reset,
 
 ```math
-A_t=\mathcal N(D_tA_{t-1}).
+\mathrm{accT}_t=\mathcal N(D_t\,\mathrm{accT}_{t-1}).
 ```
 
 At a document reset, accumulation starts from the local depth carrier:
 
 ```math
-A_t=\mathcal N(D_t).
+\mathrm{accT}_t=\mathcal N(D_t).
 ```
 
 The active chunked training path and token-by-token inference use a streaming endpoint recurrence. A fixed boundary is scheduled after at most `W=tria_temporal_window` tokens; an explicit `<CARRY>` token may fire earlier. A hard boundary is suppressed when the next token starts a new document, because there is no same-document token to seed.
@@ -650,7 +670,7 @@ The active chunked training path and token-by-token inference use a streaming en
 Suppose a valid boundary fires at token `b_k`. The endpoint
 
 ```math
-A_{b_k}
+\mathrm{accT}_{b_k}
 =
 \mathcal N\!\left(
 D_{b_k}D_{b_k-1}\cdots D_{s_k}
@@ -664,7 +684,7 @@ For the first token of the next segment, `t_0=b_k+1`, the boundary endpoint is i
 ```math
 C_{1,t_0}^{\mathrm{seed}}
 =
-\mathcal N\!\left(T_{1,t_0}A_{b_k}\right).
+\mathcal N\!\left(T_{1,t_0}\,\mathrm{accT}_{b_k}\right).
 ```
 
 The remaining layers then run normally:
@@ -680,27 +700,27 @@ D_{t_0}^{\mathrm{seed}}=C_{L,t_0}^{\mathrm{seed}}.
 After the seed has been consumed, the temporal accumulator is restarted from that newly finished depth carrier:
 
 ```math
-A_{t_0}=\mathcal N\!\left(D_{t_0}^{\mathrm{seed}}\right).
+\mathrm{accT}_{t_0}=\mathcal N\!\left(D_{t_0}^{\mathrm{seed}}\right).
 ```
 
 For later tokens before the next boundary,
 
 ```math
-A_t=\mathcal N(D_tA_{t-1}),
+\mathrm{accT}_t=\mathcal N(D_t\,\mathrm{accT}_{t-1}),
 \qquad t_0<t\le b_{k+1}.
 ```
 
-This reset is intentional. `A_{b_k}` already participates inside `D_{t_0}^{seed}` through the first-layer composition; multiplying the old endpoint into the temporal recurrence again would count it twice.
+This reset is intentional. `accT_{b_k}` already participates inside `D_{t_0}^{seed}` through the first-layer composition; multiplying the old endpoint into the temporal recurrence again would count it twice.
 
 The complete boundary route is therefore
 
 ```text
 last-block carriers D_s ... D_b
           │
-          └── streaming temporal composition ──► boundary endpoint A_b
+          └── streaming temporal composition ──► boundary endpoint accT_b
                                                    │
                                                    ├── final-CA key/value
-                                                   └── T_1,next @ A_b
+                                                   └── T_1,next @ accT_b
                                                          │
                                                          ├── compose through all layers
                                                          └── restart temporal state from D_next^seed
@@ -712,22 +732,22 @@ The full-sequence PyTorch reference also contains an associative segmented scan 
 
 A fired temporal endpoint has shape `[H,3,3]`. The reader does not first allocate one `k`-dimensional representation per hidden neuron. It scores the nine raw slots, pools them over the hidden population, and only then applies the shared value projection.
 
-Let `a_{b,h}=vec(A_{b,h})`. A learned query and an independent slot-key projection define one normalized score direction `s` in the nine-slot space. The population weights are
+Let `x_{b,h}=vec(accT_{b,h})`. A learned query and an independent slot-key projection define one normalized score direction `s` in the nine-slot space. The population weights are
 
 ```math
 \rho_{b,h}
 =
 \mathrm{softmax}_h\!\left(
-\langle s,a_{b,h}\rangle
+\langle s,x_{b,h}\rangle
 \right).
 ```
 
 The pooled boundary vector is
 
 ```math
-\bar a_b=\sum_h\rho_{b,h}a_{b,h},
+\bar x_b=\sum_h\rho_{b,h}x_{b,h},
 \qquad
-z_b=\mathrm{Up}\!\left(W_{\mathrm{reader}}\bar a_b+b_{\mathrm{reader}}\right).
+z_b=\mathrm{Up}\!\left(W_{\mathrm{reader}}\bar x_b+b_{\mathrm{reader}}\right).
 ```
 
 Only fired boundaries become keys and values. The final cross-attention uses a shared projection for queries and keys and a separate value projection:
@@ -796,12 +816,12 @@ A full-sequence training forward may materialize the same depth states for a tok
 In incremental inference Tria carries no time axis. At the largest point of one token step, the live operator state is exactly three carrier-sized tensors:
 
 ```math
-C_{L-1},\quad C_L,\quad A_T
+C_{L-1},\quad C_L,\quad \mathrm{accT}
 \in
 \mathbb{R}^{B\times H\times 3\times 3},
 ```
 
-where `C_{L-1}` is the previous depth carrier, `C_L` is the current layer result, and `A_T` is the temporal accumulator retained at the tail of the network. The raw bf16 working set is therefore
+where `C_{L-1}` is the previous depth carrier, `C_L` is the current layer result, and `accT` is the temporal accumulator retained at the tail of the network. The raw bf16 working set is therefore
 
 ```math
 3\cdot 9BH
@@ -892,7 +912,7 @@ The replay changes storage, not the forward equation. Gradients are still comput
 Chunked training usually needs the final temporal state of a segment, not every normalized temporal prefix. The `temporal_carry_endpoint` kernel therefore returns only
 
 ```math
-A_T\in\mathbb{R}^{B\times H\times3\times3}
+\mathrm{accT}\in\mathbb{R}^{B\times H\times3\times3}
 ```
 
 and a small FP32 endpoint copy used by backward. It does not store a second full trajectory of temporal accumulators. Backward walks the input depth carriers in reverse and reconstructs each preceding normalized accumulator analytically from the invertible local factor and the current accumulator. This is the temporal counterpart of replay: the input depth carriers remain available, while the additional `[B,T,H,3,3]` prefix history is avoided.
@@ -1158,6 +1178,7 @@ Until there is a paper or archived release, cite the repository and checkpoint c
 - [Референсный чекпойнт](#референсный-чекпойнт)
 - [Архитектура в одном маршруте](#архитектура-в-одном-маршруте)
 - [Как это работает](#как-это-работает)
+  - [Нотация](#нотация)
   - [Каузальное GQA](#каузальное-gqa)
   - [DepthAttn](#depthattn-1)
   - [Paraplex](#paraplex-1)
@@ -1229,7 +1250,7 @@ D
 +b_{\mathrm{imag}}.
 ```
 
-Полный сектор `U` внутри `W_imag` является второй проекцией того же model-stream входа `u`; остальные сектора обусловливают эту проекцию query, attended key, attention context и depth-context. Поэтому обе части веса образуют единую псевдокомплексную параметризацию, а не две независимые ветви. Для такого сопряжения не требуются complex dtype и замкнутое комплексное умножение.
+Полный сектор `U` внутри `W_imag` является второй проекцией того же model-stream входа `u`; остальные сектора обусловливают эту проекцию query, attended key, attention context и depth-context (метки секторов `C` и `D` обозначают attention value context `V^ctx` и depth context `d`). Поэтому обе части веса образуют единую псевдокомплексную параметризацию, а не две независимые ветви. Для такого сопряжения не требуются complex dtype и замкнутое комплексное умножение.
 
 Сам `W_imag` имеет псевдопаравекторную структуру. Его собственный `U`-сектор играет роль скалярной части, а контекстные сектора образуют векторную часть:
 
@@ -1317,7 +1338,7 @@ h_l,t
 ```text
 D_s, D_s+1, ... , D_b
           │
-          └── temporal composition ─► A_b
+          └── temporal composition ─► accT_b
                                        ├── key/value для sparse final cross-attention
                                        └── seed для первого Tria-слоя следующего сегмента
 ```
@@ -1325,6 +1346,25 @@ D_s, D_s+1, ... , D_b
 Refeed-seed потребляется один раз в начале следующего сегмента. Затем temporal accumulator перезапускается от нового depth-composed токена, поэтому boundary carrier не умножается в тракт дважды.
 
 ## Как это работает
+
+### Нотация
+
+| Символ | Значение |
+| --- | --- |
+| `u_t` | вход FFN из residual stream на токене `t` |
+| `Q`, `K^ctx`, `V^ctx` | query, attended-key и attention-value контексты каузального GQA |
+| `d_t` | depth context второго чтения DepthAttn; метка сектора `D` внутри `W_imag` |
+| `C` (метка сектора) | сектор `V^ctx` внутри `W_imag` |
+| `m_s` | pooled-чтение DepthAttn на sublayer `s` |
+| `R`, `I`, `O` | real-, фазовая и выходная координаты Paraplex |
+| `A` | положительная амплитуда PvPowLU `softplus(g)` |
+| `a`, `b`, `c` | ограниченные попарные отношения `tanh(RI)`, `tanh(RO)`, `tanh(IO)` |
+| `K(a,b,c)` | кососимметричный генератор Tria (не путать с attention keys `K`) |
+| `T_{l,t,h}` | локальный оператор Tria |
+| `C_l` | depth carrier после слоя `l`; `D_t = C_{L,t}` — законченный depth carrier |
+| `accT_t` | temporal-аккумулятор Tria (в коде `accT`) |
+| `b_k` | позиция сработавшей temporal-границы |
+| `I_3`, `𝒩(·)` | единичная матрица; max-absolute нормализация |
 
 ### Каузальное GQA
 
@@ -1354,9 +1394,9 @@ LoomFormer сохраняет и attention context `Vctx`, и attended key conte
 \pi_{s,j} = \mathrm{softmax}_{j}
 \left(\frac{\langle q_s,k_j\rangle}{\sqrt{d_h}}\right),
 \qquad
-D_s = \sum_{j\le s}\pi_{s,j}v_j,
+m_s = \sum_{j\le s}\pi_{s,j}v_j,
 \qquad
-\mathrm{skip}_s = W^{\mathrm{depth}}_{o,s}D_s.
+\mathrm{skip}_s = W^{\mathrm{depth}}_{o,s}m_s.
 ```
 
 Softmax идёт по оси **глубины**, а не по токенам. В каждом блоке выполняются два чтения:
@@ -1752,13 +1792,13 @@ D_t=C_{L,t}
 Внутри сегмента без reset:
 
 ```math
-A_t=\mathcal N(D_tA_{t-1}).
+\mathrm{accT}_t=\mathcal N(D_t\,\mathrm{accT}_{t-1}).
 ```
 
 На границе документа накопление начинается с локального depth-carrier:
 
 ```math
-A_t=\mathcal N(D_t).
+\mathrm{accT}_t=\mathcal N(D_t).
 ```
 
 Активный chunked training и token-by-token inference используют streaming endpoint recurrence. Фиксированная граница планируется не позднее чем через `W=tria_temporal_window` токенов; явный токен `<CARRY>` может сработать раньше. Hard boundary подавляется, если следующий токен начинает новый документ, поскольку seed для того же документа отсутствует.
@@ -1766,7 +1806,7 @@ A_t=\mathcal N(D_t).
 Пусть валидная граница сработала на токене `b_k`. Endpoint
 
 ```math
-A_{b_k}
+\mathrm{accT}_{b_k}
 =
 \mathcal N\!\left(
 D_{b_k}D_{b_k-1}\cdots D_{s_k}
@@ -1780,7 +1820,7 @@ D_{b_k}D_{b_k-1}\cdots D_{s_k}
 ```math
 C_{1,t_0}^{\mathrm{seed}}
 =
-\mathcal N\!\left(T_{1,t_0}A_{b_k}\right).
+\mathcal N\!\left(T_{1,t_0}\,\mathrm{accT}_{b_k}\right).
 ```
 
 Остальные слои выполняют обычную depth-рекурсию:
@@ -1796,27 +1836,27 @@ D_{t_0}^{\mathrm{seed}}=C_{L,t_0}^{\mathrm{seed}}.
 После потребления seed temporal accumulator перезапускается от нового законченного depth-carrier:
 
 ```math
-A_{t_0}=\mathcal N\!\left(D_{t_0}^{\mathrm{seed}}\right).
+\mathrm{accT}_{t_0}=\mathcal N\!\left(D_{t_0}^{\mathrm{seed}}\right).
 ```
 
 Для следующих токенов до очередной границы:
 
 ```math
-A_t=\mathcal N(D_tA_{t-1}),
+\mathrm{accT}_t=\mathcal N(D_t\,\mathrm{accT}_{t-1}),
 \qquad t_0<t\le b_{k+1}.
 ```
 
-Reset сделан намеренно. `A_{b_k}` уже входит в `D_{t_0}^{seed}` через композицию первого слоя; повторное умножение старого endpoint в temporal recurrence учло бы его дважды.
+Reset сделан намеренно. `accT_{b_k}` уже входит в `D_{t_0}^{seed}` через композицию первого слоя; повторное умножение старого endpoint в temporal recurrence учло бы его дважды.
 
 Полный boundary-маршрут:
 
 ```text
 last-block carriers D_s ... D_b
           │
-          └── streaming temporal composition ──► boundary endpoint A_b
+          └── streaming temporal composition ──► boundary endpoint accT_b
                                                    │
                                                    ├── key/value final-CA
-                                                   └── T_1,next @ A_b
+                                                   └── T_1,next @ accT_b
                                                          │
                                                          ├── композиция по всем слоям
                                                          └── restart temporal state от D_next^seed
@@ -1828,22 +1868,22 @@ last-block carriers D_s ... D_b
 
 Сработавший temporal endpoint имеет форму `[H,3,3]`. Reader не обязан сначала материализовать отдельное `k`-мерное представление каждого hidden-нейрона. Реализация оценивает девять сырых слотов, pooling-ует их по hidden-population и только после этого применяет общую value-проекцию.
 
-Пусть `a_{b,h}=vec(A_{b,h})`. Обучаемый query и независимая slot-key-проекция задают одно нормированное направление `s` в девятимерном slot-space. Population weights:
+Пусть `x_{b,h}=vec(accT_{b,h})`. Обучаемый query и независимая slot-key-проекция задают одно нормированное направление `s` в девятимерном slot-space. Population weights:
 
 ```math
 \rho_{b,h}
 =
 \mathrm{softmax}_h\!\left(
-\langle s,a_{b,h}\rangle
+\langle s,x_{b,h}\rangle
 \right).
 ```
 
 Pooled boundary vector:
 
 ```math
-\bar a_b=\sum_h\rho_{b,h}a_{b,h},
+\bar x_b=\sum_h\rho_{b,h}x_{b,h},
 \qquad
-z_b=\mathrm{Up}\!\left(W_{\mathrm{reader}}\bar a_b+b_{\mathrm{reader}}\right).
+z_b=\mathrm{Up}\!\left(W_{\mathrm{reader}}\bar x_b+b_{\mathrm{reader}}\right).
 ```
 
 Key/value становятся только сработавшие границы. Final cross-attention использует общую проекцию для query и key и отдельную проекцию value:
@@ -1912,12 +1952,12 @@ Full-sequence training forward может материализовать так�
 В incremental inference у Tria нет временной оси в хранимом состоянии. В наиболее ёмкой точке одного token-step одновременно существуют ровно три carrier-sized тензора:
 
 ```math
-C_{L-1},\quad C_L,\quad A_T
+C_{L-1},\quad C_L,\quad \mathrm{accT}
 \in
 \mathbb{R}^{B\times H\times 3\times 3},
 ```
 
-где `C_{L-1}` — carrier предыдущего depth-слоя, `C_L` — результат текущего слоя, а `A_T` — temporal accumulator на хвосте сетки. Сырой bf16 working set равен
+где `C_{L-1}` — carrier предыдущего depth-слоя, `C_L` — результат текущего слоя, а `accT` — temporal accumulator на хвосте сетки. Сырой bf16 working set равен
 
 ```math
 3\cdot 9BH
@@ -2008,7 +2048,7 @@ Replay не меняет forward-уравнение. Градиенты по-п�
 В chunked training обычно требуется конечное temporal-состояние сегмента, а не каждый нормализованный temporal prefix. Поэтому `temporal_carry_endpoint` возвращает только
 
 ```math
-A_T\in\mathbb{R}^{B\times H\times3\times3}
+\mathrm{accT}\in\mathbb{R}^{B\times H\times3\times3}
 ```
 
 и небольшую FP32-копию endpoint для backward. Вторая полная траектория temporal accumulators не сохраняется. Backward проходит входные depth-carriers в обратном порядке и аналитически восстанавливает предыдущий нормализованный accumulator из обратимого локального фактора и текущего accumulator. Это temporal-аналог replay: входные depth-carriers остаются доступны, но дополнительная prefix-history `[B,T,H,3,3]` не создаётся.

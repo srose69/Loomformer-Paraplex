@@ -322,6 +322,7 @@ class Config:
     grad_clip: float = 1.0
     grad_accum_steps: int = 1
     prefetch_batches: int = 256
+    gpu_prefetch_batches: int = 8
     grad_checkpointing: bool = False
     save_every: int = 0 
     runpoints_path: Optional[str] = None  
@@ -875,6 +876,8 @@ def apply_config(cfg: Config) -> None:
 
     if N_Q_HEADS <= 0 or LAYERS <= 0 or VOCAB <= 0 or SEQ_LEN <= 0:
         raise ValueError("model/data dimensions must be positive")
+    if int(cfg.prefetch_batches) <= 0 or int(cfg.gpu_prefetch_batches) <= 0:
+        raise ValueError("prefetch_batches and gpu_prefetch_batches must be positive")
 
     # d_model derivation from model_dim and/or head_dim.
     explicit_dim = cfg.model_dim
@@ -1870,8 +1873,11 @@ class ShardStream:
         self._gpu_batches = host.to(self.device, non_blocking=True)
         self._gpu_pos = 0
 
+    def _gpu_chunk_size(self) -> int:
+        return min(int(self.cfg.gpu_prefetch_batches), int(self.cfg.prefetch_batches))
+
     async def prime(self) -> None:
-        count = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
+        count = self._gpu_chunk_size()
         await self._load_gpu_chunk(count)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -1892,7 +1898,7 @@ class ShardStream:
         return self.sample_device_batch()
 
     async def batches(self, n: int):
-        chunk_size = max(1, 3 * int(self.cfg.log_every) * max(1, int(self.cfg.grad_accum_steps)))
+        chunk_size = self._gpu_chunk_size()
         yielded = 0
         while yielded < n:
             if self._gpu_batches is None or self._gpu_pos >= self._gpu_batches.shape[0]:

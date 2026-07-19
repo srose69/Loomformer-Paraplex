@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokens", type=int, default=768)
     parser.add_argument("--raw-tokens", type=int, default=768)
+    parser.add_argument("--window", type=int)
+    parser.add_argument("--alpha", type=float)
     parser.add_argument("--sequences", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default="tria_geometry_analysis.json")
@@ -820,6 +822,10 @@ def main():
     if requested_tokens <= 0:
         raise ValueError("tokens must be positive")
     cfg.seq_len = requested_tokens
+    if args.window is not None:
+        cfg.tria_temporal_window = int(args.window)
+    if args.alpha is not None:
+        cfg.tria_carrier_alpha = float(args.alpha)
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)
@@ -831,6 +837,8 @@ def main():
     token_count = requested_tokens
     raw_token_count = min(int(args.raw_tokens), token_count)
     window = int(cfg.tria_temporal_window)
+    if token_count % window:
+        raise ValueError("tokens must be divisible by the temporal window")
     horizons = sorted({
         horizon
         for horizon in (

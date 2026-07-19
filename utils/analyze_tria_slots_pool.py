@@ -22,6 +22,8 @@ def parse_args():
     parser.add_argument("--data", required=True)
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokens", type=int, default=1536)
+    parser.add_argument("--window", type=int)
+    parser.add_argument("--alpha", type=float)
     parser.add_argument("--sequences", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default="tria_slots_pool.json")
@@ -104,6 +106,14 @@ def main():
     cfg = lf.Config.from_checkpoint_dict(dict(blob["cfg"]))
     if args.tokenizer is not None:
         cfg.tokenizer = args.tokenizer
+    token_count = int(args.tokens)
+    if token_count <= 0:
+        raise ValueError("tokens must be positive")
+    cfg.seq_len = token_count
+    if args.window is not None:
+        cfg.tria_temporal_window = int(args.window)
+    if args.alpha is not None:
+        cfg.tria_carrier_alpha = float(args.alpha)
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)
@@ -111,7 +121,6 @@ def main():
     tria.set_carrier_alpha(float(cfg.tria_carrier_alpha))
 
     device = torch.device(args.device)
-    token_count = min(int(args.tokens), lf.SEQ_LEN)
     window = int(cfg.tria_temporal_window)
     if token_count % window:
         raise ValueError("tokens must be divisible by the temporal window")
@@ -120,6 +129,7 @@ def main():
     model = lf.Model()
     lf.load_model_blob_into(model, blob, ablation=False)
     model.to(device).eval().requires_grad_(False)
+    model.head = torch.nn.Identity()
     position_ids = torch.arange(token_count, device=device).view(1, token_count)
     endpoints_by_sequence = []
 
@@ -183,6 +193,16 @@ def main():
         "window": window,
         "tokens_analyzed": token_count,
         "sequences": len(rows),
+        "rope": {
+            "original_seq_len": int(cfg.rope_original_seq_len),
+            "factor": float(cfg.rope_factor),
+            "attention_factor": (
+                float(cfg.rope_attention_factor)
+                if cfg.rope_attention_factor is not None
+                else float(lf._yarn_get_mscale(cfg.rope_factor))
+            ),
+            "cache_seq_len": token_count,
+        },
         "chunks": chunks,
         "adjacent_boundary_slot_cosine": tensor_quantiles(adjacent_slots),
         "adjacent_boundary_slot_abs_cosine": tensor_quantiles(adjacent_slots.abs()),

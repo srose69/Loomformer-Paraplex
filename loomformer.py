@@ -3733,7 +3733,7 @@ class Model(nn.Module):
             temporal_seed = None
             if temporal_state is not None:
                 seed_valid = fire_mask[:, s - 1] & ~document_reset[:, s]
-                temporal_seed = tria.polarm(temporal_state)
+                temporal_seed = temporal_state
             h_chunk, depth_chunk, layer_states = self._run_chunk_stack(
                 h_emb[:, s:e], position_ids[:, s:e], chunk_mask, layer_states,
                 temporal_seed, seed_valid)
@@ -3756,9 +3756,13 @@ class Model(nn.Module):
                     depth_chunk, local_reset, initial_state=temporal_state)
             h_chunks.append(h_chunk)
             if e - 1 in boundary_set:
+                boundary_valid = fire_mask[:, e - 1]
+                corrected_state = tria.polarm(temporal_state)
+                temporal_state = torch.where(
+                    boundary_valid[:, None, None, None], corrected_state, temporal_state)
                 key_carries.append(temporal_state)
                 key_depth.append(depth_chunk[:, -1])
-                key_valid.append(fire_mask[:, e - 1])
+                key_valid.append(boundary_valid)
                 key_positions.append(e - 1)
             s = e
         if s != T:
@@ -3884,7 +3888,7 @@ class Model(nn.Module):
         accT_seed = (
             None
             if tria_temporal_state.carry is None
-            else tria.polarm(tria_temporal_state.carry)
+            else tria_temporal_state.carry
         )
         for bi, (block, cache) in enumerate(zip(self.blocks, caches)):
             is_last_block = bi == n_blocks - 1
@@ -3948,8 +3952,6 @@ class Model(nn.Module):
                 prev_doc = tria_temporal_state.carry.to(device=h.device, dtype=depth_carry_t.dtype)
                 continued = tria._local_normalize(torch.matmul(depth_carry_t, prev_doc))
                 document_carry_t = torch.where(reset_now[:, None, None, None], depth_carry_t, continued)
-            document_carry = document_carry_t.unsqueeze(1)
-            a_t = self.tria_agg(document_carry)
             # spec §12.3: fire decision for the NEXT token.
             carry_token_id = CARRY_TOKEN_ID
             hard_fire_now = (
@@ -3962,6 +3964,14 @@ class Model(nn.Module):
             else:
                 explicit_fire_now = torch.zeros(h.shape[0], dtype=torch.bool, device=h.device)
             fire_now = explicit_fire_now | hard_fire_now
+            if hard_fire_now or (
+                carry_token_id is not None and bool(explicit_fire_now.any().item())
+            ):
+                corrected_state = tria.polarm(document_carry_t)
+                document_carry_t = torch.where(
+                    fire_now[:, None, None, None], corrected_state, document_carry_t)
+            document_carry = document_carry_t.unsqueeze(1)
+            a_t = self.tria_agg(document_carry)
             h, tria_ca_cache = self.tria_final_ca.step(
                 a_t, h, tria_ca_cache, pos_t, SEQ_LEN, carry_key_mask=fire_now[:, None])
             tria_temporal_state = TriaTemporalState(carry=document_carry_t, refeed_pending=fire_now)

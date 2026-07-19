@@ -2429,10 +2429,15 @@ class _BetaSpaceDirect(torch.autograd.Function):
         ext = _try_load_cuda_beta_space()
         if ext is None:
             raise RuntimeError("CUDA beta_space module is unavailable")
-        out, _r_pack, w_contig = ext.beta_forward_cuda(
-            u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
+        w_compute = (
+            w1_imag_compact
+            if w1_imag_compact.dtype == u.dtype
+            else w1_imag_compact.to(dtype=u.dtype)
+        )
+        out, _r_pack, _w_contig = ext.beta_forward_cuda(
+            u, q_h, k_ctx_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
-        ctx.save_for_backward(u, q_h, k_ctx_h, c_h, d_h, w_contig)
+        ctx.save_for_backward(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2],
                       w1_imag_compact.shape[0], w1_imag_compact.shape[1])
         ctx.meta = (hidden_per_q_head, head_dim, n_q_heads, open_sectors)
@@ -2443,13 +2448,20 @@ class _BetaSpaceDirect(torch.autograd.Function):
         ext = _try_load_cuda_beta_space()
         if ext is None:
             raise RuntimeError("CUDA beta_space module is unavailable")
-        u, q_h, k_ctx_h, c_h, d_h, w_contig = ctx.saved_tensors
+        u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact = ctx.saved_tensors
         B, T, N, HIDDEN, IMAG_IN = ctx.shapes
         hidden_per_q_head, head_dim, n_q_heads, open_sectors = ctx.meta
+        w_compute = (
+            w1_imag_compact
+            if w1_imag_compact.dtype == u.dtype
+            else w1_imag_compact.to(dtype=u.dtype)
+        )
         grads = ext.beta_backward_cuda_recompute(
-            grad_out, u, q_h, k_ctx_h, c_h, d_h, w_contig,
+            grad_out, u, q_h, k_ctx_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = grads
+        if grad_w.dtype != w1_imag_compact.dtype:
+            grad_w = grad_w.to(dtype=w1_imag_compact.dtype)
         QH, HD = n_q_heads, head_dim
         return (grad_u,
                 grad_q.view(B, T, QH, HD),
@@ -2471,8 +2483,9 @@ class _ParaplexFused(torch.autograd.Function):
         core_ext = _try_load_cuda_paraplex()
         if beta_ext is None or core_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
-        beta, _r_pack, w_contig = beta_ext.beta_forward_cuda(
-            u, q_h, k_h, c_h, d_h, w_imag,
+        w_compute = w_imag if w_imag.dtype == u.dtype else w_imag.to(dtype=u.dtype)
+        beta, _r_pack, _w_contig = beta_ext.beta_forward_cuda(
+            u, q_h, k_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         act, s, next_trace, anchor_snapshot = core_ext.paraplex_forward(
             p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
@@ -2480,7 +2493,7 @@ class _ParaplexFused(torch.autograd.Function):
         ctx.mark_non_differentiable(anchor_snapshot)
         ctx.save_for_backward(
             p_real, gate_src, beta, bias, trace, trace_w, reset, anchor_snapshot,
-            u, q_h, k_h, c_h, d_h, w_contig)
+            u, q_h, k_h, c_h, d_h, w_imag)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2], w_imag.shape[0], w_imag.shape[1])
         ctx.meta = (
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
@@ -2495,7 +2508,7 @@ class _ParaplexFused(torch.autograd.Function):
         if core_ext is None or beta_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
         (p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
-         u, q_h, k_h, c_h, d_h, w_contig) = ctx.saved_tensors
+         u, q_h, k_h, c_h, d_h, w_imag) = ctx.saved_tensors
         grad_act = torch.zeros_like(p_real) if grad_act is None else grad_act.to(dtype=p_real.dtype)
         grad_s = torch.zeros_like(p_real) if grad_s is None else grad_s.to(dtype=p_real.dtype)
         grad_next = torch.zeros_like(trace) if grad_next is None else grad_next.to(dtype=trace.dtype)
@@ -2504,9 +2517,12 @@ class _ParaplexFused(torch.autograd.Function):
             grad_act, grad_s, grad_next, p_real, gate_src, beta, bias, trace, trace_w,
             reset, anchor, mode, floor, near_eps, m)
         B, T, N_local, H_local, imag_in = ctx.shapes
+        w_compute = w_imag if w_imag.dtype == u.dtype else w_imag.to(dtype=u.dtype)
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_ext.beta_backward_cuda_recompute(
-            grad_beta, u, q_h, k_h, c_h, d_h, w_contig,
+            grad_beta, u, q_h, k_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
+        if grad_w.dtype != w_imag.dtype:
+            grad_w = grad_w.to(dtype=w_imag.dtype)
         QH, HD = n_q_heads, head_dim
         return (
             grad_p, grad_gate, grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
@@ -2523,7 +2539,9 @@ def beta_space_cuda(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
         return None
     if u.dtype not in (torch.float32, torch.bfloat16):
         return None
-    if not (q_h.dtype == u.dtype and k_ctx_h.dtype == u.dtype and c_h.dtype == u.dtype and d_h.dtype == u.dtype and w1_imag_compact.dtype == u.dtype):
+    if not (q_h.dtype == u.dtype and k_ctx_h.dtype == u.dtype and c_h.dtype == u.dtype and d_h.dtype == u.dtype):
+        return None
+    if w1_imag_compact.dtype not in (torch.float32, torch.bfloat16):
         return None
     N_local = u.shape[-1]
     IMAG_IN_local = w1_imag_compact.shape[-1]
@@ -2665,16 +2683,15 @@ class ParaplexFFN(nn.Module):
             if fast_dtype in (torch.float32, torch.bfloat16):
                 # In the real training graph the five activation sources can be mixed dtype
                 # under autocast. beta_space_cuda requires one dtype, so normalize explicitly.
-                # The casts are differentiable, including w1_imag fp32 Parameter -> bf16.
+                # Activation casts remain in the outer graph. The weight cast is transient
+                # inside the custom autograd op, so its BF16 copy is not retained for backward.
                 u_fast = u if u.dtype == fast_dtype else u.to(dtype=fast_dtype)
                 q_fast = q_h if q_h.dtype == fast_dtype else q_h.to(dtype=fast_dtype)
                 k_fast = k_ctx_h if k_ctx_h.dtype == fast_dtype else k_ctx_h.to(dtype=fast_dtype)
                 c_fast = c_h if c_h.dtype == fast_dtype else c_h.to(dtype=fast_dtype)
                 d_fast = d_h if d_h.dtype == fast_dtype else d_h.to(dtype=fast_dtype)
-                w_fast = self.w1_imag if self.w1_imag.dtype == fast_dtype else self.w1_imag.to(dtype=fast_dtype)
-
                 out = beta_space_cuda(
-                    u_fast, q_fast, k_fast, c_fast, d_fast, w_fast,
+                    u_fast, q_fast, k_fast, c_fast, d_fast, self.w1_imag,
                     HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS, PHASE_SECTORS == "open")
                 if out is not None:
                     if not _cuda_beta_space_active_printed:
@@ -2730,7 +2747,7 @@ class ParaplexFFN(nn.Module):
         update_anchor = bool(mode == 1 and self.training and anchor_override is None)
         act, s, next_trace, anchor_snapshot = _ParaplexFused.apply(
             cast(p_real), cast(gate_src), cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
-            cast(self.w1_imag), self.w1_imag_bias, cast(trace), self.w1_imag_trace,
+            self.w1_imag, self.w1_imag_bias, cast(trace), self.w1_imag_trace,
             reset, anchor, HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS,
             PHASE_SECTORS == "open", mode, update_anchor, self.beta_anchor_decay,
             max(PHASE_GRAD_FLOOR, 0.0), 1e-4, POWLU_M,

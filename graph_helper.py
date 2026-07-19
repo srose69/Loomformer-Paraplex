@@ -696,8 +696,13 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
         hidden_per_q_head: int, head_dim: int, n_q_heads: int, open_sectors: bool,
     ) -> torch.Tensor:
         module = _get_module()
+        w_compute = (
+            w1_imag_compact
+            if w1_imag_compact.dtype == u.dtype
+            else w1_imag_compact.to(dtype=u.dtype)
+        )
         out, _r_pack, _w_contig = module.beta_forward_cuda(
-            u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
+            u, q_h, k_ctx_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         )
         return out
@@ -721,10 +726,17 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
         grad_out: torch.Tensor,
         hidden_per_q_head: int, head_dim: int, n_q_heads: int, open_sectors: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        w_compute = (
+            w1_imag_compact
+            if w1_imag_compact.dtype == u.dtype
+            else w1_imag_compact.to(dtype=u.dtype)
+        )
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = _get_module().beta_backward_cuda_recompute(
-            grad_out, u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
+            grad_out, u, q_h, k_ctx_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         )
+        if grad_w.dtype != w1_imag_compact.dtype:
+            grad_w = grad_w.to(dtype=w1_imag_compact.dtype)
         B, T = u.shape[:2]
         QH, HD = n_q_heads, head_dim
         return (
@@ -742,7 +754,7 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
-            torch.empty(w1_imag_compact.shape, dtype=grad_out.dtype, device=grad_out.device),
+            torch.empty(w1_imag_compact.shape, dtype=w1_imag_compact.dtype, device=w1_imag_compact.device),
         )
 
     def _backward(ctx, grad_out):

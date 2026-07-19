@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument("--raw-tokens", type=int, default=768)
     parser.add_argument("--window", type=int)
     parser.add_argument("--alpha", type=float)
+    parser.add_argument("--polarm-beta", type=float)
     parser.add_argument("--sequences", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default="tria_geometry_analysis.json")
@@ -612,6 +613,7 @@ def analyze_checkpoint(
     operational_temporal_result = operational_temporal_accumulator.finish()
     operational_depth_chunk_results = [accumulator.finish() for accumulator in operational_depth_by_chunk]
     operational_temporal_chunk_results = [accumulator.finish() for accumulator in operational_temporal_by_chunk]
+    del original_run_chunk_stack, capture_run_chunk_stack
     del model
     gc.collect()
     if device.type == "cuda":
@@ -826,6 +828,8 @@ def main():
         cfg.tria_temporal_window = int(args.window)
     if args.alpha is not None:
         cfg.tria_carrier_alpha = float(args.alpha)
+    if args.polarm_beta is not None:
+        cfg.tria_polarm_beta = float(args.polarm_beta)
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)
@@ -894,6 +898,7 @@ def main():
             "checkpoint": args.checkpoint,
             "dataset": args.data,
             "native_alpha": float(cfg.tria_carrier_alpha),
+            "polarm_beta": float(cfg.tria_polarm_beta),
             "window": window,
             "tokens_analyzed": token_count,
             "raw_tokens_analyzed": raw_token_count,
@@ -944,6 +949,7 @@ def main():
         "init_checkpoint": args.init,
         "dataset": args.data,
         "native_alpha": float(cfg.tria_carrier_alpha),
+        "polarm_beta": float(cfg.tria_polarm_beta),
         "window": window,
         "tokens_analyzed": token_count,
         "raw_tokens_analyzed": raw_token_count,

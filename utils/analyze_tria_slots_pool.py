@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--tokens", type=int, default=1536)
     parser.add_argument("--window", type=int)
     parser.add_argument("--alpha", type=float)
+    parser.add_argument("--polarm-beta", type=float)
     parser.add_argument("--sequences", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default="tria_slots_pool.json")
@@ -114,6 +115,8 @@ def main():
         cfg.tria_temporal_window = int(args.window)
     if args.alpha is not None:
         cfg.tria_carrier_alpha = float(args.alpha)
+    if args.polarm_beta is not None:
+        cfg.tria_polarm_beta = float(args.polarm_beta)
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)
@@ -163,6 +166,8 @@ def main():
             endpoints_by_sequence.append(torch.stack(endpoints, dim=1).cpu())
             print(f"sequence {sequence_index}/{len(rows)}", flush=True)
 
+    del original_run_chunk_stack, capture_run_chunk_stack
+    del tokens, captured_depth, endpoints, depth_chunk, reset
     endpoints = torch.cat(endpoints_by_sequence, dim=0).float()
     chunks = []
     slot_chunks = []
@@ -193,6 +198,7 @@ def main():
         "window": window,
         "tokens_analyzed": token_count,
         "sequences": len(rows),
+        "polarm_beta": float(cfg.tria_polarm_beta),
         "rope": {
             "original_seq_len": int(cfg.rope_original_seq_len),
             "factor": float(cfg.rope_factor),

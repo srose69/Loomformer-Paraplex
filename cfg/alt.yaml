@@ -1,0 +1,92 @@
+# alt
+optimizer: atom                     # atom | adamw
+steps: 21000
+lr: 1e-4
+weight_decay: 0.01
+grad_clip: 1.5
+warmup_steps: 500
+min_lr_frac: 0.1
+seed: 1
+log_every: 10
+eval_every: 500
+eval_batches: 10
+device: cuda:0,cuda:1               # cpu | cuda[:N] | cudas | cuda:N,cuda:M
+grad_accum_steps: 1
+grad_checkpointing: true
+amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
+save_every: 4000
+runpoints_path: null
+graph: false
+save_graph: false
+
+# sequence / batch
+seq_len: 1536                       # must be > 0
+batch_size: 34                      # DDP: must be divisible by world_size
+prefetch_batches: 300
+
+# positional encoding
+rope_theta: 10000.0                 # must be > 0
+rope_original_seq_len: 1536         # null | > 0
+rope_factor: 4.0                    # must be > 0
+rope_beta_fast: 32.0                # must be > 0
+rope_beta_slow: 1.0                 # must be > 0
+rope_attention_factor: null
+
+# carrier Tria and temporal refeed
+tria_carry_enabled: true            # true requires tria_temporal_enabled: true
+use_cuda_tria: true
+tria_gamma_max: 0.80
+tria_raw_gamma_init: 0.01
+tria_temporal_enabled: true
+tria_temporal_auto: false           # false requires tria_temporal_window
+tria_temporal_window: 192           # must be > 0
+tria_temporal_window_min: 32
+tria_target_refeeds_per_sequence: 7
+tria_carrier_alpha: 0.05            # must be finite and > 0
+
+# data / tokenizer
+tokenizer: ./tokenizer32768.json     # null | local .json | Hugging Face name/path
+vocab: 32768                        # must be > 0
+tied_embeddings: true
+
+# pretrain datasets
+train_dataset: ./datasets/fw-edu
+val_dataset: null
+auto_val_split_pct: 0.1             # 0 disables; otherwise must be in (0, 100)
+
+# on-the-fly corpus format
+dataset_format: auto                # auto | bin | txt | jsonl | parquet | arrow
+text_field: text
+dataset_cache: null                 # null | mmap | ram
+
+# model shape
+model_dim: 576                      # with head_dim: = q_heads*head_dim; otherwise divisible by q_heads
+n_q_heads: 6                        # must be > 0
+head_dim: 96                        # must be even; multiple of 4 enables fast CUDA path
+n_kv_heads: 2                       # must divide n_q_heads; with group: product = n_q_heads
+gqa_group_size: 3                   # must divide n_q_heads; with kv heads: product = n_q_heads
+
+# Paraplex FFN
+hidden: null                        # null | positive multiple of n_q_heads
+hidden_mult: 4
+layers: 30                          # must be > 0
+final_norm: true
+paraplex_gate_proj: true
+
+# phase / residual / activation knobs
+phase_sectors: head                 # head | open
+residual_init: beta                 # beta | fanin
+depth_attn_readout: per-sublayer    # shared | per-sublayer
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0        # null | > 0
+activation: pvpowlu                 # gelu | powlu | pvpowlu
+powlu_m: 3.0
+phase_grad_floor: 0.05
+phase_grad_mode: secant             # floor | secant
+attn_impl: sdpa                     # sdpa | manual
+
+# precision / CUDA fast paths
+use_cuda_beta_space: true
+use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true

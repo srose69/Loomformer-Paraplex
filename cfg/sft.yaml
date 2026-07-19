@@ -1,0 +1,68 @@
+device: cuda:0                      # cpu | cuda[:N] | cudas | cuda:N,cuda:M
+optimizer: atom                     # atom | adamw
+steps: 8000
+lr: 5e-5
+weight_decay: 0.01
+grad_clip: 1.75
+warmup_steps: 100
+min_lr_frac: 0.1
+seed: 1
+log_every: 20
+grad_accum_steps: 1
+grad_checkpointing: false
+graph: false
+save_graph: false
+amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
+save_every: 1000
+
+# sequence / batch
+seq_len: 2048                       # must be > 0
+batch_size: 12                      # DDP: must be divisible by world_size
+
+# positional encoding
+rope_theta: 10000.0                 # must be > 0
+rope_original_seq_len: 1024         # null | > 0
+rope_factor: 4.0                    # must be > 0
+rope_beta_fast: 32.0                # must be > 0
+rope_beta_slow: 1.0                 # must be > 0
+rope_attention_factor: null
+
+# Tria values are restored from the checkpoint at startup.
+tria_carry_enabled: true            # true requires tria_temporal_enabled: true
+use_cuda_tria: true
+tria_gamma_max: 0.80
+tria_raw_gamma_init: 0.25
+tria_temporal_enabled: true
+tria_temporal_auto: false           # false requires tria_temporal_window
+tria_temporal_window: 128           # must be > 0
+tria_carrier_alpha: 0.025           # must be finite and > 0
+
+# data / tokenizer
+tokenizer: ./tokenizer8192.json      # null | local .json | Hugging Face name/path
+vocab: 8192                         # must be > 0
+tied_embeddings: false
+
+# model shape
+model_dim: 768                      # with head_dim: = q_heads*head_dim; otherwise divisible by q_heads
+n_q_heads: 8                        # must be > 0
+head_dim: 96                        # must be even; multiple of 4 enables fast CUDA path
+n_kv_heads: null                    # null | positive divisor of n_q_heads
+gqa_group_size: 4                   # null | positive divisor of n_q_heads
+hidden: null                        # null | positive multiple of n_q_heads
+hidden_mult: 4.0
+layers: 10                          # must be > 0
+
+# phase / residual / activation
+phase_sectors: head                 # head | open
+residual_init: beta                 # beta | fanin
+activation: pvpowlu                 # gelu | powlu | pvpowlu
+powlu_m: 3.0
+phase_grad_floor: 0.05
+phase_grad_mode: secant             # floor | secant
+attn_impl: sdpa                     # sdpa | manual
+
+# precision / CUDA fast paths
+use_cuda_beta_space: true
+use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true

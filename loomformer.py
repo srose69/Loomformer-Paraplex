@@ -2035,7 +2035,9 @@ def _try_load_cuda_phase_sin():
         )
     except Exception as e:
         _cuda_phase_sin_module = None
-        ddp_print(f"[loomformer] CUDA phase_sin unavailable ({type(e).__name__}: {e}); using pure PyTorch.")
+        ddp_print(
+            f"[loomformer] CUDA phase_sin failed ({type(e).__name__}: {e}); "
+            "using SLOWER PyTorch fallback.")
     return _cuda_phase_sin_module
 
 
@@ -2105,7 +2107,9 @@ def _try_load_cuda_pvpowlu():
         )
     except Exception as e:
         _cuda_pvpowlu_module = None
-        ddp_print(f"[loomformer] CUDA pvpowlu unavailable ({type(e).__name__}: {e}); using pure PyTorch.")
+        ddp_print(
+            f"[loomformer] CUDA pvpowlu failed ({type(e).__name__}: {e}); "
+            "using SLOWER PyTorch fallback.")
     return _cuda_pvpowlu_module
 
 
@@ -2297,7 +2301,9 @@ def _try_load_cuda_depth_attn():
         )
     except Exception as e:
         _cuda_depth_attn_module = None
-        ddp_print(f"[loomformer] CUDA depth_attn unavailable ({type(e).__name__}: {e}); using pure PyTorch.")
+        ddp_print(
+            f"[loomformer] CUDA depth_attn failed ({type(e).__name__}: {e}); "
+            "using SLOWER PyTorch fallback.")
     return _cuda_depth_attn_module
 
 
@@ -2386,7 +2392,9 @@ def _try_load_cuda_beta_space():
         )
     except Exception as e:
         _cuda_beta_space_module = None
-        ddp_print(f"[loomformer] CUDA beta_space unavailable ({type(e).__name__}: {e}); using pure PyTorch.")
+        ddp_print(
+            f"[loomformer] CUDA beta_space failed ({type(e).__name__}: {e}); "
+            "using SLOWER PyTorch fallback.")
     return _cuda_beta_space_module
 
 
@@ -3042,7 +3050,9 @@ def _try_load_cuda_chunk_attn():
         )
     except Exception as e:
         _cuda_chunk_attn_module = None
-        ddp_print(f"[loomformer] CUDA chunk attention unavailable ({type(e).__name__}: {e}); using PyTorch.")
+        ddp_print(
+            f"[loomformer] CUDA chunk_attention failed ({type(e).__name__}: {e}); "
+            "using SLOWER PyTorch fallback.")
     return _cuda_chunk_attn_module
 
 

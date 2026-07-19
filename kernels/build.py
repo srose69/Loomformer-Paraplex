@@ -44,12 +44,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Dict, List, Optional, Sequence
 
 _KERNELS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUILD_DIR = os.path.join(_KERNELS_DIR, "build")
 _HASH_FILE = os.path.join(_KERNELS_DIR, ".hashes.json")
+_HASH_LOCK_FILE = os.path.join(_KERNELS_DIR, ".hashes.lock")
 _STATE_LOCK = threading.Lock()
 _EXT_LOCKS: Dict[str, threading.Lock] = {}
 
@@ -143,10 +145,31 @@ def _load_hash_db() -> Dict[str, Dict[str, str]]:
 
 
 def _save_hash_db(db: Dict[str, Dict[str, str]]) -> None:
-    tmp = _HASH_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2, sort_keys=True)
-    os.replace(tmp, _HASH_FILE)  # atomic on POSIX -- no half-written .hashes.json
+    fd, tmp = tempfile.mkstemp(
+        prefix=".hashes.json.", suffix=".tmp", dir=_KERNELS_DIR, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2, sort_keys=True)
+        os.replace(tmp, _HASH_FILE)  # atomic on POSIX -- no half-written .hashes.json
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _update_hash_record(ext_name: str, current: Dict[str, str]) -> None:
+    # _STATE_LOCK protects threads inside one rank. DDP ranks are separate
+    # processes, so serialize the read-modify-write as well; otherwise two
+    # ranks can overwrite one another's records even with atomic replacement.
+    import fcntl
+
+    with open(_HASH_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            db = _load_hash_db()
+            db[ext_name] = current
+            _save_hash_db(db)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 # ============================================================================
@@ -312,9 +335,7 @@ def build_or_load(
         _status(f"{counter} {verb_done} {ext_name}{groups_label}", done=True)
 
         with _STATE_LOCK:
-            db = _load_hash_db()
-            db[ext_name] = current
-            _save_hash_db(db)
+            _update_hash_record(ext_name, current)
 
         if changed and ptx_kernels and _ptx_dump_enabled():
             for kernel_cu_rel in ptx_kernels.values():

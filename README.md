@@ -74,6 +74,12 @@ I built LoomFormer around three coupled changes:
 2. **DepthAttn** replaces the fixed residual source with a learned softmax read over states produced earlier in network depth.
 3. **Tria** converts the internal Paraplex coordinates into a `3×3` operator, composes that operator through layers and time, and returns selected summaries to later computation.
 
+Tria is the part of LoomFormer that I can describe mechanically and mathematically, but not yet semantically. I know how it is constructed, propagated and read, and ablation shows that a trained model can incorporate it deeply enough for its removal to change autoregressive logits and loss. At the same time, Tria does not map cleanly to tokens, concepts or a stable human-readable latent vocabulary: direct decoding and correlation analysis have not produced a reliable interpretation.
+
+The base model *can* operate without Tria (on early steps compared with BIG train runs), so I do not present it as a necessary condition for language modelling. Rather, it is an auxiliary operator pathway whose learned role remains an open research question. In the spirit of the Bitter Lesson, I build an **instrument**, give it a task, and let learning determine how that instrument is used. Probes indicate that Tria does not remain an inert architectural ornament: its states become increasingly structured during training, and the model learns to rely on them as part of its computation.
+
+I can describe how Tria works, but not yet what it means. If you want an interpretation, try asking the trained model why it uses Tria; its answer may be no less speculative than mine :)
+
 The implementation works entirely with real tensors and produces three internal coordinates per FFN neuron:
 
 - `R` — the real/preactivation coordinate;
@@ -518,6 +524,8 @@ L1H1 phase/output ──► dense W2 ──► residual stream ──► attenti
 The immediate Tria gate preserves the hidden-channel index. Cross-channel mixing is supplied by `W2`, the next `W_real`, attention, DepthAttn and the final population pool.
 
 ### Tria
+
+The equations below define Tria exactly, but they do not by themselves identify its learned semantic role. In trained checkpoints, the carrier is causally active: disabling it changes downstream computation and autoregressive logits. However, its states have not yielded a stable token-level dictionary or a straightforward human-readable interpretation. Tria may encode its useful function through distributed population geometry, operator composition and trajectories across depth and time rather than through individually decodable coordinates.
 
 Tria takes the three Paraplex coordinates `R`, `I` and `O` for every token and hidden channel. The implementation materializes three unique pairwise relations:
 
@@ -1182,6 +1190,12 @@ LoomFormer — decoder-only авторегрессионная языковая 
 2. **DepthAttn** заменяет фиксированный источник residual на обучаемое softmax-чтение состояний, уже полученных раньше по глубине сети.
 3. **Tria** превращает внутренние координаты Paraplex в оператор `3×3`, композирует его по слоям и времени и возвращает выбранные сводки в дальнейшее вычисление.
 
+Tria - та часть LoomFormer, которую я могу описать механически и математически, но пока не могу семантически интерпретировать. Я знаю, как она строится, переносится и читается; абляции показывает, что обученная модель способна встроить её в своё вычисление настолько глубоко, что отключение Tria меняет авторегрессионные логиты и loss. При этом Tria не отображается напрямую в токены, понятия или устойчивый человекочитаемый латентный словарь: прямое декодирование и корреляционный анализ пока не дали надёжной интерпретации.
+
+Базовая модель способна работать без Tria (по крайней мере, на ранних шагах в сравнении с БОЛЬШИМИ трейн ранами), поэтому я не представляю её как необходимое условие языкового моделирования. Скорее, это вспомогательный операторный путь, точная выученная роль которого остаётся открытым исследовательским вопросом. В духе Bitter Lesson я строю инструмент, даю ему задачу и позволяю обучению определить, как именно этот инструмент будет использован. Пробы показывают, что Tria не остаётся инертным архитектурным украшением: по мере обучения её состояния становятся всё более структурированными, а модель учится опираться на них как на часть собственного вычисления.
+
+Я могу описать, как работает Tria, но пока не знаю, что она означает. Если вам нужна интерпретация, попробуйте спросить у самой обученной модели, зачем ей Tria: её ответ, возможно, будет не менее спекулятивным, чем мой :)
+
 Реализация полностью работает на вещественных тензорах и формирует три внутренние координаты каждого FFN-нейрона:
 
 - `R` — real/preactivation-координата;
@@ -1626,6 +1640,8 @@ phase/output L1H1 ──► dense W2 ──► residual stream ──► attenti
 Непосредственный Tria-gate сохраняет hidden-index. Межканальное смешивание выполняют `W2`, следующий `W_real`, attention, DepthAttn и финальный population pool.
 
 ### Tria
+
+Приведённые ниже уравнения точно определяют механику Tria, но сами по себе не раскрывают её выученную семантическую роль. В обученных чекпойнтах carrier является каузально активным: его отключение меняет дальнейшее вычисление и авторегрессионные логиты. Однако для его состояний пока не удалось построить устойчивый токенный словарь или простую человекочитаемую интерпретацию. Возможно, полезная функция Tria выражается через распределённую геометрию популяции, композицию операторов и траектории по глубине и времени, а не через отдельно декодируемые координаты.
 
 Tria получает три координаты Paraplex `R`, `I`, `O` для каждого токена и hidden-канала. Реализация материализует три уникальных попарных отношения:
 

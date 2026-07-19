@@ -43,6 +43,7 @@ tria_temporal_window: 192           # must be > 0
 tria_temporal_window_min: 32
 tria_target_refeeds_per_sequence: 7
 tria_carrier_alpha: 0.05            # must be finite and > 0
+tria_polarm_beta: 0.1                # must be finite and in [0, 1)
 
 # data / tokenizer
 tokenizer: ./tokenizer32768.json     # null | local .json | Hugging Face name/path

@@ -100,6 +100,7 @@ _TRIA_DISABLE_OPS = {
 # (optionally by startup calibration); axis is supplied per depth layer. No tensor
 # state is allocated for either value.
 _TRIA_CARRIER_ALPHA = 0.05
+_TRIA_POLARM_BETA = 0.1
 
 def set_carrier_alpha(alpha: float) -> None:
     global _TRIA_CARRIER_ALPHA
@@ -110,6 +111,54 @@ def set_carrier_alpha(alpha: float) -> None:
 
 def carrier_alpha() -> float:
     return float(_TRIA_CARRIER_ALPHA)
+
+
+def set_polarm_beta(beta: float) -> None:
+    global _TRIA_POLARM_BETA
+    beta = float(beta)
+    if not math.isfinite(beta) or beta < 0.0 or beta >= 1.0:
+        raise ValueError(f"PolARM beta must be finite and in [0, 1), got {beta}")
+    _TRIA_POLARM_BETA = beta
+
+
+def polarm_beta() -> float:
+    return float(_TRIA_POLARM_BETA)
+
+
+def _polarm_impl(matrix: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
+    input_dtype = matrix.dtype
+    with torch.autocast(device_type=matrix.device.type, enabled=False):
+        work = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+        gram = work.transpose(-1, -2) @ work
+        scale = gram.diagonal(dim1=-2, dim2=-1).mean(-1, keepdim=True)
+        scale = scale.unsqueeze(-1).clamp_min(eps)
+        normalized_gram = gram / scale
+        identity = torch.eye(3, device=work.device, dtype=work.dtype)
+        correction = identity - 0.5 * beta * (normalized_gram - identity)
+        corrected = work @ correction
+    return corrected.to(input_dtype) if corrected.dtype != input_dtype else corrected
+
+
+class _PolARMRecompute(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, matrix: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
+        ctx.save_for_backward(matrix)
+        ctx.beta = float(beta)
+        ctx.eps = float(eps)
+        return _polarm_impl(matrix, ctx.beta, ctx.eps)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (matrix,) = ctx.saved_tensors
+        with torch.enable_grad():
+            replay = matrix.detach().requires_grad_(True)
+            output = _polarm_impl(replay, ctx.beta, ctx.eps)
+            (grad_matrix,) = torch.autograd.grad(output, replay, grad_output)
+        return grad_matrix, None, None
+
+
+def polarm(matrix: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _PolARMRecompute.apply(matrix, _TRIA_POLARM_BETA, eps)
 
 def _axis(axis: int) -> int:
     axis = int(axis)

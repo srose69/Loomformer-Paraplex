@@ -369,6 +369,7 @@ class Config:
     tria_temporal_auto: bool = True
     tria_carrier_alpha: float = 0.05
     tria_carrier_alpha_candidates: Optional[List[float]] = None
+    tria_polarm_beta: float = 0.1
     tria_min_refeeds_per_sequence: int = 1
     tria_temporal_max_condition: float = 3.0
     tria_temporal_min_effective_rank: float = 2.70
@@ -663,6 +664,7 @@ def apply_temporal_tria_auto_calibration(cfg: Config) -> None:
         apply_temporal_tria_calibration(cfg)
         return
     tria.set_carrier_alpha(float(getattr(cfg, "tria_carrier_alpha", 0.05)))
+    tria.set_polarm_beta(float(getattr(cfg, "tria_polarm_beta", 0.1)))
     if not bool(getattr(cfg, "tria_temporal_auto", True)):
         return
     result = calibrate_temporal_tria_from_init(cfg)
@@ -1047,6 +1049,7 @@ def apply_config(cfg: Config) -> None:
     cfg.hidden = HIDDEN
 
     tria.set_carrier_alpha(float(getattr(cfg, "tria_carrier_alpha", 0.05)))
+    tria.set_polarm_beta(float(getattr(cfg, "tria_polarm_beta", 0.1)))
     if TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED:
         apply_temporal_tria_auto_calibration(cfg)
     selected_window = getattr(cfg, "tria_temporal_window", None)
@@ -3727,11 +3730,13 @@ class Model(nn.Module):
             if attn_mask is not None:
                 chunk_mask = chunk_mask & attn_mask[:, :, s:e, :e]
             seed_valid = None
+            temporal_seed = None
             if temporal_state is not None:
                 seed_valid = fire_mask[:, s - 1] & ~document_reset[:, s]
+                temporal_seed = tria.polarm(temporal_state)
             h_chunk, depth_chunk, layer_states = self._run_chunk_stack(
                 h_emb[:, s:e], position_ids[:, s:e], chunk_mask, layer_states,
-                temporal_state, seed_valid)
+                temporal_seed, seed_valid)
             local_reset = document_reset[:, s:e].clone()
             if seed_valid is not None:
                 local_reset[:, 0] |= seed_valid
@@ -3876,7 +3881,11 @@ class Model(nn.Module):
             else tria_temporal_state.refeed_pending.to(device=idx_t.device)
         )
         seed_valid = pending & (not is_bos)
-        accT_seed = tria_temporal_state.carry
+        accT_seed = (
+            None
+            if tria_temporal_state.carry is None
+            else tria.polarm(tria_temporal_state.carry)
+        )
         for bi, (block, cache) in enumerate(zip(self.blocks, caches)):
             is_last_block = bi == n_blocks - 1
             attn_out, q_h, k_ctx_h, c_h, k_all, v_all = block.attn.step(h, pos_t, cache.k, cache.v, cache.cache_len)

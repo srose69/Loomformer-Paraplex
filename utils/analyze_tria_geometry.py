@@ -19,7 +19,7 @@ import tria
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint")
-    parser.add_argument("--init", required=True)
+    parser.add_argument("--init")
     parser.add_argument("--data", required=True)
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokens", type=int, default=768)
@@ -478,6 +478,7 @@ def analyze_checkpoint(
     model = lf.Model()
     lf.load_model_blob_into(model, blob, ablation=False)
     model.to(device).eval().requires_grad_(False)
+    model.head = torch.nn.Identity()
     model.capture_tria_depth_carry = True
     window = int(model.tria_temporal_window)
     raw_horizons = [horizon for horizon in horizons if horizon <= raw_token_count]
@@ -753,13 +754,72 @@ def print_summary(report, horizons):
         )
 
 
+def print_single_summary(label, checkpoint_report, window, horizons):
+    section = checkpoint_report["temporal"]
+    print("\n=== Rotation-aware summary ===")
+    print(
+        f"{label}: temporal stable horizon={section['stable_horizon']} "
+        f"depth stable horizon={checkpoint_report['depth']['stable_horizon']}"
+    )
+    for horizon in horizons:
+        metrics = section["selected_horizons"][str(horizon)]
+        singular_values = "/".join(
+            f"{value:.3f}" for value in metrics["normalized_singular_values_mean"]
+        )
+        print(
+            f"  h={horizon:4d} pass={metrics['population_pass']:.4f} "
+            f"cond={metrics['condition']['mean']:.3f} "
+            f"rank={metrics['effective_rank']['mean']:.3f} "
+            f"rot={math.degrees(metrics['rotation_angle']['mean']):6.1f}deg "
+            f"path={metrics['rotation_path_length']['mean']:.1f}rad "
+            f"sv={singular_values}"
+        )
+    failure = section["per_stream_first_failure"]
+    dynamics = section["singular_frame_dynamics"]
+    print(
+        f"  first-failure median={failure['all']['p50']:.1f} "
+        f"p10={failure['all']['p10']:.1f} p90={failure['all']['p90']:.1f} "
+        f"failed_by_W={failure['fraction_failed_by_window']:.4f}"
+    )
+    print(
+        f"  weak-frame lag1 overlap={dynamics['weak_step_overlap']['mean']:.4f} "
+        f"dominant-frame lag1 overlap={dynamics['dominant_step_overlap']['mean']:.4f}"
+    )
+    operational = checkpoint_report["operational"]["temporal"]
+    boundary = operational["selected_horizons"][str(window)]
+    operational_failure = operational["per_stream_first_failure"]
+    print(
+        f"  operational W={window}: pass={boundary['population_pass']:.4f} "
+        f"cond={boundary['condition']['mean']:.3f} "
+        f"rank={boundary['effective_rank']['mean']:.3f} "
+        f"failed_by_W={operational_failure['fraction_failed_by_window']:.4f}"
+    )
+    chunk_line = []
+    for chunk in checkpoint_report["operational"]["by_chunk"]:
+        chunk_boundary = chunk["temporal"]["selected_horizons"][str(window)]
+        chunk_line.append(
+            f"c{chunk['chunk_index']}:{chunk_boundary['population_pass']:.3f}/"
+            f"{chunk_boundary['condition']['mean']:.2f}/"
+            f"{chunk_boundary['effective_rank']['mean']:.2f}"
+        )
+    print("  operational chunks pass/cond/rank: " + " ".join(chunk_line))
+
+
 def main():
     args = parse_args()
     trained_blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    init_blob = torch.load(args.init, map_location="cpu", weights_only=False)
+    init_blob = (
+        torch.load(args.init, map_location="cpu", weights_only=False)
+        if args.init is not None
+        else None
+    )
     cfg = lf.Config.from_checkpoint_dict(dict(trained_blob["cfg"]))
     if args.tokenizer is not None:
         cfg.tokenizer = args.tokenizer
+    requested_tokens = int(args.tokens)
+    if requested_tokens <= 0:
+        raise ValueError("tokens must be positive")
+    cfg.seq_len = requested_tokens
     cfg.grad_checkpointing = False
     cfg.device = None
     lf.apply_config(cfg)
@@ -768,7 +828,7 @@ def main():
     device = torch.device(args.device)
     if device.type != "cuda":
         raise ValueError("this audit currently requires CUDA autocast")
-    token_count = min(int(args.tokens), lf.SEQ_LEN)
+    token_count = requested_tokens
     raw_token_count = min(int(args.raw_tokens), token_count)
     window = int(cfg.tria_temporal_window)
     horizons = sorted({
@@ -790,11 +850,59 @@ def main():
         if 1 <= horizon <= token_count
     })
     raw_horizons = [horizon for horizon in horizons if horizon <= raw_token_count]
+    rope_attention_factor = (
+        float(cfg.rope_attention_factor)
+        if cfg.rope_attention_factor is not None
+        else float(lf._yarn_get_mscale(cfg.rope_factor))
+    )
+    rope_report = {
+        "original_seq_len": int(cfg.rope_original_seq_len),
+        "factor": float(cfg.rope_factor),
+        "attention_factor": rope_attention_factor,
+        "cache_seq_len": token_count,
+    }
     rows = build_rows(cfg, args.data, token_count, args.sequences)
     print(
         f"T={token_count} W={window} alpha={cfg.tria_carrier_alpha:g} "
-        f"sequences={len(rows)} horizons={horizons}"
+        f"sequences={len(rows)} horizons={horizons} "
+        f"rope_original={cfg.rope_original_seq_len} rope_factor={cfg.rope_factor:g}"
     )
+    if init_blob is None:
+        checkpoint_report, _, _, _ = analyze_checkpoint(
+            "checkpoint",
+            args.checkpoint,
+            trained_blob,
+            rows,
+            cfg,
+            device,
+            token_count,
+            raw_token_count,
+            horizons,
+            args.max_condition,
+            args.min_effective_rank,
+            args.population_pass,
+        )
+        report = {
+            "checkpoint": args.checkpoint,
+            "dataset": args.data,
+            "native_alpha": float(cfg.tria_carrier_alpha),
+            "window": window,
+            "tokens_analyzed": token_count,
+            "raw_tokens_analyzed": raw_token_count,
+            "sequences": len(rows),
+            "rope": rope_report,
+            "thresholds": {
+                "max_condition": args.max_condition,
+                "min_effective_rank": args.min_effective_rank,
+                "population_pass": args.population_pass,
+            },
+            "analysis": checkpoint_report,
+        }
+        output_path = Path(args.output)
+        output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print_single_summary("checkpoint", checkpoint_report, window, raw_horizons)
+        print(f"\nJSON saved to {output_path}")
+        return
     init_report, init_internal, init_operational_internal, _ = analyze_checkpoint(
         "init",
         args.init,
@@ -832,6 +940,7 @@ def main():
         "tokens_analyzed": token_count,
         "raw_tokens_analyzed": raw_token_count,
         "sequences": len(rows),
+        "rope": rope_report,
         "thresholds": {
             "max_condition": args.max_condition,
             "min_effective_rank": args.min_effective_rank,

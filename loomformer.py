@@ -2429,10 +2429,10 @@ class _BetaSpaceDirect(torch.autograd.Function):
         ext = _try_load_cuda_beta_space()
         if ext is None:
             raise RuntimeError("CUDA beta_space module is unavailable")
-        out, r_pack, w_contig = ext.beta_forward_cuda(
+        out, _r_pack, w_contig = ext.beta_forward_cuda(
             u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
-        ctx.save_for_backward(r_pack, w_contig)
+        ctx.save_for_backward(u, q_h, k_ctx_h, c_h, d_h, w_contig)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2],
                       w1_imag_compact.shape[0], w1_imag_compact.shape[1])
         ctx.meta = (hidden_per_q_head, head_dim, n_q_heads, open_sectors)
@@ -2443,11 +2443,11 @@ class _BetaSpaceDirect(torch.autograd.Function):
         ext = _try_load_cuda_beta_space()
         if ext is None:
             raise RuntimeError("CUDA beta_space module is unavailable")
-        r_pack, w_contig = ctx.saved_tensors
+        u, q_h, k_ctx_h, c_h, d_h, w_contig = ctx.saved_tensors
         B, T, N, HIDDEN, IMAG_IN = ctx.shapes
         hidden_per_q_head, head_dim, n_q_heads, open_sectors = ctx.meta
-        grads = ext.beta_backward_cuda(
-            grad_out, r_pack, w_contig, B, T, N, HIDDEN, IMAG_IN,
+        grads = ext.beta_backward_cuda_recompute(
+            grad_out, u, q_h, k_ctx_h, c_h, d_h, w_contig,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = grads
         QH, HD = n_q_heads, head_dim
@@ -2471,7 +2471,7 @@ class _ParaplexFused(torch.autograd.Function):
         core_ext = _try_load_cuda_paraplex()
         if beta_ext is None or core_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
-        beta, r_pack, w_contig = beta_ext.beta_forward_cuda(
+        beta, _r_pack, w_contig = beta_ext.beta_forward_cuda(
             u, q_h, k_h, c_h, d_h, w_imag,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         act, s, next_trace, anchor_snapshot = core_ext.paraplex_forward(
@@ -2480,7 +2480,7 @@ class _ParaplexFused(torch.autograd.Function):
         ctx.mark_non_differentiable(anchor_snapshot)
         ctx.save_for_backward(
             p_real, gate_src, beta, bias, trace, trace_w, reset, anchor_snapshot,
-            r_pack, w_contig)
+            u, q_h, k_h, c_h, d_h, w_contig)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2], w_imag.shape[0], w_imag.shape[1])
         ctx.meta = (
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
@@ -2494,7 +2494,8 @@ class _ParaplexFused(torch.autograd.Function):
         beta_ext = _try_load_cuda_beta_space()
         if core_ext is None or beta_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
-        p_real, gate_src, beta, bias, trace, trace_w, reset, anchor, r_pack, w_contig = ctx.saved_tensors
+        (p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
+         u, q_h, k_h, c_h, d_h, w_contig) = ctx.saved_tensors
         grad_act = torch.zeros_like(p_real) if grad_act is None else grad_act.to(dtype=p_real.dtype)
         grad_s = torch.zeros_like(p_real) if grad_s is None else grad_s.to(dtype=p_real.dtype)
         grad_next = torch.zeros_like(trace) if grad_next is None else grad_next.to(dtype=trace.dtype)
@@ -2503,8 +2504,8 @@ class _ParaplexFused(torch.autograd.Function):
             grad_act, grad_s, grad_next, p_real, gate_src, beta, bias, trace, trace_w,
             reset, anchor, mode, floor, near_eps, m)
         B, T, N_local, H_local, imag_in = ctx.shapes
-        grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_ext.beta_backward_cuda(
-            grad_beta, r_pack, w_contig, B, T, N_local, H_local, imag_in,
+        grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_ext.beta_backward_cuda_recompute(
+            grad_beta, u, q_h, k_h, c_h, d_h, w_contig,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         QH, HD = n_q_heads, head_dim
         return (
@@ -2532,7 +2533,7 @@ def beta_space_cuda(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
     if ext is None:
         return None
     if GRAPH_MODE_ENABLED and _graph_beta_space_op is not None:
-        out, _r_pack, _w_contig = _graph_beta_space_op(
+        out = _graph_beta_space_op(
             u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
         return out

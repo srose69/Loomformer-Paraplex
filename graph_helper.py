@@ -694,57 +694,38 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
         u: torch.Tensor, q_h: torch.Tensor, k_ctx_h: torch.Tensor,
         c_h: torch.Tensor, d_h: torch.Tensor, w1_imag_compact: torch.Tensor,
         hidden_per_q_head: int, head_dim: int, n_q_heads: int, open_sectors: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         module = _get_module()
-        out, r_pack, w_contig = module.beta_forward_cuda(
+        out, _r_pack, _w_contig = module.beta_forward_cuda(
             u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         )
-        # beta_forward_cuda's third return is w1_imag_compact.contiguous() --
-        # a no-op returning the SAME tensor whenever the input already is
-        # contiguous (the normal case for an nn.Parameter). torch.library
-        # custom_op enforces "no output aliases an input", which the old
-        # raw/non-graph path never had to satisfy; clone here (only on this
-        # path, only when it's actually the same storage -- never on the
-        # already-fast common case where a genuine copy is unavoidable
-        # anyway) rather than touching beta_forward_cuda itself and paying
-        # for it on the non-graph path too.
-        inputs = (u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact)
-        if any(w_contig.data_ptr() == inp.data_ptr() for inp in inputs):
-            w_contig = w_contig.clone()
-        if any(r_pack.data_ptr() == inp.data_ptr() for inp in inputs):
-            r_pack = r_pack.clone()
-        if any(out.data_ptr() == inp.data_ptr() for inp in inputs):
-            out = out.clone()
-        return out, r_pack, w_contig
+        return out
 
     @beta_space_op.register_fake
     def _beta_space_fake(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact, hidden_per_q_head, head_dim, n_q_heads, open_sectors):
         B, T = u.shape[0], u.shape[1]
-        hidden, imag_in = w1_imag_compact.shape
-        return (
-            torch.empty((B, T, hidden), dtype=u.dtype, device=u.device),
-            torch.empty((n_q_heads, B * T, imag_in), dtype=u.dtype, device=u.device),
-            torch.empty(w1_imag_compact.shape, dtype=u.dtype, device=u.device),
-        )
+        hidden = w1_imag_compact.shape[0]
+        return torch.empty((B, T, hidden), dtype=u.dtype, device=u.device)
 
     def _setup_context(ctx, inputs, output):
         u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact, hidden_per_q_head, head_dim, n_q_heads, open_sectors = inputs
-        out, r_pack, w_contig = output
-        ctx.save_for_backward(r_pack, w_contig)
+        ctx.save_for_backward(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact)
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2], w1_imag_compact.shape[0], w1_imag_compact.shape[1])
         ctx.meta = (hidden_per_q_head, head_dim, n_q_heads, open_sectors)
 
     @torch.library.custom_op("loomformer::beta_space_bwd", mutates_args=())
     def beta_space_bwd_op(
-        r_pack: torch.Tensor, w_contig: torch.Tensor, grad_out: torch.Tensor,
-        B: int, T: int, N: int, HIDDEN: int, IMAG_IN: int,
+        u: torch.Tensor, q_h: torch.Tensor, k_ctx_h: torch.Tensor,
+        c_h: torch.Tensor, d_h: torch.Tensor, w1_imag_compact: torch.Tensor,
+        grad_out: torch.Tensor,
         hidden_per_q_head: int, head_dim: int, n_q_heads: int, open_sectors: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = _get_module().beta_backward_cuda(
-            grad_out, r_pack, w_contig, B, T, N, HIDDEN, IMAG_IN,
+        grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = _get_module().beta_backward_cuda_recompute(
+            grad_out, u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         )
+        B, T = u.shape[:2]
         QH, HD = n_q_heads, head_dim
         return (
             grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
@@ -752,7 +733,8 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
         )
 
     @beta_space_bwd_op.register_fake
-    def _beta_space_bwd_fake(r_pack, w_contig, grad_out, B, T, N, HIDDEN, IMAG_IN, hidden_per_q_head, head_dim, n_q_heads, open_sectors):
+    def _beta_space_bwd_fake(u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact, grad_out, hidden_per_q_head, head_dim, n_q_heads, open_sectors):
+        B, T, N = u.shape
         q_shape = (B, T, n_q_heads, head_dim)
         return (
             torch.empty((B, T, N), dtype=grad_out.dtype, device=grad_out.device),
@@ -760,19 +742,15 @@ def _register_beta_space(lf_module, placeholder_args) -> None:
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
             torch.empty(q_shape, dtype=grad_out.dtype, device=grad_out.device),
-            torch.empty(w_contig.shape, dtype=grad_out.dtype, device=grad_out.device),
+            torch.empty(w1_imag_compact.shape, dtype=grad_out.dtype, device=grad_out.device),
         )
 
-    def _backward(ctx, grad_out, *_extra_grads):
-        # _extra_grads: grads w.r.t. r_pack/w_contig, the two non-public
-        # extra outputs -- always unused, same as every other kernel's
-        # internal-only extras here.
-        r_pack, w_contig = ctx.saved_tensors
-        B, T, N, HIDDEN, IMAG_IN = ctx.shapes
+    def _backward(ctx, grad_out):
+        u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact = ctx.saved_tensors
         hidden_per_q_head, head_dim, n_q_heads, open_sectors = ctx.meta
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_space_bwd_op(
-            r_pack, w_contig, grad_out.contiguous(),
-            B, T, N, HIDDEN, IMAG_IN, hidden_per_q_head, head_dim, n_q_heads, open_sectors,
+            u, q_h, k_ctx_h, c_h, d_h, w1_imag_compact, grad_out.contiguous(),
+            hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         )
         return grad_u, grad_q, grad_k, grad_c, grad_d, grad_w, None, None, None, None
 

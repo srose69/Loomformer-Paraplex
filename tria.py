@@ -1476,7 +1476,12 @@ def final_ca_sparse(
     allowed: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    if q.is_cuda and k.is_cuda and v.is_cuda and _tria_cuda_op_enabled("final_ca_sparse"):
+    cuda_shape_supported = 0 < k.shape[1] <= 256
+    if (
+        q.is_cuda and k.is_cuda and v.is_cuda
+        and cuda_shape_supported
+        and _tria_cuda_op_enabled("final_ca_sparse")
+    ):
         try:
             return _FinalCASparseFused.apply(q, k, v, allowed, float(scale))
         except RuntimeError as error:
@@ -1530,14 +1535,16 @@ class TriaFinalCrossAttention(nn.Module):
                 attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=m, dropout_p=0.0)
             attn_out = attn_out.squeeze(1)
         else:
-            q = self.w_qk(b)
-            k = self.w_qk(a)
-            v = self.w_v(a)
-            T = b.shape[1]
-            structural = torch.ones(T, T, dtype=torch.bool, device=b.device).tril().unsqueeze(0)
-            if mask is not None:
-                structural = structural & (mask.squeeze(1) if mask.dim() == 4 else mask)
-            attn_out = final_ca_sparse(q, k, v, structural & carry_key_mask[:, None, :], self.scale)
+            active_positions = carry_key_mask.any(dim=0).nonzero(as_tuple=False).flatten()
+            if active_positions.numel() == 0:
+                return b
+            return self.forward(
+                a.index_select(1, active_positions),
+                b,
+                mask,
+                carry_key_mask=carry_key_mask.index_select(1, active_positions),
+                key_positions=active_positions,
+            )
         gamma = self.gamma_max * torch.tanh(self.raw_gamma)
         return b + gamma * attn_out
 

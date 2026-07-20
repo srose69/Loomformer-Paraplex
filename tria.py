@@ -20,21 +20,33 @@ import torch.nn.functional as F
 # ============================================================================
 
 
+# a=r*i, b=r*o, c=i*o parameterize K=[[0,-c,b],[c,0,-a],[-b,a,0]]; M=(I+alpha*K)
+# @R_axis. a,b,c are jointly RMS-normalized before tanh (NOT independently
+# hard-clipped by a fixed abc_bound): rms=sqrt(mean(ri^2,ro^2,io^2)+eps), then
+# tanh(x/rms) per component. This makes the (a,b,c)-magnitude, and therefore
+# the condition-number bound kappa(M)<=sqrt(1+3*alpha^2), SCALE-INVARIANT --
+# it holds identically whether r,i,o sit at typical activation scale or at a
+# 100x-larger outlier, instead of only engaging once |r*i| etc. exceed a
+# fixed absolute bound. Replaces the earlier abc_bound=1.0 hard clip, which
+# killed the condition-number guarantee once |r|,|i|,|o| drifted upward over
+# long training runs (checkpoint-scale outliers still measured fine at any
+# single step, but the fixed bound stopped engaging early enough on long
+# ranges as activation scale grew).
 def build_tria_pytorch(
     r: torch.Tensor,
     i: torch.Tensor,
     o: torch.Tensor,
     alpha: Optional[float] = None,
     axis: int = 0,
-    abc_bound: float = 1.0,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     axis = _axis(axis)
-    a = abc_bound * torch.tanh((r * i) / abc_bound)
-    b = abc_bound * torch.tanh((r * o) / abc_bound)
-    c = abc_bound * torch.tanh((i * o) / abc_bound)
+    x = torch.stack((r * i, r * o, i * o), dim=-1)
+    rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    x = torch.tanh(x / rms)
     q = float(_TRIA_CARRIER_ALPHA if alpha is None else alpha)
-    aa, bb, cc = a * q, b * q, c * q
-    one = torch.ones_like(a)
+    aa, bb, cc = q * x[..., 0], q * x[..., 1], q * x[..., 2]
+    one = torch.ones_like(aa)
     neg_one = -one
     if axis == 0:  # (I+qK) @ Rz(+90)
         rows = (
@@ -1604,18 +1616,16 @@ class TriaCACache:
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    print("=== 1. build_tria: exact full-rank carrier formulas (with abc_bound tanh) ===")
+    print("=== 1. build_tria: exact full-rank carrier formulas (with joint-RMS tanh) ===")
     B, T, H = 2, 3, 4
     r = torch.randn(B, T, H)
     i = torch.randn(B, T, H)
     o = torch.randn(B, T, H)
     q = carrier_alpha()
-    abc_bound = 1.0
+    eps = 1e-6
     a_raw, b_raw, c_raw = r * i, r * o, i * o
-    a_b = abc_bound * torch.tanh(a_raw / abc_bound)
-    b_b = abc_bound * torch.tanh(b_raw / abc_bound)
-    c_b = abc_bound * torch.tanh(c_raw / abc_bound)
-    a, b, c = q * a_b, q * b_b, q * c_b
+    rms_ref = torch.sqrt((a_raw.square() + b_raw.square() + c_raw.square()) / 3.0 + eps)
+    a, b, c = q * torch.tanh(a_raw / rms_ref), q * torch.tanh(b_raw / rms_ref), q * torch.tanh(c_raw / rms_ref)
     one = torch.ones_like(a)
     expected = (
         torch.stack((torch.stack((-c, -one, b), -1),
@@ -1874,45 +1884,49 @@ if __name__ == "__main__":
     print(f"OK: raw_gamma_init=0.0 -> still exact identity (backward compat); "
           f"raw_gamma_init=0.5 -> real, immediate gamma={gamma_val:.4f} effect, not identity.")
 
-    print("\n=== N. build_tria: abc_bound keeps single-step condition bounded even at real-checkpoint-scale outliers ===")
+    print("\n=== N. build_tria: joint-RMS tanh keeps single-step condition bounded even at real-checkpoint-scale outliers ===")
     # exact reproduction of what a real 32,500-step checkpoint showed: |o| up
     # to hundreds in outlier neurons/positions (b=r*o reaching 512 was
-    # directly measured). Without the bound this gives local condition~13;
+    # directly measured). Without any bound this gives local condition~13;
     # with it, the GPT-derived guarantee kappa<=sqrt(1+3*alpha^2) must hold
     # exactly, regardless of how extreme r,i,o get.
     alpha_real = 0.025
     r_extreme = torch.tensor([100.0])
     i_extreme = torch.tensor([100.0])
     o_extreme = torch.tensor([512.0])  # the actual measured outlier magnitude
-    m_extreme = build_tria_pytorch(r_extreme, i_extreme, o_extreme, axis=0)
+    m_extreme = build_tria_pytorch(r_extreme, i_extreme, o_extreme, alpha=alpha_real, axis=0)
     sv_extreme = torch.linalg.svdvals(m_extreme)
     cond_extreme = (sv_extreme[..., 0] / sv_extreme[..., -1].clamp_min(1e-12)).item()
     theoretical_max = (1 + 3 * alpha_real ** 2) ** 0.5
     print(f"condition number at real-checkpoint-scale outlier (r=i=100, o=512): {cond_extreme:.6f}")
     print(f"GPT-derived reference bound sqrt(1+3*alpha^2) at alpha={alpha_real}: {theoretical_max:.6f}")
-    # The measured value (1.0037) runs slightly above the simplified reference
-    # formula (1.00094) -- likely a detail in how R_axis composes with the
-    # skew part that the simplified derivation didn't fully capture. Not
-    # chasing that discrepancy here: what matters for the actual fix is that
-    # condition stays near-identity regardless of extreme r,i,o, which it
-    # does -- compare to ~13 measured on the SAME (r=i=100,o=512) inputs
-    # without the bound (unbounded a,b,c reach the thousands).
     safe_bound = 1.05
     assert cond_extreme <= safe_bound, \
-        f"abc_bound failed to keep condition near-identity: {cond_extreme} > {safe_bound}"
+        f"joint-RMS tanh failed to keep condition near-identity: {cond_extreme} > {safe_bound}"
     print(f"OK: condition number stays near-identity ({cond_extreme:.4f} <= {safe_bound}) even at the exact "
           f"outlier magnitude that broke calibration's 90%-population stability guarantee at t=8/128 "
-          f"on the real checkpoint -- vs ~13 for the same inputs without this bound.")
+          f"on the real checkpoint -- vs ~13 for the same inputs with no bound at all.")
 
-    # near-identity check: small, well-behaved r,i,o should barely be affected
-    r_small = torch.randn(100) * 0.3
-    i_small = torch.randn(100) * 0.3
-    o_small = torch.randn(100) * 0.3
-    a_raw_small = r_small * i_small
-    a_bounded_small = torch.tanh(a_raw_small)
-    max_distortion = (a_raw_small - a_bounded_small).abs().max().item()
-    print(f"max distortion from tanh at small (well-behaved) scale: {max_distortion:.6f}")
-    assert max_distortion < 0.05, "abc_bound should barely affect small, well-behaved values"
-    print("OK: near-identity for realistic small-scale activations, bound only engages at outliers.")
+    # scale-invariance check: unlike the old fixed abc_bound (near-identity at
+    # small scale, only engaging once |r*i| etc. crossed a hard threshold --
+    # which is exactly what let the bound stop engaging early enough as
+    # activation scale drifted upward over a long training run), the
+    # joint-RMS normalization is self-referential: it should produce the
+    # SAME condition number whether r,i,o sit at typical scale or 100x larger,
+    # as long as their RELATIVE proportions are unchanged.
+    # (kept well above the eps=1e-6 floor at "small" scale -- at scale s,
+    # ri~s^2 so ri^2~s^4 must stay >> eps for the ratio to be eps-free; 0.5
+    # gives ri^2~0.06, comfortably above 1e-6)
+    r_dir = torch.randn(50)
+    i_dir = torch.randn(50)
+    o_dir = torch.randn(50)
+    cond_small = torch.linalg.svdvals(build_tria_pytorch(r_dir * 0.5, i_dir * 0.5, o_dir * 0.5, alpha=alpha_real, axis=0))
+    cond_large = torch.linalg.svdvals(build_tria_pytorch(r_dir * 500.0, i_dir * 500.0, o_dir * 500.0, alpha=alpha_real, axis=0))
+    cond_small = cond_small[..., 0] / cond_small[..., -1].clamp_min(1e-12)
+    cond_large = cond_large[..., 0] / cond_large[..., -1].clamp_min(1e-12)
+    max_scale_delta = (cond_small - cond_large).abs().max().item()
+    print(f"max |condition(0.5x) - condition(500x)| over same directions: {max_scale_delta:.6f}")
+    assert max_scale_delta < 1e-3, "joint-RMS tanh should be scale-invariant across a 1000x range"
+    print("OK: condition-number bound is scale-invariant (same r,i,o direction, 1000x scale range).")
 
     print("\nALL TRIA SELF-TESTS PASSED.")

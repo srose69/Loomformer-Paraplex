@@ -13,7 +13,7 @@
 // then tanh(x/rms) per component, BEFORE alpha scaling -- ADDED after a real
 // 32,500-step checkpoint showed |o| growing from 0.51 at init to 1.25
 // post-training, with |r*o| reaching 512 in outlier neurons/positions.
-// maxabs-normalizing the accumulated carry afterward does NOT fix this: it
+// normalizing the accumulated carry afterward does NOT fix this: it
 // only rescales the whole matrix by a scalar, which leaves every singular-
 // value RATIO (the condition number) exactly unchanged (verified
 // numerically). Weight decay does not fix it either -- r/i/o are FFN
@@ -105,6 +105,34 @@ __device__ __forceinline__ float tria_absmax9(const float v[9]) {
     return amax;
 }
 
+// Smooth carry normalization. RMS is differentiable in all entries and avoids
+// max-abs's systematic tie at the structural +/-1 entries. It remains
+// positively homogeneous (rms(c*v)=|c|*rms(v)), so the O(1) reverse trick in
+// tria_reverse_prev9 still works.
+__device__ __forceinline__ float tria_rms9(const float v[9], float eps = 1e-6f) {
+    float sumsq = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 9; ++k) sumsq += v[k] * v[k];
+    return sqrtf(sumsq * (1.0f / 9.0f) + eps);
+}
+
+// d(carry_k)/d(pre_j) = delta_kj/rms - pre_k*pre_j/(9*rms^3) (same derivation
+// pattern as tria_carrier_grad_abc's joint-RMS Jacobian), collapsing via
+// dot=sum_k(grad_out_k*pre_k) to:
+//   dL/dpre_j = grad_out_j/rms - pre_j*dot/(9*rms^3)
+// No tie-detection branch needed -- unlike tria_maxabs_backward9, this is the
+// exact analytic gradient everywhere, not a subgradient convention.
+__device__ __forceinline__ void tria_rms_backward9(
+    const float grad_out[9], const float pre[9], float rms, float grad_pre[9]) {
+    float dot = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 9; ++k) dot += grad_out[k] * pre[k];
+    const float inv_rms = 1.0f / rms;
+    const float cross = dot / (9.0f * rms * rms * rms);
+    #pragma unroll
+    for (int k = 0; k < 9; ++k) grad_pre[k] = grad_out[k] * inv_rms - pre[k] * cross;
+}
+
 __device__ __forceinline__ void tria_matmul9(
     const float a[9], const float b[9], float out[9]) {
     #pragma unroll
@@ -160,11 +188,11 @@ __device__ __forceinline__ void tria_invert9(const float m[9], float inv[9]) {
 }
 
 // O(1) analytic reverse of the depth/temporal recurrence: given the local
-// factor `local` and the maxabs-normalized post-step state `cur`
-// (cur=pre/s, pre=local@prev, s=max|pre|), recover the maxabs-normalized
+// factor `local` and the RMS-normalized post-step state `cur`
+// (cur=pre/s, pre=local@prev, s=rms(pre)), recover the RMS-normalized
 // pre-step state `prev`. The unknown scale s cancels exactly: prev_raw =
 // local^-1 @ (cur*s) = s*(local^-1@cur), and renormalizing prev_raw by its
-// own max-abs reproduces prev regardless of s -- so s never needs to be
+// own RMS reproduces prev regardless of s -- so s never needs to be
 // computed. Used by temporal_carry_endpoint's backward instead of storing
 // the whole [B,T,H,3,3] forward trajectory.
 __device__ __forceinline__ void tria_reverse_prev9(
@@ -172,7 +200,7 @@ __device__ __forceinline__ void tria_reverse_prev9(
     float inv[9], raw[9];
     tria_invert9(local, inv);
     tria_matmul9(inv, cur, raw);
-    const float s = fmaxf(tria_absmax9(raw), 1.0e-6f);
+    const float s = tria_rms9(raw);
     const float invs = 1.0f / s;
     #pragma unroll
     for (int k = 0; k < 9; ++k) prev[k] = raw[k] * invs;

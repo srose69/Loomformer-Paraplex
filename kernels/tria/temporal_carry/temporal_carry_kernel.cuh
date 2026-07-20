@@ -35,7 +35,7 @@ __global__ void temporal_carry_forward_kernel(
         } else {
             tria_matmul9(local,acc,pre);
         }
-        const float scale=fmaxf(tria_absmax9(pre),1.0e-6f);
+        const float scale=tria_rms9(pre);
         const float inv=1.0f/scale;
         #pragma unroll
         for(int k=0;k<9;++k) acc[k]=pre[k]*inv;
@@ -73,7 +73,7 @@ __global__ void temporal_carry_backward_kernel(
         if(reset){
             #pragma unroll
             for(int k=0;k<9;++k) pre[k]=local[k];
-            tria_maxabs_backward9(gy,pre,scale[sbase+t*sstep],gpre);
+            tria_rms_backward9(gy,pre,scale[sbase+t*sstep],gpre);
             #pragma unroll
             for(int k=0;k<9;++k){
                 tc_store(grad_depth_carry+off+k,gpre[k]);
@@ -84,7 +84,7 @@ __global__ void temporal_carry_backward_kernel(
             #pragma unroll
             for(int k=0;k<9;++k) prev[k]=document_carry[(off-step)+k];
             tria_matmul9(local,prev,pre);
-            tria_maxabs_backward9(gy,pre,scale[sbase+t*sstep],gpre);
+            tria_rms_backward9(gy,pre,scale[sbase+t*sstep],gpre);
             tria_matmul_right_transpose9(gpre,prev,glocal);
             tria_matmul_left_transpose9(local,gpre,gprev);
             #pragma unroll

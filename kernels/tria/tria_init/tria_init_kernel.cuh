@@ -10,7 +10,7 @@ __global__ void tria_init_forward_kernel(
     if (idx >= n) return;
     float vals[9];
     tria_carrier_build9((float)r[idx], (float)i_[idx], (float)o[idx], alpha, axis, vals);
-    const float scale = fmaxf(tria_absmax9(vals), 1.0e-6f);
+    const float scale = tria_rms9(vals);
     const float inv = 1.0f / scale;
     scalar_t* out = carry_1 + idx * 9;
     #pragma unroll
@@ -33,7 +33,7 @@ __global__ void tria_init_backward_kernel(
     const scalar_t* g = grad_carry_1 + idx * 9;
     #pragma unroll
     for (int k=0;k<9;++k) gout[k]=(float)g[k];
-    tria_maxabs_backward9(gout, vals, scale[idx], gm);
+    tria_rms_backward9(gout, vals, scale[idx], gm);
     float da,db,dc;
     tria_carrier_grad_abc(gm, alpha, axis, rv, iv, ov, da, db, dc);
     grad_r[idx]=(scalar_t)(da*iv + db*ov);

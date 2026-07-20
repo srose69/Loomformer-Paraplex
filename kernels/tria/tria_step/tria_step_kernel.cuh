@@ -13,7 +13,7 @@ __global__ void tria_step_forward_kernel(
     #pragma unroll
     for(int k=0;k<9;++k) cp[k]=(float)carry_prev[idx*9+k];
     tria_matmul9(m,cp,pre);
-    const float scale=fmaxf(tria_absmax9(pre),1.0e-6f),inv=1.0f/scale;
+    const float scale=tria_rms9(pre),inv=1.0f/scale;
     scalar_t* out=carry_new+idx*9;
     #pragma unroll
     for(int k=0;k<9;++k) out[k]=(scalar_t)(pre[k]*inv);
@@ -35,7 +35,7 @@ __global__ void tria_step_backward_kernel(
     #pragma unroll
     for(int k=0;k<9;++k){ cp[k]=(float)carry_prev[idx*9+k]; gout[k]=(float)grad_carry_new[idx*9+k]; }
     tria_matmul9(m,cp,pre);
-    tria_maxabs_backward9(gout,pre,scale[idx],gpre);
+    tria_rms_backward9(gout,pre,scale[idx],gpre);
     tria_matmul_right_transpose9(gpre,cp,gm);  // dM = dpre @ cp^T
     tria_matmul_left_transpose9(m,gpre,gcp);   // dcp = M^T @ dpre
     float da,db,dc; tria_carrier_grad_abc(gm,alpha,axis,rv,iv,ov,da,db,dc);
@@ -69,8 +69,8 @@ __global__ void tria_step_reverse_backward_kernel(
     for(int k=0;k<9;++k){ cur[k]=(float)current[idx*9+k]; gout[k]=(float)grad_carry_new[idx*9+k]; }
     tria_reverse_prev9(m,cur,prev);
     tria_matmul9(m,prev,pre);
-    const float scale=fmaxf(tria_absmax9(pre),1.0e-6f);
-    tria_maxabs_backward9(gout,pre,scale,gpre);
+    const float scale=tria_rms9(pre);
+    tria_rms_backward9(gout,pre,scale,gpre);
     tria_matmul_right_transpose9(gpre,prev,gm);  // dM = dpre @ prev^T
     tria_matmul_left_transpose9(m,gpre,gprev);   // dprev = M^T @ dpre
     float da,db,dc; tria_carrier_grad_abc(gm,alpha,axis,rv,iv,ov,da,db,dc);

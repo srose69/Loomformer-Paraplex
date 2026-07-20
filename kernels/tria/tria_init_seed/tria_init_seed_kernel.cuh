@@ -32,7 +32,7 @@ __global__ void tria_init_seed_forward_kernel(
         #pragma unroll
         for (int k = 0; k < 9; ++k) pre[k] = m[k];
     }
-    const float scale = fmaxf(tria_absmax9(pre), 1.0e-6f);
+    const float scale = tria_rms9(pre);
     const float inv = 1.0f / scale;
     scalar_t* out = carry_out == nullptr ? nullptr : (carry_out + idx * 9);
     #pragma unroll
@@ -69,7 +69,7 @@ __global__ void tria_init_seed_backward_kernel(
         float seed_vals[9], gseed[9];
         tria_seed_load9(seed, (b * H + h) * 9, seed_vals);
         tria_matmul9(m, seed_vals, pre);
-        tria_maxabs_backward9(gout, pre, scale[idx], gpre);
+        tria_rms_backward9(gout, pre, scale[idx], gpre);
         tria_matmul_right_transpose9(gpre, seed_vals, gm);
         tria_matmul_left_transpose9(m, gpre, gseed);
         scalar_t* gs = grad_seed + (b * H + h) * 9;
@@ -78,7 +78,7 @@ __global__ void tria_init_seed_backward_kernel(
     } else {
         #pragma unroll
         for (int k = 0; k < 9; ++k) pre[k] = m[k];
-        tria_maxabs_backward9(gout, pre, scale[idx], gm);
+        tria_rms_backward9(gout, pre, scale[idx], gm);
     }
     float da, db, dc;
     tria_carrier_grad_abc(gm, alpha, axis, rv, iv, ov, da, db, dc);
@@ -111,7 +111,7 @@ __global__ void tria_init_seed_gate_forward_kernel(
         #pragma unroll
         for (int k = 0; k < 9; ++k) pre[k] = m[k];
     }
-    const float scale = fmaxf(tria_absmax9(pre), 1.0e-6f);
+    const float scale = tria_rms9(pre);
     const float inv = 1.0f / scale;
     scalar_t* out = carry_out == nullptr ? nullptr : (carry_out + idx * 9);
     float p = 0.0f;
@@ -158,7 +158,7 @@ __global__ void tria_init_seed_gate_backward_kernel(
                 gout[k] = (float)g[k] + gp * (float)w[k];
                 local_w[k] = gp * pre[k] * inv;
             }
-            tria_maxabs_backward9(gout, pre, scale[idx], gpre);
+            tria_rms_backward9(gout, pre, scale[idx], gpre);
             tria_matmul_right_transpose9(gpre, seed_vals, gm);
             tria_matmul_left_transpose9(m, gpre, gseed);
             scalar_t* gs = grad_seed + (b * H + h) * 9;
@@ -173,7 +173,7 @@ __global__ void tria_init_seed_gate_backward_kernel(
                 gout[k] = (float)g[k] + gp * (float)w[k];
                 local_w[k] = gp * pre[k] * inv;
             }
-            tria_maxabs_backward9(gout, pre, scale[idx], gm);
+            tria_rms_backward9(gout, pre, scale[idx], gm);
         }
         float da, db, dc;
         tria_carrier_grad_abc(gm, alpha, axis, rv, iv, ov, da, db, dc);

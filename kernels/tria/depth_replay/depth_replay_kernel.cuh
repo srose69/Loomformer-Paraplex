@@ -6,7 +6,7 @@
 template <typename scalar_t>
 __device__ __forceinline__ void depth_replay_quantize9(
     const float pre[9], float state[9]) {
-    const float scale = fmaxf(tria_absmax9(pre), 1.0e-6f);
+    const float scale = tria_rms9(pre);
     const float inv = 1.0f / scale;
     #pragma unroll
     for (int k = 0; k < 9; ++k) {
@@ -87,7 +87,7 @@ __global__ void depth_replay_backward_kernel(
         float m[9], pre[9], gout[9], gpre[9], gm[9], gprev[9];
         tria_carrier_build9(rv, iv, ov, alpha, axis, m);
         tria_matmul9(m, previous, pre);
-        const float scale = fmaxf(tria_absmax9(pre), 1.0e-6f);
+        const float scale = tria_rms9(pre);
         const float inv = 1.0f / scale;
         const float gp = GATED ? (float)grad_p[idx] : 0.0f;
         #pragma unroll
@@ -97,7 +97,7 @@ __global__ void depth_replay_backward_kernel(
                 (GATED ? gp * (float)w[k] : 0.0f);
             if (GATED) local_w[k] = gp * (float)stored;
         }
-        tria_maxabs_backward9(gout, pre, scale, gpre);
+        tria_rms_backward9(gout, pre, scale, gpre);
         tria_matmul_right_transpose9(gpre, previous, gm);
         tria_matmul_left_transpose9(m, gpre, gprev);
         float da, db, dc;

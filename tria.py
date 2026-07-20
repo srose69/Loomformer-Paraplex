@@ -75,9 +75,9 @@ def build_tria_pytorch(
 
 
 def _local_normalize(m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Max-absolute-normalize each matrix over its final two dimensions."""
+    """RMS-normalize each matrix over its final two dimensions."""
     work = m.float() if m.dtype in (torch.float16, torch.bfloat16) else m
-    scale = work.abs().amax(dim=(-1, -2), keepdim=True).clamp_min(eps)
+    scale = torch.sqrt(work.square().mean(dim=(-1, -2), keepdim=True) + eps)
     normalized = work / scale
     return normalized.to(m.dtype) if normalized.dtype != m.dtype else normalized
 
@@ -246,7 +246,7 @@ def _warn_cuda_fallback(name: str, error: BaseException) -> None:
 
 # One thread per (b,t,h) 3x3 block. Everything lives in registers: the 6 real
 # multiplies to build Tria_L, the 9-element (3x3 @ 3x3) matmul against
-# carry_prev, the maxabs reduction over exactly those 9 elements, and the
+# carry_prev, the RMS reduction over exactly those 9 elements, and the
 # final scale -- no shared memory, no global-memory round-trip for the
 # intermediate Tria_L or the pre-normalize matmul result. This is exactly the
 # "9 transient register values are fine, don't persist 6/9 as state" design
@@ -1059,13 +1059,14 @@ def temporal_carry_pytorch(
         depth_carry = depth_carry.float()
     T = depth_carry.shape[1]
     # The segmented matrix-only reference is associative for the normal path where
-    # local maxabs normalization is a positive rescale. If a raw local matrix is
-    # below eps, clamp makes `normalize(L_t @ Aprev)` depend on the pre-rescale
-    # magnitude, which a normalized single scan element no longer carries.
+    # local RMS normalization is effectively a positive rescale. If a raw local
+    # matrix is below the eps-dominated RMS floor, `normalize(L_t @ Aprev)` depends
+    # on the pre-rescale magnitude, which a normalized single scan element no
+    # longer carries.
     # Preserve the canonical CUDA/sequential contract exactly for that rare
     # branch instead of returning a mathematically different Hillis-Steele value.
-    local_max = depth_carry.abs().amax(dim=(-1, -2))
-    if bool((local_max < eps).any().item()):
+    local_rms = torch.sqrt(depth_carry.square().mean(dim=(-1, -2)))
+    if bool((local_rms < math.sqrt(eps)).any().item()):
         return temporal_carry_reference(depth_carry, reset_mask, eps=eps)
     matrix = _local_normalize(depth_carry, eps)
     flags = reset_mask.to(device=depth_carry.device, dtype=torch.bool).clone()
@@ -1649,20 +1650,20 @@ if __name__ == "__main__":
         assert bool((torch.linalg.matrix_rank(base.float()) == 3).all())
     print("OK: all three cyclic carrier axes match the closed form and stay full-rank at zero signal.")
 
-    print("\n=== 2. carry chain: per-(B,T,H) normalize, NOT global ===")
+    print("\n=== 2. carry chain: per-(B,T,H) RMS-normalize, NOT global ===")
     # replicate the exact bug found during spec review: build a batch where
     # different H slices have wildly different natural scales, and confirm
-    # EVERY slice ends up at max|.|=1.0 independently.
+    # EVERY slice ends up at rms=1.0 independently.
     B, T, H = 4, 8, 3
     scale_per_h = torch.tensor([1.0, 5.0, 20.0])
     r = torch.randn(B, T, H) * scale_per_h
     i = torch.randn(B, T, H) * scale_per_h
     o = torch.randn(B, T, H) * scale_per_h
     carry = tria_init(r, i, o)
-    per_h_max = carry.abs().amax(dim=(0, 1, 3, 4))
-    print("max|carry| per h-slice:", per_h_max.tolist())
-    assert torch.allclose(per_h_max, torch.ones(H), atol=1e-5), "per-slice normalize broken"
-    print("OK: every (B,T,H) slice independently hits max|carry|=1.0, "
+    per_h_rms = torch.sqrt(carry.square().mean(dim=(0, 1, 3, 4)))
+    print("rms(carry) per h-slice:", per_h_rms.tolist())
+    assert torch.allclose(per_h_rms, torch.ones(H), atol=1e-5), "per-slice RMS normalize broken"
+    print("OK: every (B,T,H) slice independently hits rms(carry)=1.0, "
           "regardless of that slice's raw input scale.")
 
     print("\n=== 3. explosion without normalize vs stability with it ===")
@@ -1670,17 +1671,17 @@ if __name__ == "__main__":
         carry = tria_init(torch.randn(1, 1, 1) * test_scale,
                            torch.randn(1, 1, 1) * test_scale,
                            torch.randn(1, 1, 1) * test_scale)
-        maxes = [carry.abs().amax().item()]
+        rmses = [torch.sqrt(carry.square().mean()).item()]
         for _ in range(50):
             r_l = torch.randn(1, 1, 1) * test_scale
             i_l = torch.randn(1, 1, 1) * test_scale
             o_l = torch.randn(1, 1, 1) * test_scale
             carry = tria_step(r_l, i_l, o_l, carry)
-            maxes.append(carry.abs().amax().item())
-        print(f"scale={test_scale:5.1f}: max|carry| layer0={maxes[0]:.4f} "
-              f"layer10={maxes[10]:.4f} layer25={maxes[25]:.4f} layer50={maxes[50]:.4f}")
-        assert all(abs(m - 1.0) < 1e-4 for m in maxes), f"unstable at scale={test_scale}"
-    print("OK: max|carry|=1.0 held exactly at every layer, every tested scale, "
+            rmses.append(torch.sqrt(carry.square().mean()).item())
+        print(f"scale={test_scale:5.1f}: rms(carry) layer0={rmses[0]:.4f} "
+              f"layer10={rmses[10]:.4f} layer25={rmses[25]:.4f} layer50={rmses[50]:.4f}")
+        assert all(abs(m - 1.0) < 1e-4 for m in rmses), f"unstable at scale={test_scale}"
+    print("OK: rms(carry)=1.0 held exactly at every layer, every tested scale, "
           "including scales matching |beta|~15-27 observed elsewhere in this project.")
 
     print("\n=== 4. gradient flows through both build_tria and the carry chain ===")

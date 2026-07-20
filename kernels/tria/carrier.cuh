@@ -8,8 +8,9 @@
 // z/x/y for axis 0/1/2. Everything is float so half/bfloat inputs accumulate
 // in FP32; callers cast only final stored values.
 //
-// abc_bound: a,b,c are soft-clipped to [-abc_bound,abc_bound] via
-// abc_bound*tanh(x/abc_bound) BEFORE alpha scaling -- ADDED after a real
+// a,b,c are JOINTLY RMS-normalized before tanh (NOT independently
+// hard-clipped by a fixed abc_bound): rms=sqrt(mean(ri^2,ro^2,io^2)+eps),
+// then tanh(x/rms) per component, BEFORE alpha scaling -- ADDED after a real
 // 32,500-step checkpoint showed |o| growing from 0.51 at init to 1.25
 // post-training, with |r*o| reaching 512 in outlier neurons/positions.
 // maxabs-normalizing the accumulated carry afterward does NOT fix this: it
@@ -20,19 +21,23 @@
 // magnitude on Tria's behalf. This makes the "a,b,c stay small" assumption
 // (that the single-factor stability bound kappa(M)<=sqrt(1+3*alpha^2)
 // relies on) a structural guarantee instead of something training can
-// silently violate. abc_bound=1.0f is the default, matching the PyTorch
-// reference (tria.py's build_tria_pytorch) exactly; verified end-to-end on
-// the real checkpoint: calibration's 90%-population stable_horizon went
-// from 9/128 (broken) to 128/128 (full window) with this bound in place,
-// while real held-out perplexity moved by <0.001 nats (negligible) --
-// the bound only engages for rare outliers, near-identity everywhere else.
+// silently violate. The earlier fixed abc_bound=1.0f clip was near-identity
+// at typical activation scale and only engaged once |r*i| etc. crossed the
+// absolute threshold -- which stopped catching outliers once activation
+// scale itself drifted upward over a long training run. The joint-RMS form
+// is self-referential/scale-invariant instead: it bounds a,b,c relative to
+// EACH OTHER, not to a fixed constant, so the guarantee holds identically at
+// any activation scale. eps=1e-6f is the default, matching the PyTorch
+// reference (tria.py's build_tria_pytorch) exactly.
 //
 __device__ __forceinline__ void tria_carrier_build9(
     float r, float i, float o, float alpha, int axis, float m[9],
-    float abc_bound = 1.0f) {
-    const float a = alpha * abc_bound * tanhf((r * i) / abc_bound);
-    const float b = alpha * abc_bound * tanhf((r * o) / abc_bound);
-    const float c = alpha * abc_bound * tanhf((i * o) / abc_bound);
+    float eps = 1e-6f) {
+    const float x0 = r * i, x1 = r * o, x2 = i * o;
+    const float rms = sqrtf((x0 * x0 + x1 * x1 + x2 * x2) * (1.0f / 3.0f) + eps);
+    const float a = alpha * tanhf(x0 / rms);
+    const float b = alpha * tanhf(x1 / rms);
+    const float c = alpha * tanhf(x2 / rms);
     if (axis == 0) {              // @ Rz(+90)
         m[0] = -c; m[1] = -1.0f; m[2] =  b;
         m[3] = 1.0f; m[4] = -c;  m[5] = -a;
@@ -48,45 +53,49 @@ __device__ __forceinline__ void tria_carrier_build9(
     }
 }
 
-// d(abc_bound*tanh(x/abc_bound))/dx = 1 - tanh(x/abc_bound)^2, evaluated at
-// each of the three raw products. Backward needs this extra chain-rule
-// factor now that a,b,c are no longer linear in r,i,o.
-__device__ __forceinline__ void tria_carrier_tanh_derivs(
-    float r, float i, float o, float abc_bound,
-    float& d_a_raw, float& d_b_raw, float& d_c_raw) {
-    const float ta = tanhf((r * i) / abc_bound);
-    const float tb = tanhf((r * o) / abc_bound);
-    const float tc = tanhf((i * o) / abc_bound);
-    d_a_raw = 1.0f - ta * ta;
-    d_b_raw = 1.0f - tb * tb;
-    d_c_raw = 1.0f - tc * tc;
-}
-
-// Chain dL/dM -> dL/d(ri,ro,io). alpha is already included here. r,i,o are
-// now needed (not just gm) to chain through the abc_bound tanh -- pass the
-// SAME r,i,o used to build the forward matrix this gradient corresponds to.
+// Chain dL/dM -> dL/d(ri,ro,io) through the joint-RMS tanh. Unlike the old
+// per-component abc_bound clip, rms=sqrt(mean(x0^2,x1^2,x2^2)+eps) depends on
+// ALL THREE of x=(ri,ro,io), so the Jacobian d(a,b,c)/d(ri,ro,io) is no
+// longer diagonal -- each output channel's tanh derivative couples back into
+// every input through rms. Let u_k=x_k/rms, W_k=alpha*G_k*(1-tanh(u_k)^2)
+// where G_k=dL/d(a,b,c)_k (the plain gm linear-combo below, alpha NOT yet
+// applied). Differentiating u_k=x_k/rms gives
+// du_k/dx_j = delta_kj/rms - x_k*x_j/(3*rms^3), which collapses via
+// dot=sum_k(W_k*x_k) to the compact form used below:
+//   dL/dx_j = W_j/rms - x_j*dot/(3*rms^3)
+// r,i,o are needed (not just gm) to rebuild rms and u_k -- pass the SAME
+// r,i,o used to build the forward matrix this gradient corresponds to.
 __device__ __forceinline__ void tria_carrier_grad_abc(
     const float gm[9], float alpha, int axis,
     float r, float i, float o,
-    float& d_a, float& d_b, float& d_c, float abc_bound = 1.0f) {
+    float& d_ri, float& d_ro, float& d_io, float eps = 1e-6f) {
+    float ga, gb, gc;  // dL/d(a,b,c), alpha NOT yet applied
     if (axis == 0) {
-        d_a = alpha * (-gm[5] + gm[6]);
-        d_b = alpha * ( gm[2] + gm[7]);
-        d_c = alpha * (-gm[0] - gm[4]);
+        ga = -gm[5] + gm[6];
+        gb =  gm[2] + gm[7];
+        gc = -gm[0] - gm[4];
     } else if (axis == 1) {
-        d_a = alpha * (-gm[4] - gm[8]);
-        d_b = alpha * ( gm[1] - gm[6]);
-        d_c = alpha * ( gm[2] + gm[3]);
+        ga = -gm[4] - gm[8];
+        gb =  gm[1] - gm[6];
+        gc =  gm[2] + gm[3];
     } else {
-        d_a = alpha * ( gm[3] + gm[7]);
-        d_b = alpha * (-gm[0] - gm[8]);
-        d_c = alpha * (-gm[1] + gm[5]);
+        ga =  gm[3] + gm[7];
+        gb = -gm[0] - gm[8];
+        gc = -gm[1] + gm[5];
     }
-    float dt_a, dt_b, dt_c;
-    tria_carrier_tanh_derivs(r, i, o, abc_bound, dt_a, dt_b, dt_c);
-    d_a *= dt_a;
-    d_b *= dt_b;
-    d_c *= dt_c;
+    const float x0 = r * i, x1 = r * o, x2 = i * o;
+    const float rms2 = (x0 * x0 + x1 * x1 + x2 * x2) * (1.0f / 3.0f) + eps;
+    const float rms = sqrtf(rms2);
+    const float t0 = tanhf(x0 / rms), t1 = tanhf(x1 / rms), t2 = tanhf(x2 / rms);
+    const float w0 = alpha * ga * (1.0f - t0 * t0);
+    const float w1 = alpha * gb * (1.0f - t1 * t1);
+    const float w2 = alpha * gc * (1.0f - t2 * t2);
+    const float dot = w0 * x0 + w1 * x1 + w2 * x2;
+    const float inv_rms = 1.0f / rms;
+    const float cross = dot / (3.0f * rms2 * rms);
+    d_ri = w0 * inv_rms - x0 * cross;
+    d_ro = w1 * inv_rms - x1 * cross;
+    d_io = w2 * inv_rms - x2 * cross;
 }
 
 __device__ __forceinline__ float tria_absmax9(const float v[9]) {

@@ -730,6 +730,20 @@ def should_replay_resume_data(
     return False, f"train_dataset changed ({saved_dataset!r} -> {dataset!r})"
 
 
+def checkpoint_tokens_seen(blob: Dict[str, Any], completed_steps: int) -> Tuple[int, bool]:
+    """Return cumulative processed tokens and whether the value was exact."""
+    saved = blob.get("tokens_seen")
+    if saved is not None:
+        return max(0, int(saved)), True
+    saved_cfg = blob.get("cfg", {})
+    batch = int(saved_cfg.get("batch_size", 0) or 0)
+    seq_len = int(saved_cfg.get("seq_len", 0) or 0)
+    accum = max(1, int(saved_cfg.get("grad_accum_steps", 1) or 1))
+    if batch <= 0 or seq_len <= 0:
+        return 0, False
+    return max(0, int(completed_steps)) * batch * seq_len * accum, False
+
+
 # Shape globals used by the compact module definitions below. They are set from
 # Config before any model is constructed.
 N = 0
@@ -4311,14 +4325,15 @@ def format_big_int(n: int) -> str:
 
 
 def print_training_budget(
-    cfg: Config, dataset: str, start_step: int = 0,
-) -> Tuple[int, int]:
+    cfg: Config, dataset: str, start_step: int = 0, tokens_seen: int = 0,
+) -> Tuple[int, int, int]:
     data_tokens = dataset_token_count(dataset, cfg)
     global_bs = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
     tokens_per_step = global_bs * int(cfg.seq_len) * accum_steps
     remaining_steps = max(0, int(cfg.steps) - int(start_step))
     run_tokens = remaining_steps * tokens_per_step
+    cumulative_target_tokens = max(0, int(tokens_seen)) + run_tokens
     run_epochs = run_tokens / max(1, data_tokens)
     label = "budget" if int(start_step) == 0 else "remaining"
     print(f"  {label:<10}{format_big_int(run_tokens)} tokens over {remaining_steps:,} steps "
@@ -4326,15 +4341,23 @@ def print_training_budget(
     if int(start_step) > 0:
         print(f"  schedule step {int(start_step):,} -> {int(cfg.steps):,} "
               f"(target is total steps, not additional steps)")
-    return run_tokens, data_tokens
+        print(f"  cumulative target {format_big_int(cumulative_target_tokens)} processed tokens")
+    return run_tokens, data_tokens, cumulative_target_tokens
 
 
-def print_training_scale(run_tokens: int, data_tokens: int, model: nn.Module) -> None:
+def print_training_scale(
+    run_tokens: int, data_tokens: int, cumulative_target_tokens: int,
+    model: nn.Module,
+) -> None:
     params = count_params(model)
     tpp = run_tokens / max(1, params)
+    cumulative_tpp = cumulative_target_tokens / max(1, params)
     epoch_tokens_per_param = data_tokens / max(1, params)
+    scale = f"{tpp:.1f} tok/param"
+    if cumulative_target_tokens != run_tokens:
+        scale += f" remaining  ·  {cumulative_tpp:.1f} cumulative tok/param"
     print(f"           paraplex: {format_big_int(params)} params  ·  "
-          f"{tpp:.1f} tok/param  ·  {epoch_tokens_per_param:.1f} data-tok/param")
+          f"{scale}  ·  {epoch_tokens_per_param:.1f} data-tok/param")
 
 
 def canonicalize_model_state_dict(state: dict) -> dict:
@@ -4669,11 +4692,14 @@ async def train_one_async(
     set_seed(int(cfg.seed) + 1000003 * int(rank))
     stream = make_stream(dataset, cfg, device)
     start_step = 0
+    tokens_seen_at_start = 0
+    resume_blob: Dict[str, Any] = {}
     if resume_in:
+        resume_blob = torch.load(resume_in, map_location="cpu", weights_only=True)
         if resume_step is not None:
             start_step = int(resume_step)
         else:
-            _ckpt_step = torch.load(resume_in, map_location="cpu", weights_only=True).get("step", None)
+            _ckpt_step = resume_blob.get("step", None)
             if _ckpt_step is None:
                 ddp_print(f"[resume] WARNING: {resume_in!r} has no saved 'step' (older checkpoint) -- "
                           f"defaulting to start_step=0. Pass --resume-step N to hard-set it.")
@@ -4689,9 +4715,19 @@ async def train_one_async(
                 "skipped": 1.0,
                 "start_step": float(start_step),
             }
-        saved_blob = torch.load(resume_in, map_location="cpu", weights_only=True)
+        tokens_seen_at_start, tokens_seen_exact = checkpoint_tokens_seen(
+            resume_blob, start_step)
+        if tokens_seen_exact:
+            ddp_print(
+                f"[resume] restored cumulative tokens_seen="
+                f"{format_big_int(tokens_seen_at_start)}")
+        else:
+            ddp_print(
+                f"[resume] checkpoint has no tokens_seen; estimated "
+                f"{format_big_int(tokens_seen_at_start)} processed tokens "
+                "from its saved step/batch/sequence config.")
         replay_data, replay_reason = should_replay_resume_data(
-            cfg, dataset, saved_blob.get("cfg", {}))
+            cfg, dataset, resume_blob.get("cfg", {}))
         ddp_print(f"[resume] data cursor policy: {replay_reason}.")
         if not replay_data:
             ddp_print(
@@ -4728,7 +4764,9 @@ async def train_one_async(
     print_architecture_report(cfg, device, ablation, dataset, val_dataset)
     budget = None
     if ddp_is_main():
-        budget = print_training_budget(cfg, dataset, start_step=start_step)
+        budget = print_training_budget(
+            cfg, dataset, start_step=start_step,
+            tokens_seen=tokens_seen_at_start)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
     model_base = Model(cfg, ablation=ablation)
@@ -4830,7 +4868,7 @@ async def train_one_async(
             {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
              "ablation": ablation, "model": model_base.state_dict(),
              "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
-             "step": 0},
+             "step": 0, "tokens_seen": 0},
             init_path,
         )
         ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
@@ -4868,7 +4906,7 @@ async def train_one_async(
     full_eval_bpb = float("nan")
 
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
-    tokens_seen_global = 0
+    tokens_seen_global = int(tokens_seen_at_start)
     data_wait_s = 0.0 
     batch_iter = stream.batches((int(cfg.steps) - start_step) * accum_steps).__aiter__()
 
@@ -4958,7 +4996,7 @@ async def train_one_async(
                 {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
                  "ablation": ablation, "model": raw_model.state_dict(),
                  "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
-                 "step": saved_step},
+                 "step": saved_step, "tokens_seen": int(tokens_seen_global)},
                 save_path,
             )
             print(f"[train] saved {tag} -> {save_path}")

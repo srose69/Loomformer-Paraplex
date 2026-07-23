@@ -4310,15 +4310,22 @@ def format_big_int(n: int) -> str:
 
 
 
-def print_training_budget(cfg: Config, dataset: str) -> Tuple[int, int]:
+def print_training_budget(
+    cfg: Config, dataset: str, start_step: int = 0,
+) -> Tuple[int, int]:
     data_tokens = dataset_token_count(dataset, cfg)
     global_bs = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
     tokens_per_step = global_bs * int(cfg.seq_len) * accum_steps
-    run_tokens = int(cfg.steps) * tokens_per_step
+    remaining_steps = max(0, int(cfg.steps) - int(start_step))
+    run_tokens = remaining_steps * tokens_per_step
     run_epochs = run_tokens / max(1, data_tokens)
-    print(f"  budget   {format_big_int(run_tokens)} tokens over {cfg.steps:,} steps "
+    label = "budget" if int(start_step) == 0 else "remaining"
+    print(f"  {label:<10}{format_big_int(run_tokens)} tokens over {remaining_steps:,} steps "
           f"({run_epochs:.3f} epochs of {format_big_int(data_tokens)})")
+    if int(start_step) > 0:
+        print(f"  schedule step {int(start_step):,} -> {int(cfg.steps):,} "
+              f"(target is total steps, not additional steps)")
     return run_tokens, data_tokens
 
 
@@ -4721,7 +4728,7 @@ async def train_one_async(
     print_architecture_report(cfg, device, ablation, dataset, val_dataset)
     budget = None
     if ddp_is_main():
-        budget = print_training_budget(cfg, dataset)
+        budget = print_training_budget(cfg, dataset, start_step=start_step)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
     model_base = Model(cfg, ablation=ablation)

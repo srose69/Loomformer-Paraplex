@@ -1,11 +1,11 @@
 # alt2
 optimizer: atom                     # atom | adamw
-steps: 14000
-lr: 2e-4
+steps: 50000
+lr: 1.5e-4
 weight_decay: 0.01
 grad_clip: 1.85
 warmup_steps: 50
-min_lr_frac: 0.1
+min_lr_frac: 0.15
 seed: 1
 log_every: 10
 eval_every: 500
@@ -16,6 +16,9 @@ grad_checkpointing: true
 amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
 save_every: 750
 runpoints_path: null
+# auto: same dataset resumes its cursor; changed train_dataset starts at draw 0
+# while checkpoint step/LR schedule still continue. continue | restart force either behavior.
+resume_data_stream: auto
 graph: false
 save_graph: false
 
@@ -40,7 +43,7 @@ tria_gamma_max: 0.80
 tria_raw_gamma_init: 0.01
 tria_temporal_enabled: true
 tria_temporal_auto: false           # false requires tria_temporal_window
-tria_temporal_window: 128           # must be > 0
+tria_temporal_window: 256           # must be > 0
 tria_temporal_window_min: 32
 tria_target_refeeds_per_sequence: 15
 tria_carrier_alpha: 0.1            # must be finite and > 0

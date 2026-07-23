@@ -121,7 +121,6 @@ def main():
     cfg.device = None
     lf.apply_config(cfg)
     tria.set_cuda_tria_enabled(bool(cfg.use_cuda_tria))
-    tria.set_carrier_alpha(float(cfg.tria_carrier_alpha))
 
     device = torch.device(args.device)
     window = int(cfg.tria_temporal_window)
@@ -129,45 +128,25 @@ def main():
         raise ValueError("tokens must be divisible by the temporal window")
     rows = build_rows(cfg, args.data, token_count, int(args.sequences))
 
-    model = lf.Model()
+    model = lf.Model(cfg)
     lf.load_model_blob_into(model, blob, ablation=False)
     model.to(device).eval().requires_grad_(False)
     model.head = torch.nn.Identity()
+    model.capture_tria_depth_carry = True
     position_ids = torch.arange(token_count, device=device).view(1, token_count)
     endpoints_by_sequence = []
 
     with torch.inference_mode():
         for sequence_index, row in enumerate(rows, 1):
-            captured_depth = []
-            original_run_chunk_stack = model._run_chunk_stack
-
-            def capture_run_chunk_stack(*call_args, **call_kwargs):
-                hidden, carry, states = original_run_chunk_stack(*call_args, **call_kwargs)
-                captured_depth.append(carry.detach())
-                return hidden, carry, states
-
-            model._run_chunk_stack = capture_run_chunk_stack
-            try:
-                tokens = row.view(1, token_count).to(device)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    model(tokens, position_ids=position_ids)
-            finally:
-                model._run_chunk_stack = original_run_chunk_stack
-
-            if len(captured_depth) != token_count // window:
-                raise RuntimeError(
-                    f"captured {len(captured_depth)} chunks, expected {token_count // window}"
-                )
-            endpoints = []
-            for depth_chunk in captured_depth:
-                reset = torch.zeros(1, window, dtype=torch.bool, device=device)
-                reset[:, 0] = True
-                endpoints.append(tria.temporal_carry_endpoint(depth_chunk, reset).detach())
-            endpoints_by_sequence.append(torch.stack(endpoints, dim=1).cpu())
+            tokens = row.view(1, token_count).to(device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                model(tokens, position_ids=position_ids)
+            if model.last_tria_document_carry is None:
+                raise RuntimeError("actual Tria boundary-state capture failed")
+            endpoints_by_sequence.append(model.last_tria_document_carry.detach().float().cpu())
             print(f"sequence {sequence_index}/{len(rows)}", flush=True)
 
-    del original_run_chunk_stack, capture_run_chunk_stack
-    del tokens, captured_depth, endpoints, depth_chunk, reset
+    del tokens
     endpoints = torch.cat(endpoints_by_sequence, dim=0).float()
     chunks = []
     slot_chunks = []

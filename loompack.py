@@ -235,7 +235,7 @@ def build_package(
                     "vocab", "model_dim", "n_q_heads", "n_kv_heads", "head_dim",
                     "hidden", "layers", "seq_len", "tied_embeddings", "activation",
                     "phase_sectors", "tria_carry_enabled", "tria_temporal_window",
-                    "tria_carrier_alpha",
+                    "tria_carrier_alpha", "tria_polarm_beta",
                 )
                 if key in cfg
             },

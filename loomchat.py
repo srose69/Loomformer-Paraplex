@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import select
 import sys
@@ -16,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 import loomformer as lf
-import tria as tria_mod
 
 # ============================================================================
 # terminal color: NO_COLOR / non-tty / TERM=dumb all fall back to plain text,
@@ -75,8 +75,9 @@ class Settings:
     top_k: int
     top_p: float
     max_new: int
-    window: int          # Tria temporal refeed window (model.tria_temporal_window)
-    alpha: float          # Tria carrier write-strength (tria.set_carrier_alpha)
+    window: int          # Tria temporal refeed window (model.cfg.tria_temporal_window)
+    alpha: float          # Tria carrier write-strength (model.cfg.tria_carrier_alpha)
+    beta: float           # PolARM correction strength (model.cfg.tria_polarm_beta)
 
     def torch_dtype(self) -> torch.dtype:
         return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
@@ -300,7 +301,7 @@ def load_aio(path: str, device: torch.device):
     lf.CARRY_TOKEN_ID = _special_id(tok, "<CARRY>")
 
     ablation = bool(checkpoint.get("ablation", False))
-    model = lf.Model(ablation=ablation)
+    model = lf.Model(cfg, ablation=ablation)
     if checkpoint.get("model_kind") != "loomformer":
         raise ValueError("AIO checkpoint is not a LoomFormer model")
     if checkpoint.get("ffn_type") != "paraplex":
@@ -388,7 +389,7 @@ def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dic
     quant = manifest.get("quantization", {}).get("target_dtype", "none")
     print(COLOR.dim(f"  archive: {aio_path}  ({n_params:,} params, packed={quant})"))
     print(COLOR.dim(f"  device={settings.device}  dtype={settings.dtype}  "
-                     f"window={settings.window}  alpha={settings.alpha:g}"))
+                     f"window={settings.window}  alpha={settings.alpha:g}  beta={settings.beta:g}"))
     print(COLOR.dim("  /help for commands · type / to browse them · Esc interrupts a reply\n"))
 
 
@@ -397,8 +398,9 @@ COMMANDS = {
     "/settings":  "show every current setting",
     "/device":    "/device <cpu|cuda:0|cuda:1|...> -- move the model, reload nothing else",
     "/dtype":     "/dtype <bf16|fp16|fp32>",
-    "/window":    "/window <int> -- Tria temporal refeed window (model.tria_temporal_window)",
-    "/alpha":     "/alpha <float> -- Tria carrier write-strength (tria.set_carrier_alpha)",
+    "/window":    "/window <int> -- Tria temporal refeed window (config SSOT)",
+    "/alpha":     "/alpha <float> -- Tria carrier write-strength (config SSOT)",
+    "/beta":      "/beta <float 0..1) -- PolARM correction strength (config SSOT)",
     "/temperature": "/temperature <float>  (0 = greedy)",
     "/top-k":     "/top-k <int>  (0 = disabled)",
     "/top-p":     "/top-p <float 0..1>",
@@ -449,11 +451,23 @@ def apply_setting(name: str, value: str, settings: Settings, model) -> Optional[
             move_model(model, torch.device(settings.device), new_dtype)
             settings.dtype = value
         elif name == "window":
-            settings.window = int(value)
-            model.tria_temporal_window = settings.window
+            new_window = int(value)
+            if new_window <= 0:
+                return "window must be > 0"
+            settings.window = new_window
+            model.cfg.tria_temporal_window = new_window
         elif name == "alpha":
-            settings.alpha = float(value)
-            tria_mod.set_carrier_alpha(settings.alpha)
+            new_alpha = float(value)
+            if not math.isfinite(new_alpha) or new_alpha <= 0.0:
+                return "alpha must be finite and > 0"
+            settings.alpha = new_alpha
+            model.cfg.tria_carrier_alpha = new_alpha
+        elif name == "beta":
+            new_beta = float(value)
+            if not math.isfinite(new_beta) or new_beta < 0.0 or new_beta >= 1.0:
+                return "beta must be finite and in [0, 1)"
+            settings.beta = new_beta
+            model.cfg.tria_polarm_beta = new_beta
         elif name == "temperature":
             settings.temperature = float(value)
         elif name == "top_k":
@@ -482,10 +496,12 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
         model = move_model(model, device, settings.torch_dtype())
     else:
         settings.dtype = packed_dtype
-    settings.window = settings.window or model.tria_temporal_window
-    model.tria_temporal_window = settings.window
+    settings.window = settings.window or int(cfg.tria_temporal_window)
+    cfg.tria_temporal_window = settings.window
     settings.alpha = float(getattr(cfg, "tria_carrier_alpha", settings.alpha))
-    tria_mod.set_carrier_alpha(settings.alpha)
+    cfg.tria_carrier_alpha = settings.alpha
+    settings.beta = float(getattr(cfg, "tria_polarm_beta", settings.beta))
+    cfg.tria_polarm_beta = settings.beta
 
     print_banner(aio_path, lf.count_params(model), settings, manifest)
 
@@ -544,9 +560,9 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
                 else:
                     settings.dtype = new_packed_dtype
                 model, tok, chat, cfg, manifest = new_model, new_tok, new_chat, new_cfg, new_manifest
-                settings.window = int(model.tria_temporal_window)
+                settings.window = int(cfg.tria_temporal_window)
                 settings.alpha = float(getattr(cfg, "tria_carrier_alpha", settings.alpha))
-                tria_mod.set_carrier_alpha(settings.alpha)
+                settings.beta = float(getattr(cfg, "tria_polarm_beta", settings.beta))
                 aio_path = new_aio
                 print(COLOR.dim(f"(reloaded {new_aio})"))
             except Exception as e:
@@ -555,7 +571,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
 
         handled_setting = False
         for key, attr in (("/device", "device"), ("/dtype", "dtype"), ("/window", "window"),
-                          ("/alpha", "alpha"), ("/temperature", "temperature"),
+                          ("/alpha", "alpha"), ("/beta", "beta"), ("/temperature", "temperature"),
                           ("/top-k", "top_k"), ("/top-p", "top_p"), ("/max-new", "max_new")):
             if user_text.startswith(key + " "):
                 err = apply_setting(attr, user_text[len(key) + 1:].strip(), settings, model)
@@ -600,6 +616,7 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--window", type=int, default=0, help="0 -> use the archive's Tria window")
     ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--beta", type=float, default=0.1)
     args = ap.parse_args()
 
     dev = lf.device_auto(args.device)
@@ -612,6 +629,7 @@ def main() -> None:
         max_new=args.max_new,
         window=args.window,
         alpha=args.alpha,
+        beta=args.beta,
     )
     run_chat(args.archive, settings, args.system, args.dtype)
 

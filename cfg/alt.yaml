@@ -1,7 +1,7 @@
 # alt
 optimizer: atom                     # atom | adamw
 steps: 21000
-lr: 1e-4
+lr: 1.5e-4
 weight_decay: 0.01
 grad_clip: 1.5
 warmup_steps: 500
@@ -14,7 +14,7 @@ device: cuda:0,cuda:1               # cpu | cuda[:N] | cudas | cuda:N,cuda:M
 grad_accum_steps: 1
 grad_checkpointing: true
 amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
-save_every: 4000
+save_every: 1000
 runpoints_path: null
 graph: false
 save_graph: false
@@ -42,8 +42,8 @@ tria_temporal_auto: false           # false requires tria_temporal_window
 tria_temporal_window: 192           # must be > 0
 tria_temporal_window_min: 32
 tria_target_refeeds_per_sequence: 7
-tria_carrier_alpha: 0.05            # must be finite and > 0
-tria_polarm_beta: 0.1                # must be finite and in [0, 1)
+tria_carrier_alpha: 0.075            # must be finite and > 0
+tria_polarm_beta: 0.5                # must be finite and in [0, 1)
 
 # data / tokenizer
 tokenizer: ./tokenizer32768.json     # null | local .json | Hugging Face name/path

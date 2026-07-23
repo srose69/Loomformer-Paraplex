@@ -44,7 +44,7 @@ def build_tria_pytorch(
     x = torch.stack((r * i, r * o, i * o), dim=-1)
     rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
     x = torch.tanh(x / rms)
-    q = float(_TRIA_CARRIER_ALPHA if alpha is None else alpha)
+    q = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     aa, bb, cc = q * x[..., 0], q * x[..., 1], q * x[..., 2]
     one = torch.ones_like(aa)
     neg_one = -one
@@ -109,33 +109,20 @@ _TRIA_DISABLE_OPS = {
 }
 _TRIA_FALLBACK_PRINTED = set()
 
-# Fixed, non-learned carrier geometry. alpha is selected/configured by loomformer.py
-# (optionally by startup calibration); axis is supplied per depth layer. No tensor
-# state is allocated for either value.
-_TRIA_CARRIER_ALPHA = 0.05
-_TRIA_POLARM_BETA = 0.1
+# Standalone API defaults only. LoomFormer always passes values explicitly from
+# its Config, so there is no mutable process-global Tria geometry.
+DEFAULT_TRIA_CARRIER_ALPHA = 0.05
+DEFAULT_TRIA_POLARM_BETA = 0.1
 
-def set_carrier_alpha(alpha: float) -> None:
-    global _TRIA_CARRIER_ALPHA
-    alpha = float(alpha)
-    if not math.isfinite(alpha) or alpha <= 0.0:
-        raise ValueError(f"tria carrier alpha must be finite and > 0, got {alpha}")
-    _TRIA_CARRIER_ALPHA = alpha
 
 def carrier_alpha() -> float:
-    return float(_TRIA_CARRIER_ALPHA)
-
-
-def set_polarm_beta(beta: float) -> None:
-    global _TRIA_POLARM_BETA
-    beta = float(beta)
-    if not math.isfinite(beta) or beta < 0.0 or beta >= 1.0:
-        raise ValueError(f"PolARM beta must be finite and in [0, 1), got {beta}")
-    _TRIA_POLARM_BETA = beta
+    """Return the standalone default (models use Config.tria_carrier_alpha)."""
+    return DEFAULT_TRIA_CARRIER_ALPHA
 
 
 def polarm_beta() -> float:
-    return float(_TRIA_POLARM_BETA)
+    """Return the standalone default (models use Config.tria_polarm_beta)."""
+    return DEFAULT_TRIA_POLARM_BETA
 
 
 def _polarm_impl(matrix: torch.Tensor, beta: float, eps: float) -> torch.Tensor:
@@ -170,8 +157,13 @@ class _PolARMRecompute(torch.autograd.Function):
         return grad_matrix, None, None
 
 
-def polarm(matrix: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return _PolARMRecompute.apply(matrix, _TRIA_POLARM_BETA, eps)
+def polarm(
+    matrix: torch.Tensor, eps: float = 1e-6, beta: Optional[float] = None,
+) -> torch.Tensor:
+    beta = float(DEFAULT_TRIA_POLARM_BETA if beta is None else beta)
+    if not math.isfinite(beta) or beta < 0.0 or beta >= 1.0:
+        raise ValueError(f"PolARM beta must be finite and in [0, 1), got {beta}")
+    return _PolARMRecompute.apply(matrix, beta, eps)
 
 def _axis(axis: int) -> int:
     axis = int(axis)
@@ -820,11 +812,12 @@ def _cuda_slot_op_applicable(carry: torch.Tensor, small: torch.Tensor) -> bool:
 
 
 def tria_init(
-    r_1: torch.Tensor, i_1: torch.Tensor, o_1: torch.Tensor, axis: int = 0
+    r_1: torch.Tensor, i_1: torch.Tensor, o_1: torch.Tensor, axis: int = 0,
+    alpha: Optional[float] = None,
 ) -> torch.Tensor:
     """Build and normalize the initial carrier matrix."""
     axis = _axis(axis)
-    alpha = float(_TRIA_CARRIER_ALPHA)
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     if _tria_cuda_op_enabled("init") and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda:
         fast_dtype = _tria_fast_dtype(r_1, i_1, o_1)
         if fast_dtype is not None:
@@ -842,8 +835,9 @@ def tria_init(
 def tria_init_seed_reference(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor,
     seed: torch.Tensor, seed_valid: torch.Tensor, axis: int = 0,
+    alpha: Optional[float] = None,
 ) -> torch.Tensor:
-    local = build_tria_pytorch(r, i, o, carrier_alpha(), axis)
+    local = build_tria_pytorch(r, i, o, alpha, axis)
     first = torch.matmul(local[:, 0], seed)
     first = torch.where(seed_valid[:, None, None, None], first, local[:, 0])
     pre = torch.cat((first[:, None], local[:, 1:]), dim=1)
@@ -853,9 +847,10 @@ def tria_init_seed_reference(
 def tria_init_seed(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor,
     seed: torch.Tensor, seed_valid: torch.Tensor, axis: int = 0,
+    alpha: Optional[float] = None,
 ) -> torch.Tensor:
     axis = _axis(axis)
-    alpha = carrier_alpha()
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     valid = seed_valid.to(device=r.device, dtype=torch.bool)
     if _tria_cuda_op_enabled("init_seed") and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, seed)
@@ -866,15 +861,16 @@ def tria_init_seed(
                     r_fast, i_fast, o_fast, seed_fast, valid, alpha, axis))
             except RuntimeError as error:
                 _warn_cuda_fallback("tria_init_seed", error)
-    return _capture_depth_output(tria_init_seed_reference(r, i, o, seed, valid, axis))
+    return _capture_depth_output(tria_init_seed_reference(r, i, o, seed, valid, axis, alpha))
 
 
 def tria_init_seed_and_gate(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor,
     seed: torch.Tensor, seed_valid: torch.Tensor, w: torch.Tensor, axis: int = 0,
+    alpha: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     axis = _axis(axis)
-    alpha = carrier_alpha()
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     valid = seed_valid.to(device=r.device, dtype=torch.bool)
     if _tria_cuda_op_enabled("init_seed_gate") and r.is_cuda and i.is_cuda and o.is_cuda and seed.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, seed, w)
@@ -887,17 +883,17 @@ def tria_init_seed_and_gate(
                 return _capture_depth_output(carry), p
             except RuntimeError as error:
                 _warn_cuda_fallback("tria_init_seed_gate", error)
-    carry = tria_init_seed_reference(r, i, o, seed, valid, axis)
+    carry = tria_init_seed_reference(r, i, o, seed, valid, axis, alpha)
     return _capture_depth_output(carry), (tria_slots(carry) * w).sum(dim=-1)
 
 
 def tria_step(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor, carry_prev: torch.Tensor,
-    axis: int = 0,
+    axis: int = 0, alpha: Optional[float] = None,
 ) -> torch.Tensor:
     """Build a carrier matrix, compose it with ``carry_prev``, and normalize."""
     axis = _axis(axis)
-    alpha = float(_TRIA_CARRIER_ALPHA)
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     if _tria_cuda_op_enabled("step") and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, carry_prev)
         if fast_dtype is not None:
@@ -916,10 +912,10 @@ def tria_step(
 
 def tria_init_and_gate(
     r_1: torch.Tensor, i_1: torch.Tensor, o_1: torch.Tensor, w: torch.Tensor,
-    axis: int = 0,
+    axis: int = 0, alpha: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     axis = _axis(axis)
-    alpha = float(_TRIA_CARRIER_ALPHA)
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     if _tria_cuda_op_enabled("init_gate") and r_1.is_cuda and i_1.is_cuda and o_1.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r_1, i_1, o_1, w)
         if fast_dtype is not None:
@@ -934,7 +930,7 @@ def tria_init_and_gate(
                 return _capture_depth_output(carry_1), p_out
             except RuntimeError as error:
                 _warn_cuda_fallback("tria_init_gate", error)
-    carry_1 = tria_init(r_1, i_1, o_1, axis=axis)
+    carry_1 = tria_init(r_1, i_1, o_1, axis=axis, alpha=alpha)
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_1, w):
         p_out = _graph_gate_slot_mix_op(carry_1, w)
     elif _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_1, w):
@@ -950,10 +946,10 @@ def tria_init_and_gate(
 
 def tria_step_and_gate(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor, carry_prev: torch.Tensor,
-    w: torch.Tensor, axis: int = 0,
+    w: torch.Tensor, axis: int = 0, alpha: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     axis = _axis(axis)
-    alpha = float(_TRIA_CARRIER_ALPHA)
+    alpha = float(DEFAULT_TRIA_CARRIER_ALPHA if alpha is None else alpha)
     if _tria_cuda_op_enabled("step_gate") and r.is_cuda and i.is_cuda and o.is_cuda and carry_prev.is_cuda and w.is_cuda:
         fast_dtype = _tria_fast_dtype(r, i, o, carry_prev, w)
         if fast_dtype is not None:
@@ -968,7 +964,7 @@ def tria_step_and_gate(
                 return _capture_depth_output(carry_new), p_out
             except RuntimeError as error:
                 _warn_cuda_fallback("tria_step_gate", error)
-    carry_new = tria_step(r, i, o, carry_prev, axis=axis)
+    carry_new = tria_step(r, i, o, carry_prev, axis=axis, alpha=alpha)
     if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None and _cuda_slot_op_applicable(carry_new, w):
         p_out = _graph_gate_slot_mix_op(carry_new, w)
     elif _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry_new, w):

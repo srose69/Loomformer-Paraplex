@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -344,6 +344,11 @@ class Config:
     # the cloned checkpoint without needing a separate --resume on the CLI.
     # An explicit --resume on the command line still overrides this.
     resume: Optional[str] = None
+    # Dataset cursor policy for --resume:
+    #   auto     -- replay only when checkpoint/current train_dataset match;
+    #   continue -- always replay already-consumed draws;
+    #   restart  -- keep checkpoint step/LR schedule but start data at draw 0.
+    resume_data_stream: str = "auto"
     # False (default): ParaplexFFN's amp gate is self-referential, amp=softplus(p_real)
     #   (original design, zero extra parameters).
     # True: amp comes from an independent gate_proj Linear(N,HIDDEN) instead --
@@ -459,7 +464,6 @@ def apply_temporal_tria_calibration(cfg: Config) -> None:
     cfg.tria_temporal_window = int(src["tria_temporal_window"])
     if "tria_carrier_alpha" in src:
         cfg.tria_carrier_alpha = float(src["tria_carrier_alpha"])
-    tria.set_carrier_alpha(float(cfg.tria_carrier_alpha))
     ddp_print(
         "[tria] temporal calibration loaded "
         f"{path}: W={cfg.tria_temporal_window} alpha={cfg.tria_carrier_alpha:g}"
@@ -548,14 +552,13 @@ def calibrate_temporal_tria_from_init(cfg: Config) -> dict:
         sweep_batch = sweep_tasks[task_start:task_start + parallel_sweep]
         jobs = []
         for alpha, seed_idx in sweep_batch:
-            # The eager forward captures alpha into every dispatched Tria op
-            # before the next task changes the process-global default.
-            tria.set_carrier_alpha(alpha)
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
             stream_ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
             with stream_ctx:
                 torch.manual_seed(int(getattr(cfg, "seed", 1)) + 9176 + seed_idx)
-                model = Model().to(device).eval()
+                candidate_cfg = replace(
+                    cfg, tria_carrier_alpha=float(alpha), tria_temporal_auto=False)
+                model = Model(candidate_cfg).to(device).eval()
                 model.capture_tria_depth_carry = True
                 idx = torch.randint(0, VOCAB, (batch, T), device=device, dtype=torch.long)
                 if carry_token_id is not None:
@@ -626,7 +629,6 @@ def calibrate_temporal_tria_from_init(cfg: Config) -> dict:
             f"effective_rank={selected['effective_rank_mean'][selected_window - 1]:.3f}, "
             f"population_pass={selected_pass:.3f} < {pass_fraction_req:.3f}"
         )
-    tria.set_carrier_alpha(selected_alpha)
     expected_refeeds = int((SEQ_LEN - 1) // selected_window)
 
     result = {
@@ -664,8 +666,6 @@ def apply_temporal_tria_auto_calibration(cfg: Config) -> None:
     if getattr(cfg, "tria_temporal_calibration", None):
         apply_temporal_tria_calibration(cfg)
         return
-    tria.set_carrier_alpha(float(getattr(cfg, "tria_carrier_alpha", 0.05)))
-    tria.set_polarm_beta(float(getattr(cfg, "tria_polarm_beta", 0.1)))
     if not bool(getattr(cfg, "tria_temporal_auto", True)):
         return
     result = calibrate_temporal_tria_from_init(cfg)
@@ -675,21 +675,59 @@ def apply_temporal_tria_auto_calibration(cfg: Config) -> None:
 
 
 def restore_temporal_tria_from_checkpoint(cfg: Config, path: Optional[str]) -> bool:
-    """Restore Tria calibration into ``cfg`` and report whether values were found."""
+    """Report checkpoint Tria geometry without mutating the active config.
+
+    Kept under its old name for callers outside this repository. The active
+    YAML/Config is the SSOT on resume; checkpoint metadata is diagnostic only.
+    """
     if not path:
         return False
     blob = torch.load(path, map_location="cpu", weights_only=True)
     saved_cfg = blob.get("cfg", {})
-    window = saved_cfg.get("tria_temporal_window")
-    alpha = saved_cfg.get("tria_carrier_alpha")
-    if window is None or alpha is None:
+    keys = ("tria_temporal_window", "tria_carrier_alpha", "tria_polarm_beta")
+    found = {key: saved_cfg.get(key) for key in keys if saved_cfg.get(key) is not None}
+    if not found:
         return False
-    cfg.tria_temporal_window = int(window)
-    cfg.tria_carrier_alpha = float(alpha)
-    # A resumed run must use the exact geometry under which its weights trained.
-    cfg.tria_temporal_auto = False
-    ddp_print(f"[resume] restored Tria calibration from checkpoint: W={window} alpha={float(alpha):g}")
+    active = {key: getattr(cfg, key) for key in keys}
+    changed = {
+        key: (saved, active[key])
+        for key, saved in found.items()
+        if active[key] is not None and float(saved) != float(active[key])
+    }
+    if changed:
+        details = ", ".join(
+            f"{key}: checkpoint={saved:g} config={current:g}"
+            for key, (saved, current) in changed.items()
+        )
+        ddp_print(f"[resume] Tria geometry differs; keeping config SSOT ({details})")
+    else:
+        ddp_print("[resume] Tria geometry matches active config")
     return True
+
+
+def should_replay_resume_data(
+    cfg: Config, dataset: str, saved_cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Resolve whether resume should advance the dataset RNG/cursor."""
+    policy = str(getattr(cfg, "resume_data_stream", "auto") or "auto").lower()
+    if policy not in ("auto", "continue", "restart"):
+        raise ValueError(
+            "resume_data_stream must be auto, continue, or restart; "
+            f"got {policy!r}")
+    if policy == "continue":
+        return True, "forced by resume_data_stream=continue"
+    if policy == "restart":
+        return False, "forced by resume_data_stream=restart"
+    saved_dataset = saved_cfg.get("train_dataset")
+    if not saved_dataset:
+        return True, (
+            "checkpoint has no train_dataset metadata; auto keeps legacy replay "
+            "(use resume_data_stream=restart to force a fresh stream)"
+        )
+    same = os.path.abspath(str(saved_dataset)) == os.path.abspath(dataset)
+    if same:
+        return True, "train_dataset matches checkpoint"
+    return False, f"train_dataset changed ({saved_dataset!r} -> {dataset!r})"
 
 
 # Shape globals used by the compact module definitions below. They are set from
@@ -719,7 +757,6 @@ FINAL_NORM_ENABLED = False  # False: head reads the residual stream directly (or
 TRIA_GAMMA_MAX = 0.25
 TRIA_RAW_GAMMA_INIT = 0.0
 TRIA_TEMPORAL_ENABLED = True
-TRIA_TEMPORAL_WINDOW = 128
 CARRY_TOKEN_ID: Optional[int] = None
 RESIDUAL_INIT = "beta"
 ACTIVATION = "gelu"
@@ -852,7 +889,7 @@ def make_w1_imag_live_flat_indices() -> torch.Tensor:
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TRIA_TEMPORAL_WINDOW, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -867,8 +904,6 @@ def apply_config(cfg: Config) -> None:
     TRIA_GAMMA_MAX = float(getattr(cfg, "tria_gamma_max", 0.25))
     TRIA_RAW_GAMMA_INIT = float(getattr(cfg, "tria_raw_gamma_init", 0.0))
     TRIA_TEMPORAL_ENABLED = bool(getattr(cfg, "tria_temporal_enabled", True))
-    provisional_window = getattr(cfg, "tria_temporal_window", None) or SEQ_LEN
-    TRIA_TEMPORAL_WINDOW = int(provisional_window)
     if TRIA_CARRY_ENABLED and not TRIA_TEMPORAL_ENABLED:
         raise ValueError("tria_carry_enabled requires tria_temporal_enabled")
     cfg.use_cuda_tria = bool(getattr(cfg, "use_cuda_tria", False))
@@ -1051,8 +1086,17 @@ def apply_config(cfg: Config) -> None:
     cfg.gqa_group_size = GQA_GROUP_SIZE
     cfg.hidden = HIDDEN
 
-    tria.set_carrier_alpha(float(getattr(cfg, "tria_carrier_alpha", 0.05)))
-    tria.set_polarm_beta(float(getattr(cfg, "tria_polarm_beta", 0.1)))
+    tria_alpha = float(cfg.tria_carrier_alpha)
+    if not math.isfinite(tria_alpha) or tria_alpha <= 0.0:
+        raise ValueError(
+            f"tria_carrier_alpha must be finite and > 0, got {tria_alpha}")
+    cfg.tria_carrier_alpha = tria_alpha
+    tria_beta = float(cfg.tria_polarm_beta)
+    if not math.isfinite(tria_beta) or tria_beta < 0.0 or tria_beta >= 1.0:
+        raise ValueError(
+            f"tria_polarm_beta must be finite and in [0, 1), got {tria_beta}")
+    cfg.tria_polarm_beta = tria_beta
+
     if TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED:
         apply_temporal_tria_auto_calibration(cfg)
     selected_window = getattr(cfg, "tria_temporal_window", None)
@@ -1061,10 +1105,10 @@ def apply_config(cfg: Config) -> None:
             "tria_temporal_auto=false requires tria_temporal_window; "
             "auto mode selects it during startup calibration"
         )
-    TRIA_TEMPORAL_WINDOW = int(selected_window or SEQ_LEN)
-    if TRIA_TEMPORAL_WINDOW <= 0:
+    resolved_window = int(selected_window or SEQ_LEN)
+    if resolved_window <= 0:
         raise ValueError("tria_temporal_window must be positive")
-    cfg.tria_temporal_window = TRIA_TEMPORAL_WINDOW
+    cfg.tria_temporal_window = resolved_window
     warmup_cuda_kernels()
 
     if bool(getattr(cfg, "graph", False)):
@@ -3416,8 +3460,12 @@ class Block(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, ablation: bool = False) -> None:
+    def __init__(self, cfg: Config, ablation: bool = False) -> None:
         super().__init__()
+        # Runtime Tria geometry has exactly one owner. Keep the Config object
+        # itself (also useful for intentional live overrides in loomchat) rather
+        # than copying alpha/beta/W into module or process globals.
+        self.cfg = cfg
         self.ablation = bool(ablation)
         self.emb = nn.Embedding(VOCAB, N)
         self.blocks = nn.ModuleList([Block(ablation=ablation) for _ in range(LAYERS)])
@@ -3437,7 +3485,6 @@ class Model(nn.Module):
         else:
             self.tria_agg = None
             self.tria_final_ca = None
-        self.tria_temporal_window = int(TRIA_TEMPORAL_WINDOW)
         # SFT (see loomsft.py): flip to False so refeed fires ONLY on explicit
         # <CARRY>, never on the dense W-token deadline pretrain relies on --
         # the model has no fixed-grid dependency to begin with (deadline is a
@@ -3502,6 +3549,7 @@ class Model(nn.Module):
     ):
         sub_idx = sub_idx0
         tria_axis = (sub_idx0 // 2) % 3
+        tria_alpha = float(self.cfg.tria_carrier_alpha)
         skip, _ = self.depth_attn(sub_idx, hist_k, hist_v)
         if RESIDUAL_BRANCH_RMS_CAP is not None:
             skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
@@ -3528,25 +3576,30 @@ class Model(nn.Module):
                     raise ValueError("seed_valid is required with accT_seed")
                 if is_last_block:
                     carry_new = tria.tria_init_seed(
-                        r, i, o, accT_seed, seed_valid, axis=tria_axis)
+                        r, i, o, accT_seed, seed_valid, axis=tria_axis,
+                        alpha=tria_alpha)
                     p_out = None
                 else:
                     w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
                     carry_new, p_out = tria.tria_init_seed_and_gate(
-                        r, i, o, accT_seed, seed_valid, w, axis=tria_axis)
+                        r, i, o, accT_seed, seed_valid, w, axis=tria_axis,
+                        alpha=tria_alpha)
             elif is_last_block:
                 carry_new = (
-                    tria.tria_init(r, i, o, axis=tria_axis)
+                    tria.tria_init(r, i, o, axis=tria_axis, alpha=tria_alpha)
                     if carry_prev is None
-                    else tria.tria_step(r, i, o, carry_prev, axis=tria_axis)
+                    else tria.tria_step(
+                        r, i, o, carry_prev, axis=tria_axis, alpha=tria_alpha)
                 )
                 p_out = None
             else:
                 w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
                 carry_new, p_out = (
-                    tria.tria_init_and_gate(r, i, o, w, axis=tria_axis)
+                    tria.tria_init_and_gate(
+                        r, i, o, w, axis=tria_axis, alpha=tria_alpha)
                     if carry_prev is None
-                    else tria.tria_step_and_gate(r, i, o, carry_prev, w, axis=tria_axis)
+                    else tria.tria_step_and_gate(
+                        r, i, o, carry_prev, w, axis=tria_axis, alpha=tria_alpha)
                 )
         else:
             ffn_out, next_phase_trace = block.ffn(
@@ -3721,7 +3774,7 @@ class Model(nn.Module):
     def _forward_chunked(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor],
                           position_ids: torch.Tensor) -> torch.Tensor:
         B, T = idx.shape
-        W = self.tria_temporal_window
+        W = int(self.cfg.tria_temporal_window)
         h_emb = self.emb(idx)
         document_reset = self._build_tria_document_reset_mask(idx, position_ids)
         base_causal = torch.ones(T, T, dtype=torch.bool, device=idx.device).tril()
@@ -3791,7 +3844,8 @@ class Model(nn.Module):
             h_chunks.append(h_chunk)
             if e - 1 in boundary_set:
                 boundary_valid = fire_mask[:, e - 1]
-                corrected_state = tria.polarm(temporal_state)
+                corrected_state = tria.polarm(
+                    temporal_state, beta=float(self.cfg.tria_polarm_beta))
                 temporal_state = torch.where(
                     boundary_valid[:, None, None, None], corrected_state, temporal_state)
                 key_carries.append(temporal_state)
@@ -3856,7 +3910,7 @@ class Model(nn.Module):
                 if TRIA_TEMPORAL_ENABLED
                 else depth_carry
             )
-            W = self.tria_temporal_window
+            W = int(self.cfg.tria_temporal_window)
             # §6.2: hard fire at the last position of each fixed-W chunk, only
             # when the NEXT position is still the same document (a fire whose
             # next position starts a new document is meaningless -- there is
@@ -3912,6 +3966,7 @@ class Model(nn.Module):
         carry = None  
         p = None      
         n_blocks = len(self.blocks)
+        tria_alpha = float(self.cfg.tria_carrier_alpha)
         # spec §12.1: seed for the (single) current token's Tria L0.
         pending = (
             torch.zeros(idx_t.shape[0], dtype=torch.bool, device=idx_t.device)
@@ -3944,21 +3999,30 @@ class Model(nn.Module):
                     accT_seed_b = accT_seed.to(device=r.device, dtype=r.dtype)
                     if is_last_block:
                         carry = tria.tria_init_seed(
-                            r, i, o, accT_seed_b, seed_valid, axis=bi % 3)
+                            r, i, o, accT_seed_b, seed_valid, axis=bi % 3,
+                            alpha=tria_alpha)
                         p = None
                     else:
                         w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
                         carry, p = tria.tria_init_seed_and_gate(
-                            r, i, o, accT_seed_b, seed_valid, w, axis=bi % 3)
+                            r, i, o, accT_seed_b, seed_valid, w, axis=bi % 3,
+                            alpha=tria_alpha)
                 elif is_last_block:
-                    carry = tria.tria_init(r, i, o, axis=bi % 3) if carry is None else tria.tria_step(r, i, o, carry, axis=bi % 3)
+                    carry = (
+                        tria.tria_init(r, i, o, axis=bi % 3, alpha=tria_alpha)
+                        if carry is None
+                        else tria.tria_step(
+                            r, i, o, carry, axis=bi % 3, alpha=tria_alpha)
+                    )
                     p = None
                 else:
                     w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
                     carry, p = (
-                        tria.tria_init_and_gate(r, i, o, w, axis=bi % 3)
+                        tria.tria_init_and_gate(
+                            r, i, o, w, axis=bi % 3, alpha=tria_alpha)
                         if carry is None
-                        else tria.tria_step_and_gate(r, i, o, carry, w, axis=bi % 3)
+                        else tria.tria_step_and_gate(
+                            r, i, o, carry, w, axis=bi % 3, alpha=tria_alpha)
                     )
             else:
                 ffn_out, next_phase_trace = block.ffn(
@@ -3991,7 +4055,7 @@ class Model(nn.Module):
             hard_fire_now = (
                 self.tria_hard_fire_enabled
                 and (pos_t + 1 < SEQ_LEN)
-                and ((pos_t + 1) % self.tria_temporal_window == 0)
+                and ((pos_t + 1) % int(self.cfg.tria_temporal_window) == 0)
             )
             if carry_token_id is not None:
                 explicit_fire_now = idx_t.view(-1).eq(int(carry_token_id))
@@ -4001,7 +4065,8 @@ class Model(nn.Module):
             if hard_fire_now or (
                 carry_token_id is not None and bool(explicit_fire_now.any().item())
             ):
-                corrected_state = tria.polarm(document_carry_t)
+                corrected_state = tria.polarm(
+                    document_carry_t, beta=float(self.cfg.tria_polarm_beta))
                 document_carry_t = torch.where(
                     fire_now[:, None, None, None], corrected_state, document_carry_t)
             document_carry = document_carry_t.unsqueeze(1)
@@ -4334,7 +4399,7 @@ def load_model_checkpoint(model: nn.Module, path: str, ablation: bool, device: t
         raise FileNotFoundError(f"resume checkpoint not found: {path}")
     blob = torch.load(path, map_location=device, weights_only=True)
     load_model_blob_into(model, blob, ablation=ablation)
-    ddp_print(f"[resume] loaded paraplex weights from {path} (optimizer state is intentionally not restored)")
+    ddp_print(f"[resume] loaded paraplex weights from {path}")
 
 
 def apply_train_lr_overrides(model: nn.Module, cfg: Config) -> Dict[int, float]:
@@ -4381,6 +4446,51 @@ def optimizer_class_from_name(name: str):
                 ) from e
         return ATOM, "atom"
     raise ValueError(f"unknown optimizer={name!r}; expected 'adamw' or 'atom'")
+
+
+def load_optimizer_checkpoint(
+    optimizer: torch.optim.Optimizer,
+    path: str,
+    optimizer_name: str,
+    device: torch.device,
+) -> bool:
+    """Restore optimizer tensors while keeping active-config group options."""
+    blob = torch.load(path, map_location=device, weights_only=True)
+    saved_state = blob.get("optimizer")
+    if saved_state is None:
+        ddp_print(
+            f"[resume] WARNING: {path!r} has no optimizer state "
+            "(legacy checkpoint); optimizer starts fresh.")
+        return False
+    saved_name = str(blob.get("optimizer_name", optimizer_name)).strip().lower()
+    active_name = str(optimizer_name).strip().lower()
+    if saved_name != active_name:
+        ddp_print(
+            f"[resume] WARNING: checkpoint optimizer={saved_name!r}, "
+            f"active config optimizer={active_name!r}; optimizer starts fresh.")
+        return False
+
+    # Tensor history belongs to the checkpoint. LR/WD/lr_mult and other group
+    # options belong to the active config and are restored after loading.
+    active_group_options = [
+        {key: value for key, value in group.items() if key != "params"}
+        for group in optimizer.param_groups
+    ]
+    try:
+        optimizer.load_state_dict(saved_state)
+    except ValueError as error:
+        raise ValueError(
+            "optimizer checkpoint is incompatible with the active trainable "
+            "parameter groups; keep train_lr/freeze settings unchanged or "
+            "start without --resume"
+        ) from error
+    if len(optimizer.param_groups) != len(active_group_options):
+        raise ValueError(
+            "optimizer checkpoint changed the number of active parameter groups")
+    for group, active_options in zip(optimizer.param_groups, active_group_options):
+        group.update(active_options)
+    ddp_print(f"[resume] restored {active_name} optimizer state from {path}")
+    return True
 
 
 class _GracefulInterrupt:
@@ -4572,7 +4682,15 @@ async def train_one_async(
                 "skipped": 1.0,
                 "start_step": float(start_step),
             }
-        if isinstance(stream, ShardStream) and start_step > 0:
+        saved_blob = torch.load(resume_in, map_location="cpu", weights_only=True)
+        replay_data, replay_reason = should_replay_resume_data(
+            cfg, dataset, saved_blob.get("cfg", {}))
+        ddp_print(f"[resume] data cursor policy: {replay_reason}.")
+        if not replay_data:
+            ddp_print(
+                "[resume] restarting data stream while preserving checkpoint "
+                "step/LR schedule.")
+        if isinstance(stream, ShardStream) and start_step > 0 and replay_data:
             _accum = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
             _n_replay = start_step * _accum
             ddp_print(f"[resume] fast-forwarding ShardStream RNG by {_n_replay} batch draws "
@@ -4580,6 +4698,8 @@ async def train_one_async(
             for _ in range(_n_replay):
                 stream._sample_batch()
             ddp_print("[resume] fast-forward done.")
+        elif isinstance(stream, ShardStream) and start_step > 0:
+            ddp_print("[resume] data stream starts at draw 0 (no fast-forward).")
         ddp_print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
                   f"LR schedule/log step numbering continue (unchanged if cfg.steps/warmup_steps match the original run).")
     if isinstance(stream, ShardStream):
@@ -4604,29 +4724,15 @@ async def train_one_async(
         budget = print_training_budget(cfg, dataset)
 
     tag = "LoomFormer-ablation-s1" if ablation else "LoomFormer-paraplex"
-    model_base = Model(ablation=ablation)
+    model_base = Model(cfg, ablation=ablation)
     if ddp_is_main():
         print_training_scale(*budget, model_base)
     ddp_print("=" * 64)
     model_base = model_base.to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
-    if bool(getattr(cfg, "save_initial_checkpoint", False)):
-        if resume_in:
-            raise ValueError("save_initial_checkpoint requires a fresh run without resume")
-        if ckpt_out and ddp_is_main():
-            root, ext = os.path.splitext(ckpt_out)
-            init_path = f"{root}.init{ext or '.pt'}"
-            saved_cfg = asdict(cfg)
-            saved_cfg["batch_size"] = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
-            if saved_cfg.get("tria_temporal_window") is not None:
-                saved_cfg["tria_temporal_auto"] = False
-            torch.save(
-                {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
-                 "ablation": ablation, "model": model_base.state_dict(), "step": 0},
-                init_path,
-            )
-            ddp_print(f"[train] saved initial {tag} -> {init_path}")
+    if bool(getattr(cfg, "save_initial_checkpoint", False)) and resume_in:
+        raise ValueError("save_initial_checkpoint requires a fresh run without resume")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
     if ddp_is_distributed():
@@ -4704,6 +4810,23 @@ async def train_one_async(
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
+    if resume_in:
+        load_optimizer_checkpoint(opt, resume_in, optimizer_name, device)
+    if bool(getattr(cfg, "save_initial_checkpoint", False)) and ckpt_out and ddp_is_main():
+        root, ext = os.path.splitext(ckpt_out)
+        init_path = f"{root}.init{ext or '.pt'}"
+        saved_cfg = asdict(cfg)
+        saved_cfg["batch_size"] = int(getattr(cfg, "_global_batch_size", cfg.batch_size))
+        if saved_cfg.get("tria_temporal_window") is not None:
+            saved_cfg["tria_temporal_auto"] = False
+        torch.save(
+            {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
+             "ablation": ablation, "model": model_base.state_dict(),
+             "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
+             "step": 0},
+            init_path,
+        )
+        ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
     n_params = count_params(ddp_unwrap_model(model))
 
     if hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
@@ -4826,7 +4949,9 @@ async def train_one_async(
             saved_step = int(step if step_override is None else step_override)
             torch.save(
                 {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
-                 "ablation": ablation, "model": raw_model.state_dict(), "step": saved_step},
+                 "ablation": ablation, "model": raw_model.state_dict(),
+                 "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
+                 "step": saved_step},
                 save_path,
             )
             print(f"[train] saved {tag} -> {save_path}")
@@ -5083,6 +5208,9 @@ def print_architecture_report(cfg: Config, device: torch.device, ablation: bool,
 
 async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out: Optional[str], ablation: bool, resume: Optional[str] = None, resume_step: Optional[int] = None) -> None:
     set_seed(int(cfg.seed) + 1000003 * int(ddp_rank()))
+    # Persist the effective path even when it came from CLI --dataset. This is
+    # what makes resume_data_stream:auto reliable on the next launch.
+    cfg.train_dataset = dataset
     build_tokenizer(cfg)
     restore_temporal_tria_from_checkpoint(cfg, resume)
 
@@ -5120,7 +5248,7 @@ def infer(cfg: Config, ckpt: str, prompt: str, max_new: int, device: torch.devic
     tok = build_tokenizer(cfg)
     apply_config(cfg)
     ablation = bool(blob.get("ablation", False))
-    model = Model(ablation=ablation).to(device)
+    model = Model(cfg, ablation=ablation).to(device)
     load_model_blob_into(model, blob, ablation=ablation)
     model.eval()
     ids = tok.encode(prompt) or [0]
@@ -5148,7 +5276,7 @@ def export_aoti(cfg: Config, ckpt: str, out_path: str, device: torch.device, bat
     graph_helper.install_capture_hooks(sys.modules[__name__], tria)
 
     ablation = bool(blob.get("ablation", False))
-    model = Model(ablation=ablation).to(device)
+    model = Model(cfg, ablation=ablation).to(device)
     load_model_blob_into(model, blob, ablation=ablation)
     model.eval()
 
@@ -5299,7 +5427,7 @@ def eval_full(
     apply_config(cfg)
 
     ablation = bool(blob.get("ablation", False))
-    model = Model(ablation=ablation).to(device)
+    model = Model(cfg, ablation=ablation).to(device)
     load_model_blob_into(model, blob, ablation=ablation)
     model.eval()
     model = maybe_compile(model, device, use_graph=bool(getattr(cfg, "graph", False)))
@@ -5318,7 +5446,7 @@ def smoke_test() -> None:
     cfg = Config(vocab=64, model_dim=12, n_q_heads=6, n_kv_heads=3, hidden=66, layers=2, seq_len=16, batch_size=2, steps=2)
     apply_config(cfg)
     set_seed(cfg.seed)
-    model = Model().to(dev)
+    model = Model(cfg).to(dev)
     x = torch.randint(0, VOCAB, (cfg.batch_size, cfg.seq_len), device=dev)
     logits = model(x)
     assert logits.shape == (cfg.batch_size, cfg.seq_len, VOCAB)
@@ -5367,8 +5495,13 @@ def main() -> None:
     ap.add_argument("--export-batch-size", type=int, default=1,
                     help="batch dimension baked into the --export-aoti graph "
                          "(torch.export needs a concrete shape)")
-    ap.add_argument("--resume", type=str, default=None, help="smart resume: load model weights, continue step count/LR schedule and skip already-seen data (optimizer state itself still restarts)")
+    ap.add_argument("--resume", type=str, default=None, help="smart resume: load model and optimizer state, continue step count/LR schedule, and apply the configured dataset cursor policy")
     ap.add_argument("--resume-step", type=int, default=None, help="override/hard-set the step to resume from, for checkpoints saved before 'step' was recorded (or to force a specific value)")
+    ap.add_argument(
+        "--resume-data", type=str, default=None,
+        choices=("auto", "continue", "restart"),
+        help="resume dataset cursor: auto restarts on a changed train_dataset; "
+             "continue always fast-forwards; restart always starts at draw 0")
     ap.add_argument("--prompt", type=str, default="")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--smoke-test", action="store_true")
@@ -5416,6 +5549,8 @@ def main() -> None:
         cfg.steps = args.steps
     if args.amp_dtype is not None:
         cfg.amp_dtype = args.amp_dtype
+    if args.resume_data is not None:
+        cfg.resume_data_stream = args.resume_data
     device_pref = args.device if args.device is not None else cfg.device
     dev, distributed, world_size, rank, local_rank = maybe_launch_or_init_ddp(device_pref, training=bool(args.train))
     if dev.type == "cuda" and not distributed:

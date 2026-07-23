@@ -4,10 +4,10 @@
 resume: smol360.pt
 optimizer: atom
 steps: 8000
-lr: 1e-04
+lr: 3e-04
 weight_decay: 0.01
 grad_clip: 1.55
-warmup_steps: 266
+warmup_steps: 200
 min_lr_frac: 0.1
 seed: 1
 log_every: 10
@@ -15,7 +15,7 @@ eval_every: 50
 eval_batches: 4
 device: cuda:0, cuda:1
 grad_accum_steps: 1
-grad_checkpointing: false
+grad_checkpointing: true
 graph: false
 save_graph: false
 amp_dtype: bf16
@@ -23,7 +23,7 @@ save_every: 500
 runpoints_path: null
 
 seq_len: 2048
-batch_size: 2
+batch_size: 36
 prefetch_batches: 256
 
 rope_theta: 100000
@@ -113,10 +113,10 @@ cloned_mapping: llama
 train_lr:
   - name: attn.qkv_weight
     train: yes
-    lr: 3.00e-06  # transplanted from donor
+    lr: 2.00e-05  # transplanted from donor
   - name: attn.o.weight
     train: yes
-    lr: 3.00e-06  # transplanted from donor
+    lr: 8.00e-06  # transplanted from donor
   - name: ffn.w1_real.weight
     train: yes
     lr: 3.00e-06  # transplanted from donor (up_proj)
@@ -131,16 +131,16 @@ train_lr:
     lr: 3.00e-06  # transplanted from donor (requires matching tokenizer)
   - name: head.weight
     train: yes
-    lr: 3.00e-06  # transplanted from donor if untied and present
+    lr: 2.00e-05  # transplanted from donor if untied and present
   - name: ln_attn.weight
     train: yes
-    lr: 3.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
+    lr: 5.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
   - name: ln_attn.bias
     train: yes
-    lr: 3.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR
+    lr: 5.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR
   - name: ln_ffn.weight
     train: yes
-    lr: 3.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
+    lr: 6.00e-05  # RMSNorm->LayerNorm approximation -- full LR to help it self-correct
   - name: ln_ffn.bias
     train: yes
-    lr: 3.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR
+    lr: 5.00e-05  # no donor equivalent (RMSNorm has no bias) -- zero-init, full LR

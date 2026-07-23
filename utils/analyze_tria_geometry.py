@@ -158,6 +158,51 @@ def regime_fractions(condition, effective_rank, max_condition, min_effective_ran
     }
 
 
+def boundary_state_report(matrix, max_condition, min_effective_rank):
+    u, singular_values, vh = torch.linalg.svd(matrix.float(), full_matrices=False)
+    singular_probability, condition, effective_rank, passed = singular_metrics(
+        singular_values,
+        max_condition,
+        min_effective_rank,
+    )
+    rotation, reflected = proper_polar_rotation(u, vh)
+    angle = rotation_angle(rotation)
+
+    def summarize(index=None):
+        selected_condition = condition if index is None else condition[:, index]
+        selected_rank = effective_rank if index is None else effective_rank[:, index]
+        selected_probability = singular_probability if index is None else singular_probability[:, index]
+        selected_passed = passed if index is None else passed[:, index]
+        selected_angle = angle if index is None else angle[:, index]
+        selected_reflected = reflected if index is None else reflected[:, index]
+        reduce_dims = tuple(range(selected_probability.dim() - 1))
+        return {
+            "condition": tensor_quantiles(selected_condition),
+            "effective_rank": tensor_quantiles(selected_rank),
+            "population_pass": float(selected_passed.float().mean()),
+            "regimes": regime_fractions(
+                selected_condition,
+                selected_rank,
+                max_condition,
+                min_effective_rank,
+            ),
+            "normalized_singular_values_mean": [
+                float(value) for value in selected_probability.mean(dim=reduce_dims)
+            ],
+            "rotation_angle": tensor_quantiles(selected_angle),
+            "polar_reflection_fraction": float(selected_reflected.float().mean()),
+        }
+
+    return {
+        "keys": int(matrix.shape[1]),
+        "all": summarize(),
+        "by_key": [
+            {"key_index": index, **summarize(index)}
+            for index in range(matrix.shape[1])
+        ],
+    }
+
+
 def build_rows(cfg, data_path, token_count, sequence_count):
     tokenizer = lf.build_tokenizer(cfg)
     bos = lf._tok_special_id(tokenizer, "<bos>")
@@ -478,12 +523,12 @@ def analyze_checkpoint(
     population_pass,
 ):
     print(f"loading {label}: {path}", flush=True)
-    model = lf.Model()
+    model = lf.Model(cfg)
     lf.load_model_blob_into(model, blob, ablation=False)
     model.to(device).eval().requires_grad_(False)
     model.head = torch.nn.Identity()
     model.capture_tria_depth_carry = True
-    window = int(model.tria_temporal_window)
+    window = int(cfg.tria_temporal_window)
     raw_horizons = [horizon for horizon in horizons if horizon <= raw_token_count]
     depth_accumulator = GeometryAccumulator(
         raw_token_count,
@@ -547,6 +592,7 @@ def analyze_checkpoint(
     position_ids = torch.arange(token_count, device=device).view(1, token_count)
     raw_position_ids = position_ids[:, :raw_token_count]
     paired = []
+    boundary_states = []
     with torch.inference_mode():
         for sequence_index, row in enumerate(rows, 1):
             tokens = row[:raw_token_count].view(1, raw_token_count).to(device)
@@ -583,6 +629,9 @@ def analyze_checkpoint(
                     logits = model(tokens, position_ids=position_ids)
             finally:
                 model._run_chunk_stack = original_run_chunk_stack
+            if model.last_tria_document_carry is None:
+                raise RuntimeError("actual Tria boundary-state capture failed")
+            boundary_states.append(model.last_tria_document_carry.detach().float().cpu())
             chunked_depth = torch.cat(captured_depth, dim=1)
             if chunked_depth.shape[1] != token_count:
                 raise RuntimeError(
@@ -613,6 +662,11 @@ def analyze_checkpoint(
     operational_temporal_result = operational_temporal_accumulator.finish()
     operational_depth_chunk_results = [accumulator.finish() for accumulator in operational_depth_by_chunk]
     operational_temporal_chunk_results = [accumulator.finish() for accumulator in operational_temporal_by_chunk]
+    boundary_state_result = boundary_state_report(
+        torch.cat(boundary_states, dim=0),
+        max_condition,
+        min_effective_rank,
+    )
     del original_run_chunk_stack, capture_run_chunk_stack
     del model
     gc.collect()
@@ -639,6 +693,7 @@ def analyze_checkpoint(
                 for chunk_index in range(complete_chunks)
             ],
         },
+        "boundary_state": boundary_state_result,
     }, temporal_result, operational_temporal_result, paired
 
 
@@ -740,6 +795,17 @@ def print_summary(report, horizons):
                 f"{chunk_boundary['effective_rank']['mean']:.2f}"
             )
         print("  operational chunks pass/cond/rank: " + " ".join(chunk_line))
+        actual_boundary = report[label]["boundary_state"]
+        actual = actual_boundary["all"]
+        print(
+            f"  actual post-PolARM boundaries={actual_boundary['keys']}: "
+            f"pass={actual['population_pass']:.4f} "
+            f"cond={actual['condition']['mean']:.3f}/"
+            f"{actual['condition']['p50']:.3f}/"
+            f"{actual['condition']['p90']:.3f}/"
+            f"{actual['condition']['p99']:.3f} "
+            f"rank={actual['effective_rank']['mean']:.3f}"
+        )
     print("\n=== Learned change ===")
     paired = report["trained_vs_init"]
     print(
@@ -807,6 +873,17 @@ def print_single_summary(label, checkpoint_report, window, horizons):
             f"{chunk_boundary['effective_rank']['mean']:.2f}"
         )
     print("  operational chunks pass/cond/rank: " + " ".join(chunk_line))
+    actual_boundary = checkpoint_report["boundary_state"]
+    actual = actual_boundary["all"]
+    print(
+        f"  actual post-PolARM boundaries={actual_boundary['keys']}: "
+        f"pass={actual['population_pass']:.4f} "
+        f"cond={actual['condition']['mean']:.3f}/"
+        f"{actual['condition']['p50']:.3f}/"
+        f"{actual['condition']['p90']:.3f}/"
+        f"{actual['condition']['p99']:.3f} "
+        f"rank={actual['effective_rank']['mean']:.3f}"
+    )
 
 
 def main():
@@ -834,7 +911,6 @@ def main():
     cfg.device = None
     lf.apply_config(cfg)
     tria.set_cuda_tria_enabled(bool(cfg.use_cuda_tria))
-    tria.set_carrier_alpha(float(cfg.tria_carrier_alpha))
     device = torch.device(args.device)
     if device.type != "cuda":
         raise ValueError("this audit currently requires CUDA autocast")

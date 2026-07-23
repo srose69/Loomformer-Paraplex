@@ -192,6 +192,7 @@ tria_temporal_window_min: 32
 tria_target_refeeds_per_sequence: 7
 tria_min_refeeds_per_sequence: 1
 tria_carrier_alpha: 0.0375
+tria_polarm_beta: 0.1
 tria_carrier_alpha_candidates: [0.0125, 0.025, 0.0375, 0.05, 0.0625, 0.075]
 tria_temporal_max_condition: 3.0
 tria_temporal_min_effective_rank: 2.70
@@ -409,7 +410,7 @@ def clone_checkpoint(config_path: str, donor_dir: str, mapping_path: str, out_pa
     prev_default = torch.get_default_dtype()
     torch.set_default_dtype(donor_dtype)
     try:
-        model = lf.Model()
+        model = lf.Model(cfg)
     finally:
         torch.set_default_dtype(prev_default)
     missing, unexpected = model.load_state_dict(remapped, strict=False)

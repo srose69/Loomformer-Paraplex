@@ -364,14 +364,8 @@ def train_sft(
     lf.set_seed(cfg.seed)
     tok = lf.build_tokenizer(cfg)
     weight_source = resume or init_checkpoint
-    # Must run before apply_config: otherwise tria_temporal_auto recalibrates a
-    # fresh W/alpha instead of the geometry the checkpoint's Tria carry was
-    # actually trained under (same ordering loomformer.train_async uses). On
-    # --resume this reads from the SFT runpoint itself, not the original PT
-    # checkpoint -- by the time a runpoint is saved, tria_temporal_auto is
-    # already pinned False and the window/alpha are the resolved values, so
-    # either source agrees; using the runpoint keeps this 1:1 with pretrain's
-    # own resume path (restore_temporal_tria_from_checkpoint(cfg, resume)).
+    # Checkpoint geometry is diagnostic only: the active Config is the SSOT for
+    # W/alpha/beta on both initialization and resume.
     lf.restore_temporal_tria_from_checkpoint(cfg, weight_source)
     lf.apply_config(cfg)
     chat = lf.ChatTemplate(tok)
@@ -390,14 +384,10 @@ def train_sft(
         if start_step >= int(cfg.steps):
             print(f"[resume] start_step={start_step} >= cfg.steps={cfg.steps} -- nothing to do, exiting.")
             return
-        # The saved value is the LAST step that was completed and logged (this
-        # script logs/saves BEFORE incrementing its 0-indexed counter -- see the
-        # main loop below); resuming must continue at the next, not-yet-done
-        # step, or the first post-resume step would silently redo one already
-        # trained on.
-        start_step += 1
+        # Checkpoints and runpoints both store the number of completed updates,
+        # i.e. the next loop index to execute (same convention as pretraining).
 
-    model = lf.Model().to(device)
+    model = lf.Model(cfg).to(device)
     lf.load_model_checkpoint(model, weight_source, ablation=False, device=device)
 
     train_pool = preprocess_dataset(train_path, chat, cfg.seq_len)
@@ -426,6 +416,8 @@ def train_sft(
     params = [p for p in model.parameters() if p.requires_grad]
     opt_cls, opt_name = lf.optimizer_class_from_name(getattr(cfg, "optimizer", "adamw"))
     opt = opt_cls(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if resume:
+        lf.load_optimizer_checkpoint(opt, resume, opt_name, device)
 
     def _save_checkpoint(path_override: Optional[str] = None, at_step: int = 0) -> None:
         save_path = path_override or ckpt_out
@@ -434,7 +426,9 @@ def train_sft(
             saved_cfg["tria_temporal_auto"] = False
         torch.save(
             {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
-             "ablation": False, "model": model.state_dict(), "step": at_step},
+             "ablation": False, "model": model.state_dict(),
+             "optimizer_name": opt_name, "optimizer": opt.state_dict(),
+             "step": at_step},
             save_path,
         )
         print(f"[loomsft] saved -> {save_path}")
@@ -488,12 +482,14 @@ def train_sft(
                     if val_packer is not None and step % (cfg.log_every * 5) == 0:
                         msg += f"  eval_loss {eval_sft(model, val_packer, cfg.batch_size, device):.4f}"
                     print(msg, flush=True)
-                if runpoint.consume() or (cfg.save_every and step > 0 and step % int(cfg.save_every) == 0):
-                    _save_runpoint(step)
+                if runpoint.consume() or (
+                    cfg.save_every and (step + 1) % int(cfg.save_every) == 0
+                ):
+                    _save_runpoint(step + 1)
                 if interrupt.requested:
                     print(f"\n[interrupt] Ctrl-C at step {step}/{cfg.steps} -- saving a runpoint and stopping.",
                           flush=True)
-                    _save_runpoint(step)
+                    _save_runpoint(step + 1)
                     step += 1
                     break
                 step += 1
@@ -564,7 +560,7 @@ def smoke_test() -> None:
     print(f"[smoke] packing OK: x={tuple(b['x'].shape)} attn_mask={tuple(b['attn_mask'].shape)} "
           f"loss_tokens={(b['y'] != IGNORE_INDEX).sum().item()}")
 
-    model = lf.Model().to(dev)
+    model = lf.Model(cfg).to(dev)
     with torch.no_grad():
         logits = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"])
     loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), b["y"].reshape(-1), ignore_index=IGNORE_INDEX)
@@ -607,8 +603,8 @@ def main() -> None:
     ap.add_argument("--init-checkpoint", type=str, default=None, help="pretrained LoomFormer checkpoint to start SFT from")
     ap.add_argument("--checkpoint", type=str, default="loomsft.pt")
     ap.add_argument("--resume", type=str, default=None,
-                    help="smart resume: load weights from an SFT runpoint, continue step count/LR "
-                         "schedule and skip already-seen data (optimizer state itself still restarts)")
+                    help="smart resume: load model and optimizer state from an SFT runpoint, "
+                         "continue step count/LR schedule, and skip already-seen data")
     ap.add_argument("--resume-step", type=int, default=None,
                     help="override/hard-set the step to resume from, for runpoints saved before "
                          "'step' was recorded (or to force a specific value)")

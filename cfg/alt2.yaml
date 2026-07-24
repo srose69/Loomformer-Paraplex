@@ -13,6 +13,7 @@ eval_batches: 10
 device: cuda:0, cuda:1              # cpu | cuda[:N] | cudas | cuda:N,cuda:M
 grad_accum_steps: 1
 grad_checkpointing: true
+fused_linear_ce: true               # chunked LM-head+CE, avoids materializing [N,VOCAB] logits
 amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
 save_every: 750
 runpoints_path: null
@@ -50,12 +51,12 @@ tria_carrier_alpha: 0.1            # must be finite and > 0
 tria_polarm_beta: 0.5                # must be finite and in [0, 1)
 
 # data / tokenizer
-tokenizer: ./tokenizer32768.json     # null | local .json | Hugging Face name/path
+tokenizer: ./tokenizers/tokenizer32768.json     # null | local .json | Hugging Face name/path
 vocab: 32768                        # must be > 0
 tied_embeddings: true
 
 # pretrain datasets
-train_dataset: ./datasets/fw-edu
+train_dataset: ./datasets/FSS1STR
 val_dataset: null
 auto_val_split_pct: 0.1             # 0 disables; otherwise must be in (0, 100)
 

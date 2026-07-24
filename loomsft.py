@@ -335,17 +335,16 @@ def eval_sft(model: torch.nn.Module, packer: Packer, batch_size: int,
     tot_loss, tot_tok = 0.0, 0
     for _ in range(n_batches):
         b = packer.sample_batch(batch_size, device)
-        with lf.amp_autocast(device):
-            logits = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"])
-        model.last_tria_depth_carry = None
-        model.last_tria_fire_mask = None
-        model.last_tria_document_carry_stats = None
         ntok = int((b["y"] != IGNORE_INDEX).sum().item())
         if ntok == 0:
             continue
-        loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), b["y"].reshape(-1),
-                                ignore_index=IGNORE_INDEX, reduction="sum")
-        tot_loss += float(loss.item())
+        with lf.amp_autocast(device):
+            loss = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"],
+                         labels=b["y"], ignore_index=IGNORE_INDEX)
+        model.last_tria_depth_carry = None
+        model.last_tria_fire_mask = None
+        model.last_tria_document_carry_stats = None
+        tot_loss += float(loss.item()) * ntok
         tot_tok += ntok
     model.train()
     return tot_loss / max(1, tot_tok)
@@ -457,9 +456,8 @@ def train_sft(
                 for micro in range(accum_steps):
                     batch = prefetcher.next()
                     with lf.amp_autocast(device):
-                        logits = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"])
-                    loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), batch["y"].reshape(-1),
-                                            ignore_index=IGNORE_INDEX)
+                        loss = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"],
+                                     labels=batch["y"], ignore_index=IGNORE_INDEX)
                     if model.last_tria_fire_mask is not None:
                         with torch.no_grad():
                             trias_since_log.add_(model.last_tria_fire_mask.detach().sum())

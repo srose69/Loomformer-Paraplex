@@ -364,6 +364,12 @@ class Config:
     # the slot a Llama-family donor's model.norm.weight maps onto during
     # --rebuild/loomcloner transplant (previously silently dropped).
     final_norm: bool = False
+    # Fused linear + cross-entropy for the LM head (Liger-Kernel style chunked
+    # projection, see `_FusedLinearCrossEntropy`): avoids ever materializing
+    # the full [B*T, VOCAB] logits tensor. One-line opt-in; the model/train
+    # call sites are unchanged (labels=None still returns full logits).
+    fused_linear_ce: bool = False
+    fused_linear_ce_chunk_size: int = 0  # 0 = auto (Liger memory-balancing formula); or a fixed row-chunk override
     use_cuda_tria: bool = False
     graph: bool = False
     save_graph: bool = False  
@@ -768,6 +774,8 @@ PARAPLEX_GATE_PROJ = False  # False: amp = softplus(p_real), self-referential (o
                             # gate_proj matrix -- see loomcloner.py mapping notes)
 FINAL_NORM_ENABLED = False  # False: head reads the residual stream directly (original design)
                             # True: one RMSNorm before head -- see Config.final_norm
+FUSED_LINEAR_CE = False  # see Config.fused_linear_ce / _FusedLinearCrossEntropy
+FUSED_LINEAR_CE_CHUNK_SIZE = 0  # 0 = auto; see Config.fused_linear_ce_chunk_size
 TRIA_GAMMA_MAX = 0.25
 TRIA_RAW_GAMMA_INIT = 0.0
 TRIA_TEMPORAL_ENABLED = True
@@ -903,7 +911,7 @@ def make_w1_imag_live_flat_indices() -> torch.Tensor:
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED, FUSED_LINEAR_CE, FUSED_LINEAR_CE_CHUNK_SIZE
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -915,6 +923,8 @@ def apply_config(cfg: Config) -> None:
     TRIA_CARRY_ENABLED = bool(getattr(cfg, "tria_carry_enabled", False))
     PARAPLEX_GATE_PROJ = bool(getattr(cfg, "paraplex_gate_proj", False))
     FINAL_NORM_ENABLED = bool(getattr(cfg, "final_norm", False))
+    FUSED_LINEAR_CE = bool(getattr(cfg, "fused_linear_ce", False))
+    FUSED_LINEAR_CE_CHUNK_SIZE = int(getattr(cfg, "fused_linear_ce_chunk_size", 0))  # 0 = auto
     TRIA_GAMMA_MAX = float(getattr(cfg, "tria_gamma_max", 0.25))
     TRIA_RAW_GAMMA_INIT = float(getattr(cfg, "tria_raw_gamma_init", 0.0))
     TRIA_TEMPORAL_ENABLED = bool(getattr(cfg, "tria_temporal_enabled", True))
@@ -3464,6 +3474,134 @@ class RMSNorm(nn.Module):
         return (xf * rms).to(dtype) * self.weight
 
 
+class _FusedLinearCrossEntropy(torch.autograd.Function):
+    """Chunked fused (LM-head projection + softmax cross-entropy).
+
+    Direct port of the Liger-Kernel algorithm (https://github.com/linkedin/
+    Liger-Kernel, src/liger_kernel/ops/fused_linear_cross_entropy.py), minus
+    the Triton kernel (plain PyTorch ops instead of a fused Triton column
+    block, since this repo has no Triton dependency): the [N, D] @ [D, V]^T
+    head projection and the token-level cross-entropy are computed one
+    row-chunk at a time, so only a [chunk_size, VOCAB] logits slice (plus its
+    exact gradient) is ever alive instead of the full [N, VOCAB] tensor.
+    Gradients are exact (softmax - onehot per chunk, algebraically identical
+    to the unchunked computation) -- this is NOT activation-checkpoint
+    recompute, there is no extra forward pass.
+
+    Matching Liger's forward exactly: there is exactly ONE host sync for the
+    non-ignored token count (needed for mean reduction), taken once before
+    the chunk loop -- never per-chunk. An early `if chunk has no valid
+    targets: skip` check would need its own per-chunk `.item()`/`bool()`
+    sync, stalling the CUDA pipeline every single chunk for no algorithmic
+    benefit (chunks are still masked correctly either way), so it is
+    deliberately not done, exactly as upstream does not do it either.
+    """
+
+    @staticmethod
+    def _prefers_fp32_gemm(hidden: torch.Tensor) -> bool:
+        """On sm_61-class GPUs (Pascal: GTX 1080, Tesla P4 -- no bf16 tensor
+        cores below sm_80) `autocast(bf16)` lowers `x @ W` to
+        `magma_sgemmEx_kernel<float, __nv_bfloat16, ...>`, which does a
+        serialized bf16->fp32 convert pass before the fp32 multiply-add --
+        verified via torch.profiler to dominate this function's CUDA time
+        (>90%) on such hardware. Forcing the GEMM operands to fp32 and
+        disabling autocast for the call instead dispatches plain cuBLAS
+        `sgemm`, which is substantially faster here. On sm_80+ (native bf16
+        tensor cores) this would throw away real speedup, so it's gated on
+        compute capability. Gated on the *active autocast state*, not
+        `hidden.dtype`: whether the matmul actually lowers to bf16 depends
+        on whether autocast is live right now, not on what dtype the
+        incoming tensor happens to already be."""
+        if not hidden.is_cuda:
+            return False
+        if not torch.is_autocast_enabled():
+            return False
+        if torch.get_autocast_gpu_dtype() != torch.bfloat16:
+            return False
+        try:
+            major, _minor = torch.cuda.get_device_capability(hidden.device)
+        except Exception:
+            return False
+        return major < 8
+
+    @staticmethod
+    def _default_chunk_size(N: int, D: int, V: int) -> int:
+        """Liger's memory-balancing formula: pick the chunk size so the
+        transient [chunk, V] logits buffer is on the same order as the
+        [N, D] hidden-state tensor, i.e. `inc_factor = ceil(V/D)`,
+        `chunk_size = next_pow2(ceil(N / inc_factor))`."""
+        if N <= 0:
+            return 1
+        inc_factor = -(-V // D)
+        raw = -(-N // inc_factor)
+        pow2 = 1 << max(raw - 1, 0).bit_length()
+        return max(1, min(pow2, N))
+
+    @staticmethod
+    def forward(ctx, hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor,
+                ignore_index: int, chunk_size: int) -> torch.Tensor:
+        N, D = hidden.shape
+        V = weight.shape[0]
+        step = int(chunk_size) if chunk_size else _FusedLinearCrossEntropy._default_chunk_size(N, D, V)
+        step = max(1, min(step, max(N, 1)))
+
+        valid_mask = targets.ne(ignore_index)
+        denom = float(max(int(valid_mask.sum().item()), 1))
+
+        want_weight_grad = weight.requires_grad
+        grad_hidden = torch.zeros(N, D, dtype=torch.float32, device=hidden.device)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32) if want_weight_grad else None
+        loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
+
+        # Cast once (not per chunk). Under autocast this is a no-op cost --
+        # `hidden` already arrives in the autocast dtype (e.g. bf16) -- and it
+        # also makes the manual backward matmuls below correct when autocast
+        # is off (amp_dtype: fp32) where hidden/weight already match anyway.
+        force_fp32_gemm = _FusedLinearCrossEntropy._prefers_fp32_gemm(hidden)
+        compute_dtype = torch.float32 if force_fp32_gemm else hidden.dtype
+        weight_c = weight if weight.dtype == compute_dtype else weight.to(compute_dtype)
+        gemm_ctx = (
+            torch.autocast(device_type="cuda", enabled=False)
+            if force_fp32_gemm else contextlib.nullcontext()
+        )
+
+        with gemm_ctx:
+            for s in range(0, N, step):
+                e = min(s + step, N)
+                h_chunk = hidden[s:e].to(compute_dtype) if force_fp32_gemm else hidden[s:e]
+                t_chunk = targets[s:e]
+                valid = valid_mask[s:e]
+                logits_chunk = F.linear(h_chunk, weight_c).float()
+                logp = F.log_softmax(logits_chunk, dim=-1)
+                safe_t = t_chunk.clamp_min(0).unsqueeze(1)
+                nll = -logp.gather(1, safe_t).squeeze(1)
+                loss_sum += torch.where(valid, nll, nll.new_zeros(())).sum()
+                grad_logits = logp.exp()
+                grad_logits.scatter_add_(1, safe_t, -torch.ones_like(safe_t, dtype=grad_logits.dtype))
+                grad_logits *= valid.unsqueeze(1)
+                grad_logits = grad_logits.to(compute_dtype)
+                grad_hidden[s:e] = (grad_logits @ weight_c).float()
+                if want_weight_grad:
+                    grad_weight += (grad_logits.t() @ h_chunk).float()
+                del logits_chunk, logp, grad_logits
+
+        grad_hidden = (grad_hidden / denom).to(hidden.dtype)
+        ctx.want_weight_grad = want_weight_grad
+        if want_weight_grad:
+            ctx.save_for_backward(grad_hidden, (grad_weight / denom).to(weight.dtype))
+        else:
+            ctx.save_for_backward(grad_hidden)
+        return loss_sum / denom
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.want_weight_grad:
+            grad_hidden, grad_weight = ctx.saved_tensors
+            return grad_hidden * grad_output, grad_weight * grad_output, None, None, None
+        (grad_hidden,) = ctx.saved_tensors
+        return grad_hidden * grad_output, None, None, None, None
+
+
 class Block(nn.Module):
     def __init__(self, ablation: bool = False) -> None:
         super().__init__()
@@ -3527,6 +3665,25 @@ class Model(nn.Module):
     def _head_in(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the optional final norm and output head."""
         return self.head(self.ln_final(x) if self.ln_final is not None else x)
+
+    def _head_or_loss(self, h: torch.Tensor, labels: Optional[torch.Tensor],
+                       ignore_index: int) -> torch.Tensor:
+        """Return logits (labels=None, unchanged path) or the LM loss.
+
+        With `FUSED_LINEAR_CE` on (Config.fused_linear_ce), the loss is
+        computed via `_FusedLinearCrossEntropy`, which never materializes the
+        full [B*T, VOCAB] logits tensor -- see that class's docstring.
+        """
+        if labels is None:
+            return self._head_in(h)
+        if not FUSED_LINEAR_CE:
+            logits = self._head_in(h)
+            return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1),
+                                    ignore_index=ignore_index)
+        hidden = self.ln_final(h) if self.ln_final is not None else h
+        return _FusedLinearCrossEntropy.apply(
+            hidden.reshape(-1, hidden.shape[-1]), self.head.weight, labels.reshape(-1),
+            ignore_index, FUSED_LINEAR_CE_CHUNK_SIZE)
 
     def reset_parameters(self) -> None:
         init_embedding_fanin(self.emb)
@@ -3766,7 +3923,13 @@ class Model(nn.Module):
         return h, carry, new_layer_states
 
     def forward(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                position_ids: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None, ignore_index: int = -100) -> torch.Tensor:
+        """Forward pass. With `labels=None` (default, all existing call sites
+        unchanged) this returns full [B,T,VOCAB] logits exactly as before.
+        Passing `labels` returns the scalar LM loss instead; when
+        `Config.fused_linear_ce` is on, that loss is computed without ever
+        materializing the full logits tensor (see `_head_or_loss`)."""
         B, T = idx.shape
         if T > SEQ_LEN:
             raise ValueError(f"input length {T} exceeds configured seq_len {SEQ_LEN}")
@@ -3782,11 +3945,14 @@ class Model(nn.Module):
             position_ids = position_ids.to(device=idx.device, dtype=torch.long)
         want_chunked = TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED and not self.ablation
         if not want_chunked:
-            return self._forward_flat(idx, attn_mask=attn_mask, position_ids=position_ids)
-        return self._forward_chunked(idx, attn_mask=attn_mask, position_ids=position_ids)
+            return self._forward_flat(idx, attn_mask=attn_mask, position_ids=position_ids,
+                                       labels=labels, ignore_index=ignore_index)
+        return self._forward_chunked(idx, attn_mask=attn_mask, position_ids=position_ids,
+                                      labels=labels, ignore_index=ignore_index)
 
     def _forward_chunked(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor],
-                          position_ids: torch.Tensor) -> torch.Tensor:
+                          position_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
+                          ignore_index: int = -100) -> torch.Tensor:
         B, T = idx.shape
         W = int(self.cfg.tria_temporal_window)
         h_emb = self.emb(idx)
@@ -3876,7 +4042,7 @@ class Model(nn.Module):
         if not key_carries:
             self.last_tria_depth_carry = None
             self.last_tria_document_carry = None
-            return self._head_in(h_full)
+            return self._head_or_loss(h_full, labels, ignore_index)
 
         document_keys = torch.stack(key_carries, dim=1)
         valid_keys = torch.stack(key_valid, dim=1)
@@ -3890,10 +4056,11 @@ class Model(nn.Module):
         a_keys = self.tria_agg(document_keys)
         h_full = self.tria_final_ca(
             a_keys, h_full, attn_mask, carry_key_mask=valid_keys, key_positions=positions)
-        return self._head_in(h_full)
+        return self._head_or_loss(h_full, labels, ignore_index)
 
     def _forward_flat(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
-                       position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       position_ids: Optional[torch.Tensor] = None,
+                       labels: Optional[torch.Tensor] = None, ignore_index: int = -100) -> torch.Tensor:
         B, T = idx.shape
         h = self.emb(idx)
         k0, v0 = self.depth_attn.project(h)
@@ -3946,7 +4113,7 @@ class Model(nn.Module):
                         "fire_count": int(carry_key_mask.detach().sum().item()),
                     }
             h = self.tria_final_ca(a, h, attn_mask, carry_key_mask=carry_key_mask)
-        return self._head_in(h)  # [B,T,VOCAB]
+        return self._head_or_loss(h, labels, ignore_index)  # [B,T,VOCAB] or scalar loss
 
     @torch.no_grad()
     def step(self, idx_t: torch.Tensor, pos_t: int, states):
@@ -4123,8 +4290,7 @@ async def eval_loss_async(model: nn.Module, stream: TokenStream, cfg: Config, de
             x, y = b[:, :-1], b[:, 1:]
             position_ids, attn_mask = build_doc_reset_state(x, eos_id)
             with amp_autocast(device):
-                logits = model(x, attn_mask=attn_mask, position_ids=position_ids)
-            loss = F.cross_entropy(logits.float().reshape(-1, VOCAB), y.reshape(-1))
+                loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
             losses.append(float(loss.item()))
             raw = ddp_unwrap_model(model)
             raw.last_tria_depth_carry = None
@@ -5084,10 +5250,7 @@ async def train_one_async(
                 )
                 with sync_ctx:
                     with amp_autocast(device):
-                        logits = model(x, attn_mask=attn_mask, position_ids=position_ids)
-                    per_tok_loss = F.cross_entropy(logits.float().reshape(-1, VOCAB), y.reshape(-1),
-                                                     reduction="none").reshape(x.shape[0], x.shape[1])
-                    loss = per_tok_loss.mean()
+                        loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
                     total_loss = loss
                     # Read before custom CUDA backward: if the same scalar changes
                     # afterwards, a backward kernel corrupted forward storage.

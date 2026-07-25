@@ -345,8 +345,8 @@ class Config:
     # An explicit --resume on the command line still overrides this.
     resume: Optional[str] = None
     # Dataset cursor policy for --resume:
-    #   auto     -- replay only when checkpoint/current train_dataset match;
-    #   continue -- always replay already-consumed draws;
+    #   auto     -- restore this dataset's saved cursor, or start a new one;
+    #   continue -- restore it, with legacy global-step replay as fallback;
     #   restart  -- keep checkpoint step/LR schedule but start data at draw 0.
     resume_data_stream: str = "auto"
     # False (default): ParaplexFFN's amp gate is self-referential, amp=softplus(p_real)
@@ -734,6 +734,99 @@ def should_replay_resume_data(
     if same:
         return True, "train_dataset matches checkpoint"
     return False, f"train_dataset changed ({saved_dataset!r} -> {dataset!r})"
+
+
+def dataset_progress_key(dataset: str) -> str:
+    """Portable, human-readable key for per-dataset checkpoint progress."""
+    return os.path.normpath(str(dataset))
+
+
+def normalize_dataset_progress(blob: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    """Load the versioned per-dataset progress map from a checkpoint."""
+    raw = blob.get("dataset_progress", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, int]] = {}
+    for raw_key, raw_value in raw.items():
+        key = dataset_progress_key(str(raw_key))
+        if isinstance(raw_value, dict):
+            steps = max(0, int(raw_value.get("steps", 0) or 0))
+            draws = max(0, int(raw_value.get("draws", steps) or 0))
+        else:
+            # Accept an early/simple {dataset: steps} representation.
+            steps = max(0, int(raw_value or 0))
+            draws = steps
+        out[key] = {"steps": steps, "draws": draws}
+    return out
+
+
+def find_dataset_progress(
+    progress: Dict[str, Dict[str, int]], dataset: str,
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    """Find progress across harmless relative/absolute path spelling changes."""
+    key = dataset_progress_key(dataset)
+    if key in progress:
+        return key, progress[key]
+    current_abs = os.path.abspath(str(dataset))
+    for saved_key, entry in progress.items():
+        if os.path.abspath(saved_key) == current_abs:
+            return saved_key, entry
+    return key, None
+
+
+def resolve_resume_dataset_progress(
+    cfg: "Config",
+    dataset: str,
+    blob: Dict[str, Any],
+    global_step: int,
+    override_steps: Optional[int] = None,
+) -> Tuple[Dict[str, Dict[str, int]], str, int, int, str]:
+    """Resolve the current dataset's cursor without conflating it with global step."""
+    progress = normalize_dataset_progress(blob)
+    current_key = dataset_progress_key(dataset)
+    saved_key, saved_entry = find_dataset_progress(progress, dataset)
+    accum = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+    policy = str(getattr(cfg, "resume_data_stream", "auto") or "auto").lower()
+    if policy not in ("auto", "continue", "restart"):
+        raise ValueError(
+            "resume_data_stream must be auto, continue, or restart; "
+            f"got {policy!r}")
+
+    if override_steps is not None:
+        steps = int(override_steps)
+        if steps < 0:
+            raise ValueError(
+                f"resume_dataset_steps must be >= 0, got {override_steps}")
+        draws = steps * accum
+        reason = (
+            f"forced current-dataset progress: steps={steps}, draws={draws}")
+    elif policy == "restart":
+        steps = draws = 0
+        reason = "forced by resume_data_stream=restart"
+    elif saved_entry is not None:
+        steps = int(saved_entry["steps"])
+        draws = int(saved_entry["draws"])
+        reason = (
+            f"restored saved progress for {current_key!r}: "
+            f"steps={steps}, draws={draws}")
+    elif progress and policy == "auto":
+        steps = draws = 0
+        reason = f"no saved progress for new dataset {current_key!r}"
+    else:
+        # Old checkpoints have no per-dataset map. Preserve their existing
+        # auto/continue/restart behavior as a one-time migration fallback.
+        replay, legacy_reason = should_replay_resume_data(
+            cfg, dataset, blob.get("cfg", {}))
+        steps = max(0, int(global_step)) if replay else 0
+        draws = steps * accum
+        reason = (
+            f"legacy checkpoint fallback ({legacy_reason}): "
+            f"steps={steps}, draws={draws}")
+
+    if saved_key != current_key:
+        progress.pop(saved_key, None)
+    progress[current_key] = {"steps": steps, "draws": draws}
+    return progress, current_key, steps, draws, reason
 
 
 def checkpoint_tokens_seen(blob: Dict[str, Any], completed_steps: int) -> Tuple[int, bool]:
@@ -1154,6 +1247,11 @@ def warmup_cuda_kernels() -> None:
         _try_load_cuda_beta_space()
     if tria.cuda_tria_enabled():
         tria._try_load_cuda_tria()
+    # Keep every extension status line ahead of the architecture report.
+    # Otherwise paraplex is first requested by the compile warmup and its
+    # final "16/16" line appears later in the startup log.
+    if USE_CUDA_BETA_SPACE:
+        _try_load_cuda_paraplex()
 
 class ByteTokenizer:
     vocab_size = 256
@@ -2543,7 +2641,9 @@ class _BetaSpaceDirect(torch.autograd.Function):
 class _ParaplexFused(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, p_real, gate_src, u, q_h, k_h, c_h, d_h, w_imag, bias, trace, trace_w,
+        ctx, p_real, gate_src, gate_weight, gate_bias,
+        recompute_intermediates,
+        u, q_h, k_h, c_h, d_h, w_imag, bias, trace, trace_w,
         reset, anchor, hidden_per_q_head, head_dim, n_q_heads, open_sectors,
         phase_mode, update_anchor, anchor_decay, phase_floor, near_eps, powlu_m,
     ):
@@ -2559,9 +2659,16 @@ class _ParaplexFused(torch.autograd.Function):
             p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
             phase_mode, update_anchor, anchor_decay, powlu_m)
         ctx.mark_non_differentiable(anchor_snapshot)
-        ctx.save_for_backward(
-            p_real, gate_src, beta, bias, trace, trace_w, reset, anchor_snapshot,
-            u, q_h, k_h, c_h, d_h, w_imag)
+        ctx.recompute_intermediates = bool(recompute_intermediates)
+        if ctx.recompute_intermediates:
+            ctx.save_for_backward(
+                p_real, bias, trace, trace_w, reset, anchor_snapshot,
+                u, q_h, k_h, c_h, d_h, w_imag, gate_weight, gate_bias)
+        else:
+            ctx.save_for_backward(
+                p_real, gate_src, beta, bias, trace, trace_w, reset, anchor_snapshot,
+                u, q_h, k_h, c_h, d_h, w_imag)
+        ctx.has_gate_projection = gate_weight.numel() != 0
         ctx.shapes = (u.shape[0], u.shape[1], u.shape[2], w_imag.shape[0], w_imag.shape[1])
         ctx.meta = (
             hidden_per_q_head, head_dim, n_q_heads, open_sectors,
@@ -2575,17 +2682,39 @@ class _ParaplexFused(torch.autograd.Function):
         beta_ext = _try_load_cuda_beta_space()
         if core_ext is None or beta_ext is None:
             raise RuntimeError("CUDA paraplex dependencies are unavailable")
-        (p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
-         u, q_h, k_h, c_h, d_h, w_imag) = ctx.saved_tensors
+        if ctx.recompute_intermediates:
+            (p_real, bias, trace, trace_w, reset, anchor,
+             u, q_h, k_h, c_h, d_h, w_imag, gate_weight, gate_bias) = ctx.saved_tensors
+            gate_src = None
+            beta = None
+        else:
+            (p_real, gate_src, beta, bias, trace, trace_w, reset, anchor,
+             u, q_h, k_h, c_h, d_h, w_imag) = ctx.saved_tensors
+            gate_weight = None
+            gate_bias = None
         grad_act = torch.zeros_like(p_real) if grad_act is None else grad_act.to(dtype=p_real.dtype)
         grad_s = torch.zeros_like(p_real) if grad_s is None else grad_s.to(dtype=p_real.dtype)
         grad_next = torch.zeros_like(trace) if grad_next is None else grad_next.to(dtype=trace.dtype)
         hidden_per_q_head, head_dim, n_q_heads, open_sectors, mode, floor, near_eps, m = ctx.meta
+        w_compute = w_imag if w_imag.dtype == u.dtype else w_imag.to(dtype=u.dtype)
+        if ctx.recompute_intermediates:
+            beta, _r_pack, _w_contig = beta_ext.beta_forward_cuda(
+                u, q_h, k_h, c_h, d_h, w_compute,
+                hidden_per_q_head, head_dim, n_q_heads, open_sectors)
+            if ctx.has_gate_projection:
+                gate_src = F.linear(
+                    u,
+                    gate_weight.to(dtype=u.dtype),
+                    gate_bias.to(dtype=u.dtype),
+                )
+                if gate_src.dtype != p_real.dtype:
+                    gate_src = gate_src.to(dtype=p_real.dtype)
+            else:
+                gate_src = p_real
         grad_p, grad_gate, grad_beta, grad_bias, grad_trace, grad_trace_w = core_ext.paraplex_backward(
             grad_act, grad_s, grad_next, p_real, gate_src, beta, bias, trace, trace_w,
             reset, anchor, mode, floor, near_eps, m)
         B, T, N_local, H_local, imag_in = ctx.shapes
-        w_compute = w_imag if w_imag.dtype == u.dtype else w_imag.to(dtype=u.dtype)
         grad_u, grad_q, grad_k, grad_c, grad_d, grad_w = beta_ext.beta_backward_cuda_recompute(
             grad_beta, u, q_h, k_h, c_h, d_h, w_compute,
             hidden_per_q_head, head_dim, n_q_heads, open_sectors)
@@ -2593,7 +2722,8 @@ class _ParaplexFused(torch.autograd.Function):
             grad_w = grad_w.to(dtype=w_imag.dtype)
         QH, HD = n_q_heads, head_dim
         return (
-            grad_p, grad_gate, grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
+            grad_p, grad_gate, None, None, None,
+            grad_u, grad_q.view(B, T, QH, HD), grad_k.view(B, T, QH, HD),
             grad_c.view(B, T, QH, HD), grad_d.view(B, T, QH, HD), grad_w,
             grad_bias, grad_trace, grad_trace_w, None, None,
             None, None, None, None, None, None, None, None, None, None,
@@ -2813,8 +2943,30 @@ class ParaplexFFN(nn.Module):
         anchor_override = _checkpoint_anchor_override(self)
         anchor = self.beta_anchor.detach() if anchor_override is None else anchor_override
         update_anchor = bool(mode == 1 and self.training and anchor_override is None)
+        gate_weight = (
+            self.gate_proj.weight
+            if self.gate_proj is not None
+            else p_real.new_empty(0)
+        )
+        gate_bias = (
+            self.gate_proj.bias
+            if self.gate_proj is not None
+            else p_real.new_empty(0)
+        )
+        recompute_intermediates = not (
+            GRAD_CHECKPOINTING
+            and self.training
+            and TRIA_CARRY_ENABLED
+            and TRIA_TEMPORAL_ENABLED
+        )
+        # Non-reentrant checkpoint already discards and regenerates saved
+        # tensors, so saving beta/gate_src there costs no retained VRAM and
+        # avoids recomputing both a second time in the custom backward.
+        # Outside checkpoint, rebuild them from the already-saved inputs.
         act, s, next_trace, anchor_snapshot = _ParaplexFused.apply(
-            cast(p_real), cast(gate_src), cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
+            cast(p_real), cast(gate_src), gate_weight, gate_bias,
+            recompute_intermediates,
+            cast(u), cast(q_h), cast(k_ctx_h), cast(c_h), cast(d_h),
             self.w1_imag, self.w1_imag_bias, cast(trace), self.w1_imag_trace,
             reset, anchor, HIDDEN_PER_Q_HEAD, HEAD_DIM, N_Q_HEADS,
             PHASE_SECTORS == "open", mode, update_anchor, self.beta_anchor_decay,
@@ -3514,9 +3666,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         incoming tensor happens to already be."""
         if not hidden.is_cuda:
             return False
-        if not torch.is_autocast_enabled():
-            return False
-        if torch.get_autocast_gpu_dtype() != torch.bfloat16:
+        if _cuda_autocast_dtype_or_none() != torch.bfloat16:
             return False
         try:
             major, _minor = torch.cuda.get_device_capability(hidden.device)
@@ -3842,7 +3992,9 @@ class Model(nn.Module):
 
     def _run_chunk_stack_impl(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
                               chunk_mask: Optional[torch.Tensor], layer_states: list,
-                              accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor]):
+                              accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
+                              endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool,
+                              replay_tape):
         """Run the full block stack for one temporal chunk and return tensor state."""
         n_blocks = len(self.blocks)
         k0, v0 = self.depth_attn.project(h_emb_chunk)
@@ -3854,15 +4006,9 @@ class Model(nn.Module):
         k_new_out = []
         v_new_out = []
         phase_out = []
-        # Outer activation checkpointing already recomputes the complete chunk.
-        # Keeping Tria's inner replay tape as well would retain strong references
-        # to every layer's r/i/o and defeat most of the memory saving.
-        replay_scope = (
-            contextlib.nullcontext()
-            if GRAD_CHECKPOINTING
-            else tria.depth_replay_scope(seed=accT_seed, seed_valid=seed_valid)
-        )
-        with replay_scope:
+        with tria.depth_replay_scope(
+            seed=accT_seed, seed_valid=seed_valid, tape=replay_tape
+        ):
             for bi, block in enumerate(self.blocks):
                 ls = layer_states[bi]
                 h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry, p = self._run_block_chunk(
@@ -3872,12 +4018,25 @@ class Model(nn.Module):
                 k_new_out.append(k_new)
                 v_new_out.append(v_new)
                 phase_out.append(next_phase_trace)
-        return (h, carry, *k_new_out, *v_new_out, *phase_out)
+            endpoint = (
+                tria.temporal_carry_endpoint(
+                    carry, endpoint_reset,
+                    initial_state=accT_seed,
+                )
+                if want_endpoint else None
+            )
+            tail = carry[:, -1].detach().contiguous() if want_tail else None
+        return (h, endpoint, tail, *k_new_out, *v_new_out, *phase_out)
 
     def _run_chunk_stack(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
                           chunk_mask: Optional[torch.Tensor], layer_states: list,
-                          accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor]):
+                          accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
+                          endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool):
         n_blocks = len(self.blocks)
+        # Custom autograd ctx objects are created in the original forward,
+        # while r/i/o are regenerated later. Keep the tape identity stable
+        # across both passes so those ctx objects see the refilled entries.
+        replay_tape = tria.new_depth_replay_tape()
         if GRAD_CHECKPOINTING and self.training:
             holder: dict = {}
 
@@ -3895,9 +4054,17 @@ class Model(nn.Module):
                 layer_states,
                 accT_seed,
                 seed_valid,
+                endpoint_reset,
+                want_endpoint,
+                want_tail,
+                replay_tape,
                 use_reentrant=False,
                 context_fn=context_fn,
             )
+            # The original pass populated the stable tape identity, but its
+            # tensors must not outlive the checkpointed region. Recompute
+            # resets and refills the same tape before Tria backward uses it.
+            replay_tape.release_inputs()
             # Forward updates the secant EMA once. Recompute must use exactly
             # that per-layer snapshot without updating the persistent buffer again.
             holder["anchor_overrides"] = {
@@ -3906,12 +4073,15 @@ class Model(nn.Module):
             }
         else:
             flat = self._run_chunk_stack_impl(
-                h_emb_chunk, position_ids_chunk, chunk_mask, layer_states, accT_seed, seed_valid)
+                h_emb_chunk, position_ids_chunk, chunk_mask, layer_states,
+                accT_seed, seed_valid, endpoint_reset, want_endpoint, want_tail,
+                replay_tape)
         h = flat[0]
-        carry = flat[1]
-        k_new = flat[2:2 + n_blocks]
-        v_new = flat[2 + n_blocks:2 + 2 * n_blocks]
-        phase = flat[2 + 2 * n_blocks:2 + 3 * n_blocks]
+        endpoint = flat[1]
+        tail = flat[2]
+        k_new = flat[3:3 + n_blocks]
+        v_new = flat[3 + n_blocks:3 + 2 * n_blocks]
+        phase = flat[3 + 2 * n_blocks:3 + 3 * n_blocks]
         new_layer_states = [
             TrainChunkLayerState(
                 k_chunks=layer_states[i].k_chunks + (k_new[i],),
@@ -3920,7 +4090,7 @@ class Model(nn.Module):
             )
             for i in range(n_blocks)
         ]
-        return h, carry, new_layer_states
+        return h, endpoint, tail, new_layer_states
 
     def forward(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.Tensor] = None,
@@ -4001,9 +4171,6 @@ class Model(nn.Module):
             if temporal_state is not None:
                 seed_valid = fire_mask[:, s - 1] & ~document_reset[:, s]
                 temporal_seed = temporal_state
-            h_chunk, depth_chunk, layer_states = self._run_chunk_stack(
-                h_emb[:, s:e], position_ids[:, s:e], chunk_mask, layer_states,
-                temporal_seed, seed_valid)
             local_reset = document_reset[:, s:e].clone()
             if seed_valid is not None:
                 local_reset[:, 0] |= seed_valid
@@ -4018,9 +4185,12 @@ class Model(nn.Module):
             # step. Structurally verified DEAD (no path to loss), so skipping
             # it changes neither loss nor any gradient.
             endpoint_consumed = (e != T) or ((e - 1) in boundary_set)
+            h_chunk, temporal_endpoint, depth_tail, layer_states = self._run_chunk_stack(
+                h_emb[:, s:e], position_ids[:, s:e], chunk_mask, layer_states,
+                temporal_seed, seed_valid, local_reset, endpoint_consumed,
+                self.capture_tria_depth_carry)
             if endpoint_consumed:
-                temporal_state = tria.temporal_carry_endpoint(
-                    depth_chunk, local_reset, initial_state=temporal_state)
+                temporal_state = temporal_endpoint
             h_chunks.append(h_chunk)
             if e - 1 in boundary_set:
                 boundary_valid = fire_mask[:, e - 1]
@@ -4029,7 +4199,8 @@ class Model(nn.Module):
                 temporal_state = torch.where(
                     boundary_valid[:, None, None, None], corrected_state, temporal_state)
                 key_carries.append(temporal_state)
-                key_depth.append(depth_chunk[:, -1])
+                if self.capture_tria_depth_carry:
+                    key_depth.append(depth_tail)
                 key_valid.append(boundary_valid)
                 key_positions.append(e - 1)
             s = e
@@ -4853,6 +5024,7 @@ async def train_one_async(
     resume_in: Optional[str] = None,
     val_dataset: Optional[str] = None,
     resume_step: Optional[int] = None,
+    resume_dataset_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     rank = ddp_rank() if ddp_is_distributed() else 0
     set_seed(int(cfg.seed) + 1000003 * int(rank))
@@ -4860,6 +5032,10 @@ async def train_one_async(
     start_step = 0
     tokens_seen_at_start = 0
     resume_blob: Dict[str, Any] = {}
+    dataset_progress: Dict[str, Dict[str, int]] = {}
+    current_dataset_key = dataset_progress_key(dataset)
+    current_dataset_steps = 0
+    current_dataset_draws = 0
     if resume_in:
         resume_blob = torch.load(resume_in, map_location="cpu", weights_only=True)
         if resume_step is not None:
@@ -4892,25 +5068,29 @@ async def train_one_async(
                 f"[resume] checkpoint has no tokens_seen; estimated "
                 f"{format_big_int(tokens_seen_at_start)} processed tokens "
                 "from its saved step/batch/sequence config.")
-        replay_data, replay_reason = should_replay_resume_data(
-            cfg, dataset, resume_blob.get("cfg", {}))
+        (
+            dataset_progress,
+            current_dataset_key,
+            current_dataset_steps,
+            current_dataset_draws,
+            replay_reason,
+        ) = resolve_resume_dataset_progress(
+            cfg, dataset, resume_blob, start_step, resume_dataset_steps)
         ddp_print(f"[resume] data cursor policy: {replay_reason}.")
-        if not replay_data:
+        if isinstance(stream, ShardStream) and current_dataset_draws > 0:
             ddp_print(
-                "[resume] restarting data stream while preserving checkpoint "
-                "step/LR schedule.")
-        if isinstance(stream, ShardStream) and start_step > 0 and replay_data:
-            _accum = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
-            _n_replay = start_step * _accum
-            ddp_print(f"[resume] fast-forwarding ShardStream RNG by {_n_replay} batch draws "
-                      f"(start_step={start_step} * grad_accum_steps={_accum}) to skip already-seen data...")
-            for _ in range(_n_replay):
+                f"[resume] fast-forwarding ShardStream RNG by "
+                f"{current_dataset_draws} saved batch draws for "
+                f"{current_dataset_key!r}...")
+            for _ in range(current_dataset_draws):
                 stream._sample_batch()
             ddp_print("[resume] fast-forward done.")
-        elif isinstance(stream, ShardStream) and start_step > 0:
+        elif isinstance(stream, ShardStream):
             ddp_print("[resume] data stream starts at draw 0 (no fast-forward).")
         ddp_print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
                   f"LR schedule/log step numbering continue (unchanged if cfg.steps/warmup_steps match the original run).")
+    else:
+        dataset_progress[current_dataset_key] = {"steps": 0, "draws": 0}
     if isinstance(stream, ShardStream):
         await stream.prime()
     eval_dataset = val_dataset or dataset
@@ -5034,7 +5214,9 @@ async def train_one_async(
             {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
              "ablation": ablation, "model": model_base.state_dict(),
              "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
-             "step": 0, "tokens_seen": 0},
+             "step": 0, "tokens_seen": 0,
+             "dataset_progress_version": 1,
+             "dataset_progress": dataset_progress},
             init_path,
         )
         ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
@@ -5158,11 +5340,17 @@ async def train_one_async(
             if saved_cfg.get("tria_temporal_window") is not None:
                 saved_cfg["tria_temporal_auto"] = False
             saved_step = int(step if step_override is None else step_override)
+            dataset_progress[current_dataset_key] = {
+                "steps": int(current_dataset_steps),
+                "draws": int(current_dataset_draws),
+            }
             torch.save(
                 {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
                  "ablation": ablation, "model": raw_model.state_dict(),
                  "optimizer_name": optimizer_name, "optimizer": opt.state_dict(),
-                 "step": saved_step, "tokens_seen": int(tokens_seen_global)},
+                 "step": saved_step, "tokens_seen": int(tokens_seen_global),
+                 "dataset_progress_version": 1,
+                 "dataset_progress": dataset_progress},
                 save_path,
             )
             print(f"[train] saved {tag} -> {save_path}")
@@ -5332,6 +5520,12 @@ async def train_one_async(
                     f"examples={bad_param_list}"
                 )
 
+            current_dataset_steps += 1
+            current_dataset_draws += accum_steps
+            dataset_progress[current_dataset_key] = {
+                "steps": current_dataset_steps,
+                "draws": current_dataset_draws,
+            }
             train_loss_local = train_loss_sum / float(accum_steps)
             train_loss_log = ddp_mean_float(train_loss_local, device)
             train_tokens_global = ddp_sum_int(train_tokens_step, device)
@@ -5414,7 +5608,16 @@ def print_architecture_report(cfg: Config, device: torch.device, ablation: bool,
     ddp_print(f"  val      {val_dataset}" if val_dataset else "  val      (none -- training loss only)")
 
 
-async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out: Optional[str], ablation: bool, resume: Optional[str] = None, resume_step: Optional[int] = None) -> None:
+async def train_async(
+    cfg: Config,
+    dataset: str,
+    device: torch.device,
+    ckpt_out: Optional[str],
+    ablation: bool,
+    resume: Optional[str] = None,
+    resume_step: Optional[int] = None,
+    resume_dataset_steps: Optional[int] = None,
+) -> None:
     set_seed(int(cfg.seed) + 1000003 * int(ddp_rank()))
     # Persist the effective path even when it came from CLI --dataset. This is
     # what makes resume_data_stream:auto reliable on the next launch.
@@ -5432,7 +5635,7 @@ async def train_async(cfg: Config, dataset: str, device: torch.device, ckpt_out:
     results = {}
     results["paraplex"] = await train_one_async(
         cfg, dataset, device, ablation, ckpt_out, resume, val_dataset=val_dataset,
-        resume_step=resume_step,
+        resume_step=resume_step, resume_dataset_steps=resume_dataset_steps,
     )
 
     ddp_print("\nSummary:")
@@ -5706,10 +5909,15 @@ def main() -> None:
     ap.add_argument("--resume", type=str, default=None, help="smart resume: load model and optimizer state, continue step count/LR schedule, and apply the configured dataset cursor policy")
     ap.add_argument("--resume-step", type=int, default=None, help="override/hard-set the step to resume from, for checkpoints saved before 'step' was recorded (or to force a specific value)")
     ap.add_argument(
+        "--resume-dataset-steps", type=int, default=None,
+        help="one-time override for completed optimizer steps on the current "
+             "dataset; seeds per-dataset progress in legacy checkpoints")
+    ap.add_argument(
         "--resume-data", type=str, default=None,
         choices=("auto", "continue", "restart"),
-        help="resume dataset cursor: auto restarts on a changed train_dataset; "
-             "continue always fast-forwards; restart always starts at draw 0")
+        help="resume dataset cursor: auto restores per-dataset progress (or "
+             "starts a new dataset at draw 0); continue uses legacy global-step "
+             "replay when no saved entry exists; restart always starts at draw 0")
     ap.add_argument("--prompt", type=str, default="")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--smoke-test", action="store_true")
@@ -5813,7 +6021,10 @@ def main() -> None:
         train_dataset = args.dataset or cfg.train_dataset
         assert train_dataset, "--train needs --dataset or train_dataset in config"
         resume_path = args.resume if args.resume is not None else cfg.resume
-        asyncio.run(train_async(cfg, train_dataset, dev, args.checkpoint or "loomformer.pt", args.ablation, resume_path, args.resume_step))
+        asyncio.run(train_async(
+            cfg, train_dataset, dev, args.checkpoint or "loomformer.pt",
+            args.ablation, resume_path, args.resume_step,
+            args.resume_dataset_steps))
         return
     if args.export_aoti:
         assert args.checkpoint, "--export-aoti needs --checkpoint"

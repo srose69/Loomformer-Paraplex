@@ -215,6 +215,11 @@ def _tria_cuda_op_enabled(name: str) -> bool:
 
 
 def _warn_cuda_fallback(name: str, error: BaseException) -> None:
+    try:
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+    except (TypeError, ValueError):
+        pass
     key = name.strip().lower().replace("-", "_")
     if key in _TRIA_FALLBACK_PRINTED:
         return
@@ -286,6 +291,24 @@ class _DepthReplayTape:
         self._expected = None
         self._tables = None
         self._cleanup_registered = False
+
+    def reset(self):
+        """Prepare this tape identity for an activation-checkpoint replay."""
+        self.entries.clear()
+        self.current_index = -1
+        self._reverse_value = None
+        self._expected = None
+        self._tables = None
+
+    def release_inputs(self):
+        """Drop original-forward tensors that checkpoint will recompute."""
+        for entry in self.entries:
+            entry["r"] = None
+            entry["i"] = None
+            entry["o"] = None
+        self.seed = None
+        self.seed_valid = None
+        self._tables = None
 
     def record(self, r, i, o, axis):
         if r.shape != i.shape or r.shape != o.shape:
@@ -400,6 +423,7 @@ class _DepthReplayTape:
 
     def clear(self):
         self.entries.clear()
+        self.current_index = -1
         self.seed = None
         self.seed_valid = None
         self._tables = None
@@ -418,15 +442,24 @@ def _active_depth_replay():
 
 
 @contextmanager
-def depth_replay_scope(seed=None, seed_valid=None):
+def depth_replay_scope(seed=None, seed_valid=None, tape=None):
     previous = _active_depth_replay()
-    tape = _DepthReplayTape(seed=seed, seed_valid=seed_valid)
+    if tape is None:
+        tape = _DepthReplayTape(seed=seed, seed_valid=seed_valid)
+    else:
+        tape.reset()
+        tape.seed = seed
+        tape.seed_valid = seed_valid
     _depth_replay_tls.tape = tape
     try:
         yield tape
     finally:
         _depth_replay_tls.tape = previous
         tape.register_scope_cleanup()
+
+
+def new_depth_replay_tape():
+    return _DepthReplayTape()
 
 
 def record_depth_replay(r, i, o, axis):

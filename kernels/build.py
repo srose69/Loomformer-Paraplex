@@ -88,7 +88,17 @@ def _progress_total_count() -> int:
 # status line: single self-overwriting "[kernels] ..." line per build step.
 # ============================================================================
 
+def _status_enabled() -> bool:
+    """Only global rank zero owns user-facing kernel build progress."""
+    try:
+        return int(os.environ.get("RANK", "0")) == 0
+    except (TypeError, ValueError):
+        return True
+
+
 def _status(msg: str, done: bool = False) -> None:
+    if not _status_enabled():
+        return
     pad = " " * 8
     line = f"[kernels] {msg}"
     if done:
@@ -319,7 +329,7 @@ def build_or_load(
 
         groups_label = ""
         if ptx_kernels and len(ptx_kernels) > 1:
-            groups_label = " [" + ", ".join(ptx_kernels.keys()) + "]"
+            groups_label = f" [{len(ptx_kernels)} fused kernels]"
 
         verb = "compiling" if changed else "loading (cached)"
         _status(f"{counter} {verb} {ext_name}{groups_label}...")
@@ -329,7 +339,7 @@ def build_or_load(
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda_cflags,
             build_directory=build_dir,
-            verbose=bool(os.environ.get("KERNELS_VERBOSE")),
+            verbose=bool(os.environ.get("KERNELS_VERBOSE")) and _status_enabled(),
         )
         verb_done = "compiled" if changed else "loaded (cached)"
         _status(f"{counter} {verb_done} {ext_name}{groups_label}", done=True)

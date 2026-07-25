@@ -18,7 +18,7 @@ by **srose69** (SimpleRose)
 [![Residual DepthAttn](https://img.shields.io/badge/residual-DepthAttn-cyan)](#depthattn)
 [![Operator carry Tria](https://img.shields.io/badge/operator%20carry-Tria-orange)](#tria)
 [![Activation PvPowLU](https://img.shields.io/badge/activation-PvPowLU-ff69b4)](#pvpowlu)
-[![Checkpoint 113M](https://img.shields.io/badge/checkpoint-113M-yellow)](https://huggingface.co/srs6901/LoomFormer-Paraplex/)
+[![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/srs6901/LoomFormer-Paraplex/)
 [![SFT supported](https://img.shields.io/badge/SFT-supported-purple)](#training-sft-and-inference)
 [![Status experimental](https://img.shields.io/badge/status-experimental-orange)](#status)
 

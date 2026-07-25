@@ -4725,6 +4725,73 @@ def format_big_int(n: int) -> str:
     return f"{int(n):,}"
 
 
+def format_eta_hours_minutes(seconds: float) -> str:
+    """Compact non-negative ETA, rounded up to the next whole minute."""
+    if not math.isfinite(seconds) or seconds < 0.0:
+        return "?h ?min"
+    total_minutes = int(math.ceil(seconds / 60.0))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes:02d}min"
+
+
+def _log_colors_enabled() -> bool:
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    forced = str(os.environ.get("FORCE_COLOR", "")).strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _log_color(text: str, color: int, bold: bool = False) -> str:
+    if not _log_colors_enabled():
+        return text
+    weight = "1;" if bold else ""
+    return f"\033[{weight}38;5;{int(color)}m{text}\033[0m"
+
+
+def _log_line(parts: List[str]) -> str:
+    separator = _log_color("|", 240)
+    return f" {separator} ".join(parts)
+
+
+def format_train_status(
+    step: int,
+    train_loss: float,
+    refeeds: int,
+    lr: float,
+    tokens: int,
+    data_wait_s: float,
+    left: str,
+    elapsed_s: float,
+) -> str:
+    # Orange/purple palette only. `tok` deliberately stays uncolored.
+    return _log_line([
+        _log_color("[LF]", 208, bold=True) + " " + _log_color(str(step), 141, bold=True),
+        _log_color("tr.loss:", 208) + " " + _log_color(f"{train_loss:.4f}", 215, bold=True),
+        _log_color("ref:", 135) + " " + _log_color(str(refeeds), 177),
+        _log_color("lr:", 173) + " " + _log_color(f"{lr:.2e}", 215),
+        f"tok: {format_big_int(tokens)}",
+        _log_color("dw:", 135) + " " + _log_color(f"{data_wait_s:.0f}s", 177),
+        _log_color("left:", 208) + " " + _log_color(left, 215, bold=True),
+        _log_color("lst:", 135) + " " + _log_color(f"{elapsed_s:.0f}s", 177),
+    ])
+
+
+def format_eval_status(
+    step: int,
+    eval_loss: float,
+    bits_tok: float,
+    bpb: float,
+) -> str:
+    return _log_line([
+        _log_color("[EVAL]", 135, bold=True) + " " + _log_color(str(step), 141, bold=True),
+        _log_color("loss:", 208) + " " + _log_color(f"{eval_loss:.4f}", 215, bold=True),
+        _log_color("bit/tok:", 135) + " " + _log_color(f"{bits_tok:.4f}", 183),
+        _log_color("bpb:", 173) + " " + _log_color(f"{bpb:.4f}", 215),
+    ])
+
+
 
 def print_training_budget(
     cfg: Config, dataset: str, start_step: int = 0, tokens_seen: int = 0,
@@ -5509,6 +5576,8 @@ async def train_one_async(
 
     step = start_step
     refeeds_since_log = torch.zeros((), dtype=torch.long, device=device)
+    tokens_per_second_ema: Optional[float] = None
+    tps_ema_alpha = 2.0 / 11.0  # conventional EMA span of 10 completed steps
     raw_model_for_tria = ddp_unwrap_model(model)  # temporal Tria diagnostics
                                                     # doesn't proxy through DDP's
                                                     # wrapper -- same reason
@@ -5521,6 +5590,7 @@ async def train_one_async(
                 # The request was observed between iterations; the previous
                 # optimizer update is the latest completed state.
                 _save_runpoint(step - 1)
+            _step_t0 = time.time()
             opt.zero_grad(set_to_none=True)
             train_loss_sum = 0.0
             train_tokens_step = 0
@@ -5629,6 +5699,20 @@ async def train_one_async(
             train_loss_log = ddp_mean_float(train_loss_local, device)
             train_tokens_global = ddp_sum_int(train_tokens_step, device)
             tokens_seen_global += int(train_tokens_global)
+            _step_seconds = max(time.time() - _step_t0, 1e-9)
+            _step_tps = float(train_tokens_global) / _step_seconds
+            tokens_per_second_ema = (
+                _step_tps
+                if tokens_per_second_ema is None
+                else (
+                    tps_ema_alpha * _step_tps
+                    + (1.0 - tps_ema_alpha) * tokens_per_second_ema
+                )
+            )
+            _remaining_tokens = (
+                max(0, int(cfg.steps) - step) * int(train_tokens_global))
+            _left = format_eta_hours_minutes(
+                _remaining_tokens / max(tokens_per_second_ema, 1e-9))
 
             log_every = max(1, int(getattr(cfg, "log_every", 100)))
             eval_every_cfg = getattr(cfg, "eval_every", None)
@@ -5639,28 +5723,22 @@ async def train_one_async(
                     dist.all_reduce(refeeds_log_t, op=dist.ReduceOp.SUM)
                 refeeds_log = int(refeeds_log_t.item())
                 refeeds_since_log.zero_()
-                elapsed = time.time() - t0
-                wait_pct = 100.0 * data_wait_s / elapsed if elapsed > 0 else 0.0
                 if step == 1 or step % eval_every == 0:
                     final_eval_local = await eval_loss_async(model_base, eval_stream, cfg, device, eos_id=eval_eos_id)
                     final_eval = ddp_mean_float(final_eval_local, device)
                     best_eval = min(best_eval, final_eval)
                     bits_tok, bpb = loss_to_bits(final_eval, eval_bpt)
-                    ddp_print(
-                        f"[{tag}] step {step:6d}  train_loss {train_loss_log:.4f}  "
-                        f"eval_loss {final_eval:.4f}  bits/tok {bits_tok:.4f}  "
-                        f"bpb {bpb:.4f}  "
-                        f"refeeds: {refeeds_log:d}  "
-                        f"lr {lr:.2e}  tokens {format_big_int(tokens_seen_global)}  "
-                        f"data_wait {data_wait_s:.0f}s({wait_pct:.0f}%)  ({elapsed:.0f}s)"
-                    )
+                    elapsed = time.time() - t0
+                    ddp_print(format_train_status(
+                        step, train_loss_log, refeeds_log, lr,
+                        tokens_seen_global, data_wait_s, _left, elapsed))
+                    ddp_print(format_eval_status(
+                        step, final_eval, bits_tok, bpb))
                 else:
-                    ddp_print(
-                        f"[{tag}] step {step:6d}  train_loss {train_loss_log:.4f}  "
-                        f"refeeds: {refeeds_log:d}  "
-                        f"lr {lr:.2e}  tokens {format_big_int(tokens_seen_global)}  "
-                        f"data_wait {data_wait_s:.0f}s({wait_pct:.0f}%)  ({elapsed:.0f}s)"
-                    )
+                    elapsed = time.time() - t0
+                    ddp_print(format_train_status(
+                        step, train_loss_log, refeeds_log, lr,
+                        tokens_seen_global, data_wait_s, _left, elapsed))
             if cfg.save_every and step % int(cfg.save_every) == 0:
                 _save_runpoint(step)
 
@@ -6026,6 +6104,10 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--smoke-test", action="store_true")
     ap.add_argument("--ablation", action="store_true", help="diagnostic: skip imag/phase and use s=1")
+    ap.add_argument(
+        "--color", action="store_true",
+        help="force ANSI colors even when stdout is redirected to a file "
+             "(tail -f displays them in a terminal)")
     ap.add_argument("--quiet", action="store_true",
                     help="--train only: relaunch training as a detached background "
                          "process (fresh interpreter, own CUDA context -- safe, unlike "
@@ -6037,6 +6119,10 @@ def main() -> None:
                          "set -- i.e. we're already one rank of an existing torchrun "
                          "launch, where self-detaching per rank would break rendezvous.")
     args = ap.parse_args()
+
+    if args.color:
+        os.environ.pop("NO_COLOR", None)
+        os.environ["FORCE_COLOR"] = "1"
 
     if args.smoke_test:
         smoke_test()

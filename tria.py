@@ -183,6 +183,7 @@ _graph_tria_step_op = None
 _graph_tria_step_gate_op = None
 _graph_gate_slot_mix_op = None
 _graph_slot_attention_pool_op = None
+_graph_final_ca_sparse_op = None
 _graph_temporal_carry_op = None
 
 
@@ -1524,6 +1525,10 @@ def final_ca_sparse(
         and cuda_shape_supported
         and _tria_cuda_op_enabled("final_ca_sparse")
     ):
+        if _GRAPH_MODE_ENABLED and _graph_final_ca_sparse_op is not None:
+            out, _lse = _graph_final_ca_sparse_op(
+                q, k, v, allowed.to(torch.bool), float(scale))
+            return out
         try:
             return _FinalCASparseFused.apply(q, k, v, allowed, float(scale))
         except RuntimeError as error:

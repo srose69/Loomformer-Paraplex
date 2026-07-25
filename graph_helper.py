@@ -18,9 +18,11 @@ Two-phase, cost = exactly one real training step:
   kernel's forward has been called at least once with REAL config-driven
   shapes (real batch size, real seq_len, real d_model, real carry shapes --
   whatever this specific run's YAML actually produces), and each call's
-  args were copied off (as fresh zero tensors, not the live ones) into
-  _captured. Registration then uses those REAL captured shapes to run the
-  arity-discovery probe -- no hand-guessed placeholder shapes anywhere.
+    args were recorded as lightweight shape/dtype/device metadata in
+    _captured. After backward, registration materializes one zero-valued
+    CUDA placeholder set at a time to run the arity-discovery probe, then
+    immediately releases it -- no hand-guessed shapes and no full-size
+    capture tensors retained alongside live training activations.
   Step 1 itself still runs on the old graph-breaking path (that IS the one
   step's cost); step 2 onward gets the registered custom_ops.
 
@@ -102,6 +104,7 @@ actually executing, __main__ or not) and the already-imported `tria` object
 explicitly instead.
 """
 import threading
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Sequence, Tuple, Type
 
 import torch
@@ -134,6 +137,9 @@ _KERNELS: List[Tuple[str, str, str, List[Tuple]]] = [
         [("carry", torch.Tensor), ("w", torch.Tensor)]),
     ("slot_attention_pool",     "tria", "_SlotAttentionPoolFused",
         [("carry", torch.Tensor), ("score_w", torch.Tensor)]),
+    ("final_ca_sparse",         "tria", "_FinalCASparseFused",
+        [("q", torch.Tensor), ("k", torch.Tensor), ("v", torch.Tensor),
+         ("allowed", torch.Tensor, False), ("scale", float)]),
     ("temporal_carry",          "tria", "_TemporalCarryFused",
         [("depth_carry", torch.Tensor), ("reset_mask", torch.Tensor, False)]),
     ("phase_sin",               "lf", "_PhaseSinFloorCUDA",
@@ -144,7 +150,7 @@ _KERNELS: List[Tuple[str, str, str, List[Tuple]]] = [
         [("x1", torch.Tensor), ("x2", torch.Tensor), ("m", float)]),
     ("depth_attn",               "lf", "_DepthAttnOnlineFused",
         [("q", torch.Tensor), ("hist_k", torch.Tensor), ("hist_v", torch.Tensor)]),
-    # beta_space and tria_final_ca intentionally NOT here -- see module docstring.
+    # beta_space intentionally is not here -- see module docstring.
 ]
 
 # These are NOT bugs and not coverage gaps -- confirmed by reading the
@@ -185,6 +191,7 @@ _CONDITIONALLY_REQUIRED: Dict[str, bool] = {
     "phase_sin": True,
     "temporal_carry": False,
 }
+_RUNTIME_NOT_REQUIRED: set = set()
 
 
 def set_conditionally_required(op_name: str, required: bool) -> None:
@@ -192,14 +199,25 @@ def set_conditionally_required(op_name: str, required: bool) -> None:
         raise ValueError(f"{op_name!r} is not a conditionally-required op -- add it to _CONDITIONALLY_REQUIRED first")
     _CONDITIONALLY_REQUIRED[op_name] = bool(required)
 
+
+def set_runtime_not_required(op_names: Sequence[str]) -> None:
+    """Mark ops hidden behind an intentional Dynamo-disabled region."""
+    global _RUNTIME_NOT_REQUIRED
+    known = {op_name for op_name, _, _, _ in _KERNELS}
+    known.add(_BETA_SPACE_TARGET[0])
+    unknown = set(op_names) - known
+    if unknown:
+        raise ValueError(
+            f"unknown graph-helper op(s): {', '.join(sorted(unknown))}")
+    _RUNTIME_NOT_REQUIRED = set(op_names)
+
 # beta_space needs its own capture target (same _wrap_forward_for_capture
 # mechanism as _KERNELS) but a HAND-WRITTEN registrar (_register_beta_space
 # below), not _register_one -- its ctx stores DERIVED shape/meta tuples
 # (ctx.shapes/ctx.meta), not single input/output tensors or single-valued
 # scalar attrs, which the generic identity/equality matcher can't
-# represent. tria_final_ca has no such target -- it's genuinely dead code
-# (nothing calls .apply() on it), unlike beta_space which is very much
-# live (ParaplexFFN._beta_space's whole point).
+# represent. final_ca_sparse is now a normal generic target in _KERNELS;
+# its internal FP32 LSE is carried as an extra non-public output.
 _BETA_SPACE_TARGET = ("beta_space", "lf", "_BetaSpaceDirect")
 
 # Registration-time-only placeholder shapes for arity discovery (see
@@ -214,15 +232,31 @@ _BETA_SPACE_TARGET = ("beta_space", "lf", "_BetaSpaceDirect")
 # install_capture_hooks() (called from apply_config(), BEFORE the model
 # exists) wraps each target class's forward with a one-shot recorder; the
 # FIRST real call during the actual training step -- real config, real
-# batch, real model, real device -- has its args' shape/dtype/device copied
-# (as a fresh zero tensor, NOT the live tensor itself -- see _capture_arg)
-# into _captured. finalize_registration() (called once, right after the
-# real step 1 completes) then registers every kernel that got captured
-# using THOSE real shapes as the arity-discovery probe's inputs. Any kernel
+# batch, real model, real device -- has only its args' shape/dtype/device
+# metadata copied into _captured. finalize_registration() (called after
+# backward) materializes one zero-valued probe at a time, registers that
+# kernel, and immediately releases the probe. Any kernel
 # that genuinely never ran during step 1 (shouldn't happen for any of these
 # 12 -- see graph_helper's usage note in loomformer.py -- but if it doesn't,
 # better to leave it graph-breaking than guess) is simply left unregistered.
 # ============================================================================
+
+@dataclass(frozen=True)
+class _CapturedTensorSpec:
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def nbytes(self) -> int:
+        count = 1
+        for dim in self.shape:
+            count *= int(dim)
+        return count * torch.empty((), dtype=self.dtype).element_size()
+
+    def materialize(self) -> torch.Tensor:
+        return torch.zeros(self.shape, dtype=self.dtype, device=self.device)
+
 
 _captured: Dict[str, List] = {}
 _hooks_installed = False
@@ -231,19 +265,28 @@ _registered_ops: set = set()  # op_names already wired up -- never re-registered
 
 def _capture_arg(a):
     if isinstance(a, torch.Tensor):
-        # Fresh zero tensor, same shape/dtype/device -- explicitly NOT the
-        # real tensor: holding the live one would keep that step's entire
-        # autograd graph (and all its activations) alive far past when it
-        # would otherwise be freed.
-        return torch.zeros_like(a).detach()
+        # Metadata only. A former implementation stored torch.zeros_like(a)
+        # here: detached avoided pinning autograd, but the full-size CUDA
+        # copies themselves consumed multiple GiB during and after warmup.
+        return _CapturedTensorSpec(
+            tuple(int(dim) for dim in a.shape), a.dtype, a.device)
     return a
+
+
+def _materialize_captured(args: Sequence) -> List:
+    return [
+        value.materialize()
+        if isinstance(value, _CapturedTensorSpec)
+        else value
+        for value in args
+    ]
 
 
 def _wrap_forward_for_capture(cls: Type[torch.autograd.Function], op_name: str) -> None:
     orig_forward = cls.forward
 
     def _capturing_forward(ctx, *args):
-        if op_name not in _captured:
+        if op_name not in _registered_ops and op_name not in _captured:
             _captured[op_name] = [_capture_arg(a) for a in args]
         return orig_forward(ctx, *args)
 
@@ -276,7 +319,8 @@ def is_finalized() -> bool:
     finalize_registration's docstring)."""
     all_names = [op_name for op_name, _, _, _ in _KERNELS] + [_BETA_SPACE_TARGET[0]]
     inactive_conditional = {n for n, active in _CONDITIONALLY_REQUIRED.items() if not active}
-    required = [n for n in all_names if n not in _KNOWN_FALLBACK_ONLY and n not in inactive_conditional]
+    not_required = _KNOWN_FALLBACK_ONLY | inactive_conditional | _RUNTIME_NOT_REQUIRED
+    required = [n for n in all_names if n not in not_required]
     return all(n in _registered_ops for n in required)
 
 
@@ -294,14 +338,25 @@ def registration_summary() -> Tuple[List[str], List[str], List[str]]:
     instead of inferring it from which warnings do or don't show up."""
     all_names = [op_name for op_name, _, _, _ in _KERNELS] + [_BETA_SPACE_TARGET[0]]
     inactive_conditional = {n for n, active in _CONDITIONALLY_REQUIRED.items() if not active}
-    fallback_set = _KNOWN_FALLBACK_ONLY | inactive_conditional
+    fallback_set = (
+        _KNOWN_FALLBACK_ONLY | inactive_conditional | _RUNTIME_NOT_REQUIRED)
     registered = [n for n in all_names if n in _registered_ops]
     missing = [n for n in all_names if n not in _registered_ops and n not in fallback_set]
     fallback_only = [n for n in all_names if n not in _registered_ops and n in fallback_set]
     return registered, missing, fallback_only
 
 
-def finalize_registration(lf_module, tria_module) -> None:
+def captured_tensor_bytes() -> int:
+    """Logical tensor bytes represented by lightweight capture metadata."""
+    total = 0
+    for args in _captured.values():
+        for value in args:
+            if isinstance(value, _CapturedTensorSpec):
+                total += value.nbytes
+    return total
+
+
+def finalize_registration(lf_module, tria_module) -> int:
     """Registers a custom_op for every kernel that's been _captured but not
     yet wired up. SAFE TO CALL MULTIPLE TIMES: each op only ever gets
     registered once (torch.library.custom_op would raise on a duplicate
@@ -322,18 +377,34 @@ def finalize_registration(lf_module, tria_module) -> None:
     actually reach that branch -- still bounded to a handful of steps, not
     "wait indefinitely"."""
     modules = {"lf": lf_module, "tria": tria_module}
+    registered_now = 0
     for op_name, module_key, class_name, arg_specs in _KERNELS:
         if op_name in _registered_ops or op_name not in _captured:
             continue
         cls = getattr(modules[module_key], class_name)
-        op = _register_one(op_name, cls, arg_specs, _captured[op_name])
-        setattr(modules[module_key], f"_graph_{op_name}_op", op)
+        captured = _captured.pop(op_name)
+        placeholder_args = _materialize_captured(captured)
+        # The arity probe calls the wrapped class.forward itself. Mark the op
+        # while probing so that capture hook does not immediately re-capture
+        # the just-materialized placeholders.
         _registered_ops.add(op_name)
+        try:
+            op = _register_one(op_name, cls, arg_specs, placeholder_args)
+        except Exception:
+            _registered_ops.discard(op_name)
+            raise
+        del placeholder_args, captured
+        setattr(modules[module_key], f"_graph_{op_name}_op", op)
+        registered_now += 1
 
     bs_op_name, bs_module_key, bs_class_name = _BETA_SPACE_TARGET
     if bs_op_name not in _registered_ops and bs_op_name in _captured:
-        _register_beta_space(modules[bs_module_key], _captured[bs_op_name])
+        # The hand-written beta registrar needs no arity probe tensors.
+        captured = _captured.pop(bs_op_name)
+        _register_beta_space(modules[bs_module_key], captured)
+        del captured
         _registered_ops.add(bs_op_name)
+        registered_now += 1
 
     if _registered_ops:
         # Flip on as soon as ANYTHING is registered -- each dispatcher
@@ -342,6 +413,7 @@ def finalize_registration(lf_module, tria_module) -> None:
         # every kernel before letting the ones that ARE ready take effect.
         lf_module.GRAPH_MODE_ENABLED = True
         tria_module.set_graph_mode_enabled(True)
+    return registered_now
 
 
 # ============================================================================
@@ -458,6 +530,12 @@ def _symbolic_fake_meta(op_name: str, args: Sequence) -> Tuple:
         return (
             ((carry.shape[0], carry.shape[1], 9), dtype),
             ((carry.shape[0], carry.shape[1]), dtype),
+        )
+    if op_name == "final_ca_sparse":
+        q = args[0]
+        return (
+            (tuple(q.shape), dtype),
+            ((q.shape[0], q.shape[1]), torch.float32),
         )
     if op_name == "temporal_carry":
         carry = args[0]

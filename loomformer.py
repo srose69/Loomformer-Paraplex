@@ -34,6 +34,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import tria  # sibling module, same directory -- see tria.py's own docstring
 
+
+def configure_cuda_math() -> None:
+    """Use one CUDA matmul policy in single-GPU and every DDP rank."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -43,9 +51,7 @@ def set_seed(seed: int) -> None:
 def device_auto(pref: Optional[str] = None) -> torch.device:
     dev = torch.device(pref) if pref else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if dev.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        configure_cuda_math()
     return dev
 
 
@@ -371,6 +377,11 @@ class Config:
     fused_linear_ce: bool = False
     fused_linear_ce_chunk_size: int = 0  # 0 = auto (Liger memory-balancing formula); or a fixed row-chunk override
     use_cuda_tria: bool = False
+    # Independent switches:
+    #   compile -- wrap the model with torch.compile/Dynamo/Inductor;
+    #   graph   -- register the pybind CUDA kernels as torch.library custom
+    #              ops so Dynamo can trace through them without graph breaks.
+    compile: bool = False
     graph: bool = False
     save_graph: bool = False  
     tria_temporal_enabled: bool = True
@@ -1233,6 +1244,21 @@ def apply_config(cfg: Config) -> None:
         graph_helper.set_conditionally_required("phase_sin_secant", PHASE_GRAD_MODE == "secant")
         graph_helper.set_conditionally_required("phase_sin", PHASE_GRAD_MODE == "floor")
         graph_helper.set_conditionally_required("temporal_carry", TRIA_CARRY_ENABLED and tria.cuda_tria_enabled())
+        checkpoint_stack_is_eager = bool(
+            getattr(cfg, "compile", False)
+            and GRAD_CHECKPOINTING
+            and TRIA_CARRY_ENABLED
+            and TRIA_TEMPORAL_ENABLED
+        )
+        graph_helper.set_runtime_not_required(
+            {
+                "tria_init", "tria_init_gate", "tria_step", "tria_step_gate",
+                "gate_slot_mix", "temporal_carry", "phase_sin",
+                "phase_sin_secant", "pvpowlu", "depth_attn", "beta_space",
+            }
+            if checkpoint_stack_is_eager
+            else set()
+        )
         graph_helper.install_capture_hooks(sys.modules[__name__], tria)
 
 
@@ -3752,6 +3778,26 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         return grad_hidden * grad_output, None, None, None, None
 
 
+@torch._dynamo.disable
+def _fused_linear_cross_entropy_eager(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Explicit Dynamo boundary for the hand-fused CE implementation.
+
+    Its one deliberate host sync computes the exact mean denominator and its
+    Python chunk loop bounds peak logits memory. Letting Dynamo enter it only
+    produces a noisy Tensor.item() graph break; compiling the surrounding
+    model regions while executing this custom autograd op eager is the
+    intended behavior.
+    """
+    return _FusedLinearCrossEntropy.apply(
+        hidden, weight, targets, ignore_index, chunk_size)
+
+
 class Block(nn.Module):
     def __init__(self, ablation: bool = False) -> None:
         super().__init__()
@@ -3831,7 +3877,7 @@ class Model(nn.Module):
             return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1),
                                     ignore_index=ignore_index)
         hidden = self.ln_final(h) if self.ln_final is not None else h
-        return _FusedLinearCrossEntropy.apply(
+        return _fused_linear_cross_entropy_eager(
             hidden.reshape(-1, hidden.shape[-1]), self.head.weight, labels.reshape(-1),
             ignore_index, FUSED_LINEAR_CE_CHUNK_SIZE)
 
@@ -4028,10 +4074,21 @@ class Model(nn.Module):
             tail = carry[:, -1].detach().contiguous() if want_tail else None
         return (h, endpoint, tail, *k_new_out, *v_new_out, *phase_out)
 
+    @torch._dynamo.disable
     def _run_chunk_stack(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
                           chunk_mask: Optional[torch.Tensor], layer_states: list,
                           accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
                           endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool):
+        """Checkpointed Tria stack is an intentional Dynamo boundary.
+
+        Its non-reentrant checkpoint uses a per-call mutable replay tape plus
+        different original/recompute Python contexts. PyTorch 2.5 Dynamo tries
+        to turn checkpoint into a higher-order graph op, but does not support
+        our nested ``context_fn`` and, more importantly, must not freeze the
+        tape/TLS mutations into a compiled graph. Keep this correctness-
+        sensitive region eager; torch.compile resumes on the tensor-only
+        regions around it.
+        """
         n_blocks = len(self.blocks)
         # Custom autograd ctx objects are created in the original forward,
         # while r/i/o are regenerated later. Keep the tape identity stable
@@ -4439,12 +4496,20 @@ def count_params(model: nn.Module) -> int:
 # ============================================================================
 
 
-def maybe_compile(model: nn.Module, device: torch.device, use_graph: bool = True) -> nn.Module:
-    if not use_graph:
+def maybe_compile(model: nn.Module, device: torch.device, enabled: bool = True) -> nn.Module:
+    if not enabled:
         return model
     if device.type == "cuda":
         major, minor = torch.cuda.get_device_capability()
         if hasattr(torch, "compile") and major >= 7:
+            # Internal PyTorch 2.5 deprecation, fixed upstream in newer
+            # releases; unrelated to model code or graph correctness.
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`torch\._prims_common\.check` is deprecated.*",
+                category=FutureWarning,
+                module=r"torch\._inductor\.lowering",
+            )
             return torch.compile(model, dynamic=None, fullgraph=False)
     return model
 
@@ -5125,7 +5190,8 @@ async def train_one_async(
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and resume_in:
         raise ValueError("save_initial_checkpoint requires a fresh run without resume")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
-    model_compiled = maybe_compile(model_base, device, use_graph=bool(getattr(cfg, "graph", False)))
+    model_compiled = maybe_compile(
+        model_base, device, enabled=bool(getattr(cfg, "compile", False)))
     if ddp_is_distributed():
         model = DDP(
             model_compiled,
@@ -5145,29 +5211,49 @@ async def train_one_async(
         _was_training = model_base.training
         model_base.train()
         _MAX_WARMUP_ATTEMPTS = 5
+        _capture_bytes_released = 0
         for _attempt in range(1, _MAX_WARMUP_ATTEMPTS + 1):
             _warm_batch = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
             _wx, _wy = _warm_batch[:, :-1], _warm_batch[:, 1:]
+            _warm_pos, _warm_mask = build_doc_reset_state(_wx, train_eos_id)
             with amp_autocast(device):
-                _wlogits = model_base(_wx)
-            _wloss = F.cross_entropy(_wlogits.float().reshape(-1, VOCAB), _wy.reshape(-1))
+                _wloss = model_base(
+                    _wx, attn_mask=_warm_mask, position_ids=_warm_pos,
+                    labels=_wy)
             _wloss.backward()
             model_base.zero_grad(set_to_none=True)
-            graph_helper.finalize_registration(sys.modules[__name__], tria)
-            del _warm_batch, _wx, _wy, _wlogits, _wloss
+            _capture_before = graph_helper.captured_tensor_bytes()
+            _registered_now = graph_helper.finalize_registration(
+                sys.modules[__name__], tria)
+            _capture_after = graph_helper.captured_tensor_bytes()
+            _capture_bytes_released += max(0, _capture_before - _capture_after)
+            del _warm_batch, _wx, _wy, _warm_pos, _warm_mask, _wloss
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             if graph_helper.is_finalized():
                 break
+            if _registered_now == 0:
+                # Repeating an identical full-size synthetic step cannot
+                # discover a structurally inactive path. Stop instead of
+                # doing five expensive forward/backward passes.
+                break
         if not _was_training:
             model_base.eval()
         _registered, _missing, _fallback_only = graph_helper.registration_summary()
-        ddp_print(f"[graph] registered after {_attempt} warmup attempt(s): {', '.join(_registered) or '(none)'}")
+        ddp_print(
+            f"[custom-ops] registered after {_attempt} warmup attempt(s): "
+            f"{', '.join(_registered) or '(none)'}; represented "
+            f"{_capture_bytes_released / (1024 ** 2):.1f} MiB via metadata "
+            "(0 MiB retained)")
         if _fallback_only:
-            ddp_print(f"[graph] fallback-only, not registered (expected, not a problem): {', '.join(_fallback_only)}")
+            ddp_print(
+                "[custom-ops] not required in active compiled path: "
+                f"{', '.join(_fallback_only)}")
         if _missing:
-            ddp_print(f"[graph] NOT registered after {_MAX_WARMUP_ATTEMPTS} attempts (worth investigating): {', '.join(_missing)}")
+            ddp_print(
+                f"[custom-ops] NOT registered after {_attempt} attempt(s) "
+                f"(worth investigating): {', '.join(_missing)}")
 
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
@@ -5222,22 +5308,35 @@ async def train_one_async(
         ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
     n_params = count_params(ddp_unwrap_model(model))
 
-    if hasattr(torch, "compile") and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
-        ddp_print("[compile] torch.compile warmup -- tracing + JIT compiling fused kernels (this may take a while)...")
+    if (
+        bool(getattr(cfg, "compile", False))
+        and hasattr(torch, "compile")
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device)[0] >= 7
+    ):
+        checkpoint_note = (
+            "; checkpointed Tria stack stays eager"
+            if GRAD_CHECKPOINTING and TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED
+            else ""
+        )
+        ddp_print(
+            "[compile] torch.compile warmup -- tracing tensor regions + "
+            f"Inductor codegen{checkpoint_note} (this may take a while)...")
         _warm_batch2 = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
         _wx2, _wy2 = _warm_batch2[:, :-1], _warm_batch2[:, 1:]
         _warm_pos2, _warm_mask2 = build_doc_reset_state(_wx2, train_eos_id)
         _compile_t0 = time.time()
         with amp_autocast(device):
-            _wlogits2 = model(_wx2, attn_mask=_warm_mask2, position_ids=_warm_pos2)
-        _wloss2 = F.cross_entropy(_wlogits2.float().reshape(-1, VOCAB), _wy2.reshape(-1))
+            _wloss2 = model(
+                _wx2, attn_mask=_warm_mask2, position_ids=_warm_pos2,
+                labels=_wy2)
         _wloss2.backward()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         _compile_s = time.time() - _compile_t0
         ddp_print(f"[compile] warmup done in {_compile_s:.1f}s -- compiled graph cached for subsequent steps")
         opt.zero_grad(set_to_none=True)
-        del _warm_batch2, _wx2, _wy2, _warm_pos2, _warm_mask2, _wlogits2, _wloss2
+        del _warm_batch2, _wx2, _wy2, _warm_pos2, _warm_mask2, _wloss2
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -5599,7 +5698,11 @@ def print_architecture_report(cfg: Config, device: torch.device, ablation: bool,
     branch_cap = "off" if RESIDUAL_BRANCH_RMS_CAP is None else f"{RESIDUAL_BRANCH_RMS_CAP:g}"
     ddp_print(f"  depth    readout={DEPTH_ATTN_READOUT}  qkv_rms={DEPTH_ATTN_QKV_RMS}  "
                f"branch_rms_cap={branch_cap}")
-    ddp_print(f"  memory   activation_checkpoint={'temporal-chunk' if GRAD_CHECKPOINTING else 'off'}")
+    ddp_print(
+        f"  memory   activation_checkpoint="
+        f"{'temporal-chunk' if GRAD_CHECKPOINTING else 'off'}  "
+        f"torch_compile={bool(getattr(cfg, 'compile', False))}  "
+        f"custom_op_graph={bool(getattr(cfg, 'graph', False))}")
     ddp_print(f"  rope     yarn  theta={ROPE_THETA:g}  factor={ROPE_FACTOR:g}x  "
                f"orig_len={ROPE_ORIGINAL_SEQ_LEN}")
     if HEAD_DIM < 8:
@@ -5841,7 +5944,8 @@ def eval_full(
     model = Model(cfg, ablation=ablation).to(device)
     load_model_blob_into(model, blob, ablation=ablation)
     model.eval()
-    model = maybe_compile(model, device, use_graph=bool(getattr(cfg, "graph", False)))
+    model = maybe_compile(
+        model, device, enabled=bool(getattr(cfg, "compile", False)))
 
     out = eval_full_model(model, cfg, dataset, device, eval_batch_size, eval_data_cache)
     print(f"dataset {dataset}")
@@ -5969,6 +6073,10 @@ def main() -> None:
         cfg.resume_data_stream = args.resume_data
     device_pref = args.device if args.device is not None else cfg.device
     dev, distributed, world_size, rank, local_rank = maybe_launch_or_init_ddp(device_pref, training=bool(args.train))
+    if dev.type == "cuda":
+        # The distributed setup returns directly after NCCL initialization
+        # instead of passing through device_auto(), so configure every rank.
+        configure_cuda_math()
     if dev.type == "cuda" and not distributed:
         idx = 0 if dev.index is None else int(dev.index)
         n_cuda = torch.cuda.device_count()

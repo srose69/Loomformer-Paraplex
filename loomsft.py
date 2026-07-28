@@ -71,7 +71,7 @@ def _iter_jsonl(path: str):
 
 
 def _iter_examples(path: str):
-    """Yield numbered examples from JSONL or an Arrow ``messages`` column."""
+    """Yield numbered examples from JSONL, an Arrow, or a Parquet ``messages`` column."""
     if path.endswith(".arrow") or path.endswith(".feather"):
         import pyarrow as pa
         import pyarrow.ipc as ipc
@@ -82,6 +82,13 @@ def _iter_examples(path: str):
                 src.seek(0)
                 reader = ipc.open_stream(src)
             table = reader.read_all()
+        if "messages" not in table.column_names:
+            raise ValueError(f"{path}: expected a 'messages' column, got {table.column_names}")
+        for i, row in enumerate(table.column("messages").to_pylist(), 1):
+            yield i, {"messages": row}
+    elif path.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        table = pq.read_table(path)
         if "messages" not in table.column_names:
             raise ValueError(f"{path}: expected a 'messages' column, got {table.column_names}")
         for i, row in enumerate(table.column("messages").to_pylist(), 1):

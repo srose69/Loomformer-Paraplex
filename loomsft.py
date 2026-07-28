@@ -71,28 +71,43 @@ def _iter_jsonl(path: str):
 
 
 def _iter_examples(path: str):
-    """Yield numbered examples from JSONL, an Arrow, or a Parquet ``messages`` column."""
+    """Yield numbered examples from JSONL, an Arrow, or a Parquet ``messages`` column.
+
+    Reads record-batch-by-record-batch rather than materializing the whole
+    table: pyarrow's nested (struct-in-list) type concatenation across
+    internal batches is unreliable at scale (ArrowNotImplementedError:
+    "Nested data conversions not implemented for chunked array outputs"),
+    but every individual RecordBatch is itself unchunked, so per-batch
+    to_pylist() always works.
+    """
     if path.endswith(".arrow") or path.endswith(".feather"):
         import pyarrow as pa
         import pyarrow.ipc as ipc
+        i = 0
         with pa.memory_map(path, "r") as src:
             try:
                 reader = ipc.open_file(src)
+                batches = [reader.get_batch(b) for b in range(reader.num_record_batches)]
             except pa.lib.ArrowInvalid:
                 src.seek(0)
                 reader = ipc.open_stream(src)
-            table = reader.read_all()
-        if "messages" not in table.column_names:
-            raise ValueError(f"{path}: expected a 'messages' column, got {table.column_names}")
-        for i, row in enumerate(table.column("messages").to_pylist(), 1):
-            yield i, {"messages": row}
+                batches = reader
+            for batch in batches:
+                if "messages" not in batch.schema.names:
+                    raise ValueError(f"{path}: expected a 'messages' column, got {batch.schema.names}")
+                for row in batch.column("messages").to_pylist():
+                    i += 1
+                    yield i, {"messages": row}
     elif path.endswith(".parquet"):
         import pyarrow.parquet as pq
-        table = pq.read_table(path)
-        if "messages" not in table.column_names:
-            raise ValueError(f"{path}: expected a 'messages' column, got {table.column_names}")
-        for i, row in enumerate(table.column("messages").to_pylist(), 1):
-            yield i, {"messages": row}
+        pf = pq.ParquetFile(path)
+        if "messages" not in pf.schema_arrow.names:
+            raise ValueError(f"{path}: expected a 'messages' column, got {pf.schema_arrow.names}")
+        i = 0
+        for batch in pf.iter_batches(columns=["messages"]):
+            for row in batch.column("messages").to_pylist():
+                i += 1
+                yield i, {"messages": row}
     else:
         for lineno, raw in _iter_jsonl(path):
             yield lineno, json.loads(raw)

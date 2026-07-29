@@ -11,6 +11,7 @@ import os
 import select
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from typing import Deque, Dict, List, Optional, Tuple
@@ -333,6 +334,176 @@ def _autocast(settings: Settings):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
+@dataclass
+class KVCalibration:
+    prefill_tps: float
+    decode_tps: float
+    chunk_size: int
+    preload_chunks: int
+    transfer_gbps: float
+    peer_access: Optional[bool] = None
+    copy_us: float = 0.0
+    consume_us: float = 0.0
+
+
+def _median_cuda_us(device: torch.device, fn, repeats: int = 7) -> float:
+    values: List[float] = []
+    for _ in range(repeats):
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize(device)
+        values.append((time.perf_counter() - start) * 1e6)
+    values.sort()
+    return values[len(values) // 2]
+
+
+def calibrate_kv_runtime(
+    model,
+    settings: Settings,
+    storage_device: torch.device,
+) -> KVCalibration:
+    """Calibrate the real model and the selected KV transport.
+
+    The model measurements deliberately use a full 2048-token forward (or the
+    configured context when shorter) plus incremental ``step`` TPS. CPU KV then
+    benchmarks the exact streamed attention implementation for candidate chunk
+    sizes. The measured no-starvation preload is padded by two chunks.
+    """
+    compute = torch.device(settings.device)
+    calib_len = min(2048, int(lf.SEQ_LEN))
+    if compute.type != "cuda":
+        return KVCalibration(0.0, 0.0, calib_len, 1, 0.0, None)
+
+    probe = torch.zeros((1, calib_len), dtype=torch.long, device=compute)
+    warm_len = min(64, calib_len)
+    with torch.inference_mode(), _autocast(settings):
+        _ = model(probe[:, :warm_len])
+    torch.cuda.synchronize(compute)
+    start = time.perf_counter()
+    with torch.inference_mode(), _autocast(settings):
+        full_out = model(probe)
+    torch.cuda.synchronize(compute)
+    prefill_seconds = max(time.perf_counter() - start, 1e-9)
+    del full_out
+    prefill_tps = calib_len / prefill_seconds
+
+    # Measure actual Python/model.step decode throughput, not a FLOP estimate.
+    step_count = min(32, calib_len)
+    state = None
+    torch.cuda.synchronize(compute)
+    start = time.perf_counter()
+    with torch.inference_mode(), _autocast(settings):
+        for pos in range(step_count):
+            _, state = model.step(probe[:, pos], pos, state)
+    torch.cuda.synchronize(compute)
+    decode_tps = step_count / max(time.perf_counter() - start, 1e-9)
+    del state
+
+    if storage_device.type == "cuda":
+        src_idx = compute.index if compute.index is not None else torch.cuda.current_device()
+        dst_idx = storage_device.index if storage_device.index is not None else 0
+        peer = bool(torch.cuda.can_device_access_peer(src_idx, dst_idx)) if src_idx != dst_idx else True
+        if storage_device == compute:
+            return KVCalibration(prefill_tps, decode_tps, calib_len, 1, 0.0, peer)
+
+        # End-to-end activation shuttle (Q/Knew/Vnew out, c/kctx back).
+        outgoing = torch.empty(
+            (1, 1, lf.N + 2 * lf.KV_DIM), dtype=settings.torch_dtype(), device=compute)
+        def remote_roundtrip() -> None:
+            remote = outgoing.to(storage_device, non_blocking=True)
+            _ = remote[:, :, :2 * lf.N].to(compute, non_blocking=True)
+        shuttle_us = _median_cuda_us(compute, remote_roundtrip)
+        shuttle_bytes = outgoing.numel() * outgoing.element_size() + 2 * lf.N * outgoing.element_size()
+        gbps = shuttle_bytes / max(shuttle_us, 1e-9) / 1e3
+        return KVCalibration(prefill_tps, decode_tps, calib_len, 1, gbps, peer)
+
+    # CPU storage: use pinned memory and benchmark both transport and the exact
+    # online-attention pipeline. Candidate sizes are geometry-independent.
+    candidates = [
+        c for c in (128, 256, 512, 1024, 2048, 4096)
+        if c <= calib_len
+    ]
+    if calib_len not in candidates:
+        candidates.append(calib_len)
+    candidates = sorted(set(candidates))
+    dtype = settings.torch_dtype()
+    attn = model.blocks[0].attn
+    best: Optional[Tuple[float, int, int, float, float, float]] = None
+
+    for chunk in candidates:
+        n_chunks = math.ceil(calib_len / chunk)
+        host_k = torch.zeros(
+            (1, calib_len, lf.N_KV_HEADS, lf.HEAD_DIM),
+            dtype=dtype, pin_memory=True)
+        host_v = torch.zeros(
+            host_k.shape, dtype=dtype, pin_memory=True)
+        gpu_k = torch.empty(
+            (1, chunk, lf.N_KV_HEADS, lf.HEAD_DIM), dtype=dtype, device=compute)
+        gpu_v = torch.empty_like(gpu_k)
+
+        copy_us = _median_cuda_us(
+            compute,
+            lambda: (
+                gpu_k.copy_(host_k[:, :chunk], non_blocking=True),
+                gpu_v.copy_(host_v[:, :chunk], non_blocking=True),
+            ),
+            repeats=5,
+        )
+        q = torch.randn(
+            1, 1, lf.N_Q_HEADS, lf.HEAD_DIM, dtype=dtype, device=compute)
+        qg = q.transpose(1, 2)
+        compute_us = _median_cuda_us(
+            compute,
+            lambda: attn._online_chunk(qg, gpu_k, gpu_v, None),
+            repeats=5,
+        )
+        # Bound the synthetic-kernel result by both measured whole-model rates.
+        # Taking the minimum is intentionally conservative: calibration must
+        # never claim more overlap budget than either real execution mode
+        # demonstrated on this machine.
+        decode_layer_us = 1e6 / max(decode_tps * int(lf.LAYERS), 1e-9)
+        prefill_layer_us = (
+            chunk / max(prefill_tps * int(lf.LAYERS), 1e-9) * 1e6)
+        overlap_us = min(compute_us, decode_layer_us, prefill_layer_us)
+        if copy_us <= overlap_us:
+            required = 1
+        else:
+            required = math.ceil(
+                n_chunks - (n_chunks - 1) * overlap_us / copy_us)
+        preload = min(n_chunks, max(1, required + 2))
+
+        runtime = lf.InferenceKVRuntime(
+            storage_device,
+            compute,
+            chunk_size=chunk,
+            preload_chunks=preload,
+            copy_us=copy_us,
+            consume_us=overlap_us,
+        )
+        k_new = torch.zeros(
+            (1, 1, lf.N_KV_HEADS, lf.HEAD_DIM), dtype=dtype, device=compute)
+        v_new = torch.zeros_like(k_new)
+        pipeline_us = _median_cuda_us(
+            compute,
+            lambda: attn._step_cpu_kv(
+                q, k_new, v_new, host_k, host_v, calib_len - 1, runtime),
+            repeats=3,
+        )
+        transfer_bytes = 2 * chunk * lf.N_KV_HEADS * lf.HEAD_DIM * torch.empty(
+            (), dtype=dtype).element_size()
+        gbps = transfer_bytes / max(copy_us, 1e-9) / 1e3
+        candidate = (pipeline_us, chunk, preload, gbps, copy_us, overlap_us)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+
+    assert best is not None
+    _, chunk, preload, gbps, copy_us, overlap_us = best
+    return KVCalibration(
+        prefill_tps, decode_tps, chunk, preload, gbps, None,
+        copy_us=copy_us, consume_us=overlap_us)
+
+
 # ============================================================================
 # prefix KV cache
 #
@@ -378,18 +549,29 @@ def resolve_kv_device(spec: Optional[str], compute: torch.device) -> torch.devic
 
 
 def _copy_to(t: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
-    return None if t is None else t.to(device, copy=True)
+    if t is None:
+        return None
+    out = t.to(device, copy=True)
+    return out.pin_memory() if device.type == "cpu" and not out.is_pinned() else out
 
 
 def _trim_to(t: Optional[torch.Tensor], used: int, device: torch.device) -> Optional[torch.Tensor]:
-    return None if t is None else t[:, :int(used)].to(device, copy=True)
+    if t is None:
+        return None
+    out = t[:, :int(used)].to(device, copy=True)
+    return out.pin_memory() if device.type == "cpu" and not out.is_pinned() else out
 
 
 def _expand_to(t: Optional[torch.Tensor], seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
     """Re-inflate a trimmed buffer: step() writes in place at index cache_len."""
     if t is None:
         return None
-    full = torch.zeros((t.shape[0], seq_len, *t.shape[2:]), dtype=t.dtype, device=device)
+    full = torch.zeros(
+        (t.shape[0], seq_len, *t.shape[2:]),
+        dtype=t.dtype,
+        device=device,
+        pin_memory=device.type == "cpu",
+    )
     if t.shape[1]:
         full[:, :t.shape[1]] = t.to(device)
     return full
@@ -433,12 +615,18 @@ def snapshot_states(states: Tuple, device: torch.device) -> Tuple:
     return snap_caches, snap_ca, snap_temporal
 
 
-def restore_states(states: Tuple, device: torch.device, seq_len: int) -> Tuple:
+def restore_states(
+    states: Tuple,
+    device: torch.device,
+    seq_len: int,
+    kv_device: Optional[torch.device] = None,
+) -> Tuple:
     caches, ca_cache, temporal = states
+    kv_device = device if kv_device is None else torch.device(kv_device)
     live_caches = [
         lf.LayerCache(
-            k=_expand_to(c.k, seq_len, device),
-            v=_expand_to(c.v, seq_len, device),
+            k=_expand_to(c.k, seq_len, kv_device),
+            v=_expand_to(c.v, seq_len, kv_device),
             phase_trace=_copy_to(c.phase_trace, device),
             cache_len=int(c.cache_len),
         )
@@ -468,9 +656,25 @@ class PrefixKVCache:
     folds it back into the history.
     """
 
-    def __init__(self, storage: Optional[str], compute: torch.device, max_entries: int = 2) -> None:
+    def __init__(
+        self,
+        storage: Optional[str],
+        compute: torch.device,
+        max_entries: int = 2,
+        chunk_size: int = 1024,
+        preload_chunks: int = 1,
+        copy_us: float = 0.0,
+        consume_us: float = 0.0,
+    ) -> None:
         self.compute = compute
         self.device = resolve_kv_device(storage, compute)
+        self.chunk_size = int(chunk_size)
+        self.preload_chunks = int(preload_chunks)
+        self.copy_us = float(copy_us)
+        self.consume_us = float(consume_us)
+        self.runtime = lf.InferenceKVRuntime(
+            self.device, self.compute, self.chunk_size, self.preload_chunks,
+            self.copy_us, self.consume_us)
         self._snaps: Deque[_KVSnapshot] = deque(maxlen=max_entries)
 
     def clear(self) -> None:
@@ -481,6 +685,25 @@ class PrefixKVCache:
         they were produced by the previous device/dtype/Tria settings."""
         self.compute = compute
         self.device = resolve_kv_device(storage, compute)
+        self.runtime = lf.InferenceKVRuntime(
+            self.device, self.compute, self.chunk_size, self.preload_chunks,
+            self.copy_us, self.consume_us)
+        self.clear()
+
+    def configure_streaming(
+        self,
+        chunk_size: int,
+        preload_chunks: int,
+        copy_us: float = 0.0,
+        consume_us: float = 0.0,
+    ) -> None:
+        self.chunk_size = max(1, int(chunk_size))
+        self.preload_chunks = max(1, int(preload_chunks))
+        self.copy_us = max(0.0, float(copy_us))
+        self.consume_us = max(0.0, float(consume_us))
+        self.runtime = lf.InferenceKVRuntime(
+            self.device, self.compute, self.chunk_size, self.preload_chunks,
+            self.copy_us, self.consume_us)
         self.clear()
 
     def nbytes(self) -> int:
@@ -499,7 +722,10 @@ class PrefixKVCache:
                 best = snap
         if best is None:
             return None, 0
-        return restore_states(best.states, self.compute, lf.SEQ_LEN), len(best.ids)
+        return (
+            restore_states(best.states, self.compute, lf.SEQ_LEN, self.device),
+            len(best.ids),
+        )
 
     def store(self, ids: List[int], states: Tuple) -> None:
         snap = snapshot_states(states, self.device)
@@ -530,7 +756,8 @@ def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
     with torch.inference_mode(), _autocast(settings):
         for pos in range(start, len(ids)):
             x = torch.tensor([int(ids[pos])], device=device, dtype=torch.long)
-            logits, states = model.step(x, pos, states)
+            logits, states = model.step(
+                x, pos, states, kv_runtime=None if kv is None else kv.runtime)
         if kv is not None:
             kv.store(ids, states)
 
@@ -547,7 +774,8 @@ def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
             gen_ids.append(nxt)
             renderer.feed(tok.decode(gen_ids, skip_special_tokens=False))
             x = torch.tensor([nxt], device=device, dtype=torch.long)
-            logits, states = model.step(x, len(ids) + i, states)
+            logits, states = model.step(
+                x, len(ids) + i, states, kv_runtime=None if kv is None else kv.runtime)
         if kv is not None and gen_ids:
             kv.store(ids + gen_ids, states)
     print()
@@ -572,7 +800,9 @@ def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dic
     print(COLOR.dim(f"  archive: {aio_path}  ({n_params:,} params, packed={quant})"))
     print(COLOR.dim(f"  device={settings.device}  dtype={settings.dtype}  "
                      f"window={settings.window}  alpha={settings.alpha:g}  beta={settings.beta:g}"))
-    print(COLOR.dim(f"  kvstorage={settings.kvstorage}  (prefix-KV reuse across turns)"))
+    print(COLOR.dim(
+        f"  kvstorage={settings.kvstorage}  "
+        "(persistent KV placement and prefix reuse across turns)"))
     print(COLOR.dim("  /help for commands · type / to browse them · Esc interrupts a reply\n"))
 
 
@@ -588,7 +818,7 @@ COMMANDS = {
     "/top-k":     "/top-k <int>  (0 = disabled)",
     "/top-p":     "/top-p <float 0..1>",
     "/max-new":   "/max-new <int> -- cap on tokens generated per turn",
-    "/kvstorage": "/kvstorage <same|cpu|cuda:N> -- where prefix-KV snapshots are parked",
+    "/kvstorage": "/kvstorage <same|cpu|cuda:N> -- persistent KV/attention placement",
     "/system":    "/system <text> -- set/replace the system prompt",
     "/reset":     "clear conversation history (keeps the system prompt)",
     "/reload":    "/reload <model.aio> -- swap archives without restarting",
@@ -675,6 +905,12 @@ def apply_setting(name: str, value: str, settings: Settings, model,
         return str(e) if name == "kvstorage" else f"couldn't parse {value!r} for {name}"
     if kv is not None and name in _KV_INVALIDATING:
         kv.retarget(settings.kvstorage, torch.device(settings.device))
+        if name in {"device", "dtype", "kvstorage"} and kv.device != kv.compute:
+            print(COLOR.dim("  (recalibrating KV transport...)"))
+            calibration = calibrate_kv_runtime(model, settings, kv.device)
+            kv.configure_streaming(
+                calibration.chunk_size, calibration.preload_chunks,
+                calibration.copy_us, calibration.consume_us)
     return None
 
 
@@ -698,9 +934,38 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
     settings.beta = float(getattr(cfg, "tria_polarm_beta", settings.beta))
     cfg.tria_polarm_beta = settings.beta
 
-    print_banner(aio_path, lf.count_params(model), settings, manifest)
+    kv_device = resolve_kv_device(settings.kvstorage, device)
+    if kv_device != device:
+        print(COLOR.dim(
+            f"  calibrating KV backend ({device} compute, {kv_device} storage; "
+            f"{min(2048, int(lf.SEQ_LEN))}-token model forward)..."),
+            flush=True,
+        )
+        calibration = calibrate_kv_runtime(model, settings, kv_device)
+    else:
+        calibration = KVCalibration(0.0, 0.0, int(lf.SEQ_LEN), 1, 0.0, True)
+    kv = PrefixKVCache(
+        settings.kvstorage,
+        device,
+        chunk_size=calibration.chunk_size,
+        preload_chunks=calibration.preload_chunks,
+        copy_us=calibration.copy_us,
+        consume_us=calibration.consume_us,
+    )
 
-    kv = PrefixKVCache(settings.kvstorage, device)
+    print_banner(aio_path, lf.count_params(model), settings, manifest)
+    if kv_device != device:
+        peer_text = (
+            "" if calibration.peer_access is None
+            else f"  peer={'yes' if calibration.peer_access else 'host-staged'}"
+        )
+        print(COLOR.dim(
+            f"  KV auto: prefill={calibration.prefill_tps:,.1f} tok/s  "
+            f"decode={calibration.decode_tps:,.1f} tok/s  "
+            f"chunk={calibration.chunk_size}  "
+            f"preload@2048={calibration.preload_chunks} (dynamic,+2)  "
+            f"transport={calibration.transfer_gbps:.2f} GB/s{peer_text}"
+        ))
     messages: List[Dict] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -762,6 +1027,12 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
                 settings.alpha = float(getattr(cfg, "tria_carrier_alpha", settings.alpha))
                 settings.beta = float(getattr(cfg, "tria_polarm_beta", settings.beta))
                 kv.retarget(settings.kvstorage, torch.device(settings.device))
+                if kv.device != kv.compute:
+                    print(COLOR.dim("  (recalibrating KV transport...)"))
+                    calibration = calibrate_kv_runtime(model, settings, kv.device)
+                    kv.configure_streaming(
+                        calibration.chunk_size, calibration.preload_chunks,
+                        calibration.copy_us, calibration.consume_us)
                 aio_path = new_aio
                 print(COLOR.dim(f"(reloaded {new_aio})"))
             except Exception as e:
@@ -818,9 +1089,8 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--kvstorage", type=str, default="same", metavar="TARGET",
-                    help="where prefix-KV snapshots are parked between turns: "
-                         "same (compute device) | cpu | cuda:N -- offloading keeps "
-                         "conversation history out of the compute GPU's VRAM")
+                    help="where KV remains during inference: same (compute device) | "
+                         "cpu (pinned streaming) | cuda:N (attention executes there)")
     args = ap.parse_args()
 
     dev = lf.device_auto(args.device)

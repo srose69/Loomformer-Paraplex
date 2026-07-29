@@ -963,6 +963,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "--config",
                             ddp_pt_config,
                         ],
+                        timeout=300,
                     )
                     _check_checkpoint(
                         ddp_pt_checkpoint, step=1, optimizer="adamw"
@@ -1010,6 +1011,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "--config",
                             ddp_sft_config,
                         ],
+                        timeout=300,
                     )
                     _check_checkpoint(
                         ddp_sft_checkpoint, step=1, optimizer="atom"

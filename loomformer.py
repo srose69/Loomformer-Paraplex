@@ -6720,6 +6720,84 @@ async def train_one_async(
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and resume_in:
         raise ValueError("save_initial_checkpoint requires a fresh run without resume")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
+
+    # Capture and register custom ops before DDP installs reducer hooks on the
+    # parameters. This warmup intentionally calls model_base directly. Doing
+    # it after DDP construction bypasses DDP.forward/prepare_for_backward while
+    # still firing the reducer's parameter hooks, poisoning static-graph
+    # reducer state and hanging a later real backward.
+    if bool(getattr(cfg, "graph", False)):
+        import graph_helper
+        _was_training = model_base.training
+        model_base.train()
+        _MAX_WARMUP_ATTEMPTS = 5
+        _capture_bytes_released = 0
+        for _attempt in range(1, _MAX_WARMUP_ATTEMPTS + 1):
+            _warm_batch = torch.randint(
+                0,
+                VOCAB,
+                (int(cfg.batch_size), SEQ_LEN + 1),
+                device=device,
+                dtype=torch.long,
+            )
+            _wx, _wy = _warm_batch[:, :-1], _warm_batch[:, 1:]
+            _warm_pos, _warm_mask = build_doc_reset_state(
+                _wx, train_eos_id
+            )
+            with amp_autocast(device):
+                _wloss = model_base(
+                    _wx,
+                    attn_mask=_warm_mask,
+                    position_ids=_warm_pos,
+                    labels=_wy,
+                )
+            _wloss.backward()
+            model_base.zero_grad(set_to_none=True)
+            _capture_before = graph_helper.captured_tensor_bytes()
+            _registered_now = graph_helper.finalize_registration(
+                sys.modules[__name__], tria
+            )
+            _capture_after = graph_helper.captured_tensor_bytes()
+            _capture_bytes_released += max(
+                0, _capture_before - _capture_after
+            )
+            del _warm_batch, _wx, _wy, _warm_pos, _warm_mask, _wloss
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if graph_helper.is_finalized():
+                break
+            if _registered_now == 0:
+                # Repeating an identical full-size synthetic step cannot
+                # discover a structurally inactive path.
+                break
+        if not _was_training:
+            model_base.eval()
+        _registered, _missing, _fallback_only = (
+            graph_helper.registration_summary()
+        )
+        ddp_print(
+            f"[custom-ops] registered after {_attempt} warmup attempt(s): "
+            f"{', '.join(_registered) or '(none)'}; represented "
+            f"{_capture_bytes_released / (1024 ** 2):.1f} MiB via metadata "
+            "(0 MiB retained)"
+        )
+        if _fallback_only:
+            ddp_print(
+                "[custom-ops] not required in active compiled path: "
+                f"{', '.join(_fallback_only)}"
+            )
+        if _missing:
+            ddp_print(
+                f"[custom-ops] NOT registered after {_attempt} attempt(s) "
+                f"(worth investigating): {', '.join(_missing)}"
+            )
+        if bool(getattr(cfg, "save_graph", False)):
+            _save_compiled_graph(cfg, model_base, device, tag)
+
+    # All ranks must finish their independent eager capture before the first
+    # DDP constructor collective and before lazy compilation starts.
+    ddp_barrier(device)
     model_compiled = maybe_compile(
         model_base, device, enabled=bool(getattr(cfg, "compile", False)))
     if ddp_is_distributed() and bool(getattr(cfg, "fsdp_full_shard", False)):
@@ -6758,58 +6836,6 @@ async def train_one_async(
                   + ("" if static_graph else " (disabled: grad_accum_steps > 1 needs no_sync)"))
     else:
         model = model_compiled
-
-    if bool(getattr(cfg, "graph", False)):
-        import graph_helper
-        _was_training = model_base.training
-        model_base.train()
-        _MAX_WARMUP_ATTEMPTS = 5
-        _capture_bytes_released = 0
-        for _attempt in range(1, _MAX_WARMUP_ATTEMPTS + 1):
-            _warm_batch = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
-            _wx, _wy = _warm_batch[:, :-1], _warm_batch[:, 1:]
-            _warm_pos, _warm_mask = build_doc_reset_state(_wx, train_eos_id)
-            with amp_autocast(device):
-                _wloss = model_base(
-                    _wx, attn_mask=_warm_mask, position_ids=_warm_pos,
-                    labels=_wy)
-            _wloss.backward()
-            model_base.zero_grad(set_to_none=True)
-            _capture_before = graph_helper.captured_tensor_bytes()
-            _registered_now = graph_helper.finalize_registration(
-                sys.modules[__name__], tria)
-            _capture_after = graph_helper.captured_tensor_bytes()
-            _capture_bytes_released += max(0, _capture_before - _capture_after)
-            del _warm_batch, _wx, _wy, _warm_pos, _warm_mask, _wloss
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            if graph_helper.is_finalized():
-                break
-            if _registered_now == 0:
-                # Repeating an identical full-size synthetic step cannot
-                # discover a structurally inactive path. Stop instead of
-                # doing five expensive forward/backward passes.
-                break
-        if not _was_training:
-            model_base.eval()
-        _registered, _missing, _fallback_only = graph_helper.registration_summary()
-        ddp_print(
-            f"[custom-ops] registered after {_attempt} warmup attempt(s): "
-            f"{', '.join(_registered) or '(none)'}; represented "
-            f"{_capture_bytes_released / (1024 ** 2):.1f} MiB via metadata "
-            "(0 MiB retained)")
-        if _fallback_only:
-            ddp_print(
-                "[custom-ops] not required in active compiled path: "
-                f"{', '.join(_fallback_only)}")
-        if _missing:
-            ddp_print(
-                f"[custom-ops] NOT registered after {_attempt} attempt(s) "
-                f"(worth investigating): {', '.join(_missing)}")
-
-        if bool(getattr(cfg, "save_graph", False)):
-            _save_compiled_graph(cfg, model_base, device, tag)
 
     named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     params = [p for _, p in named_params]

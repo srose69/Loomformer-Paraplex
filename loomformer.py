@@ -1236,9 +1236,8 @@ def apply_config(cfg: Config) -> None:
         graph_helper.set_conditionally_required("phase_sin_secant", PHASE_GRAD_MODE == "secant")
         graph_helper.set_conditionally_required("phase_sin", PHASE_GRAD_MODE == "floor")
         graph_helper.set_conditionally_required("temporal_carry", TRIA_CARRY_ENABLED and tria.cuda_tria_enabled())
-        checkpoint_stack_is_eager = bool(
+        temporal_stack_is_eager = bool(
             getattr(cfg, "compile", False)
-            and GRAD_CHECKPOINTING
             and TRIA_CARRY_ENABLED
             and TRIA_TEMPORAL_ENABLED
         )
@@ -1248,7 +1247,7 @@ def apply_config(cfg: Config) -> None:
                 "gate_slot_mix", "temporal_carry", "phase_sin",
                 "phase_sin_secant", "pvpowlu", "depth_attn", "beta_space",
             }
-            if checkpoint_stack_is_eager
+            if temporal_stack_is_eager
             else set()
         )
         graph_helper.install_capture_hooks(sys.modules[__name__], tria)

@@ -4,7 +4,8 @@
 #
 #  No root. No conda. Git is optional.
 #  CUDA toolkit: official NVIDIA .run -> project-local directory, toolkit only.
-#  Python: system venv + pip; PyTorch and nvcc always use the same CUDA line.
+#  Python: stdlib venv with a virtualenv fallback; PyTorch and nvcc always use
+#  the same CUDA line.
 #
 #  Automatic CUDA profile:
 #    * Pascal / Volta present (SM < 7.5): CUDA 12.6 + PyTorch cu126
@@ -15,7 +16,8 @@
 #    LOOM_CUDA_LINE=13 ./setup.sh
 #
 #  Other optional overrides:
-#    LOOM_INSTALL_DIR, LOOM_REPO_DIR, LOOM_BUILD_JOBS, LOOM_TORCH_VERSION
+#    LOOM_INSTALL_DIR, LOOM_REPO_DIR, LOOM_BUILD_JOBS, LOOM_NVCC_THREADS,
+#    LOOM_TORCH_VERSION
 # ===========================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -42,6 +44,7 @@ else
 fi
 VENV_DIR="$INSTALL_DIR/venv"
 ENV_FILE="$INSTALL_DIR/loomformer-env.sh"
+VALIDATION_REPORT="$INSTALL_DIR/validation-report.json"
 
 # CUDA 13 is the normal profile. CUDA 12.6 is retained because CUDA 13 removed
 # Maxwell, Pascal and Volta, while PyTorch's cu126 build still carries them.
@@ -67,8 +70,10 @@ CUDA_DIR=""
 TORCH_FLAVOR=""
 TORCH_IDX=""
 TORCH_CUDA_ARCH_LIST=""
+FLASH_ATTN_CUDA_ARCHS=""
 INSTALL_FLASH_ATTN=0
 BUILD_JOBS=1
+NVCC_BUILD_THREADS=2
 
 # ── Probe state ──────────────────────────────────────────────────────────────
 HAS_GIT=0
@@ -143,14 +148,71 @@ safe_remove_temp_tree() {
     esac
 }
 
+safe_remove_build_log() {
+    local path="${1:-}"
+    local temp_root="${TMPDIR:-/tmp}"
+    temp_root="${temp_root%/}"
+    [[ -n "$temp_root" ]] || temp_root="/tmp"
+    case "$path" in
+        "$temp_root"/loomformer-flash-attn.*.log)
+            [[ -f "$path" ]] && rm -f -- "$path"
+            ;;
+        "")
+            ;;
+        *)
+            warn "Refusing to remove unexpected build log: $path"
+            ;;
+    esac
+}
+
+filter_flash_attn_build_output() {
+    local build_log="$1"
+    local line=""
+    local progress_active=0
+    local current=0
+    local total=0
+
+    exec 3> "$build_log" || return 1
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >&3 || {
+            exec 3>&-
+            return 1
+        }
+
+        if [[ "$line" =~ \[([0-9]+)/([0-9]+)\] ]]; then
+            current="${BASH_REMATCH[1]}"
+            total="${BASH_REMATCH[2]}"
+            if [[ -t 1 ]]; then
+                printf '\r\033[2K  [flash-attn] [%s/%s]' "$current" "$total"
+            else
+                printf '  [flash-attn] [%s/%s]\n' "$current" "$total"
+            fi
+            progress_active=1
+        elif [[ "$line" == *"Precompiled wheel not found. Building from source"* ]]; then
+            (( progress_active )) && [[ -t 1 ]] && printf '\n'
+            info "No compatible prebuilt FlashAttention wheel; compiling locally."
+            progress_active=0
+        elif [[ "$line" == *"Successfully built flash-attn"* ]]; then
+            (( progress_active )) && [[ -t 1 ]] && printf '\n'
+            log "FlashAttention wheel built."
+            progress_active=0
+        fi
+    done
+
+    (( progress_active )) && [[ -t 1 ]] && printf '\n'
+    exec 3>&-
+    return 0
+}
+
 set_cuda_env() {
     [[ -n "$CUDA_DIR" ]] || die "Internal error: CUDA profile is not selected."
     export CUDA_HOME="$CUDA_DIR"
     export PATH="$CUDA_DIR/bin:${PATH}"
     export LD_LIBRARY_PATH="$CUDA_DIR/lib64:${LD_LIBRARY_PATH:-}"
     export TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST"
+    export FLASH_ATTN_CUDA_ARCHS="$FLASH_ATTN_CUDA_ARCHS"
     export MAX_JOBS="$BUILD_JOBS"
-    export NVCC_THREADS="${NVCC_THREADS:-4}"
+    export NVCC_THREADS="$NVCC_BUILD_THREADS"
 }
 
 repo_exists() {
@@ -196,6 +258,11 @@ select_cuda_profile() {
     local has_blackwell=0
     local cap major minor sm
     local -a unique_caps=()
+    local -a flash_archs=()
+
+    TORCH_CUDA_ARCH_LIST=""
+    FLASH_ATTN_CUDA_ARCHS=""
+    INSTALL_FLASH_ATTN=0
 
     if [[ -n "$requested" && "$requested" != "12" && "$requested" != "13" ]]; then
         die "LOOM_CUDA_LINE must be 12 or 13, got '$requested'."
@@ -252,6 +319,30 @@ select_cuda_profile() {
         (( sm < 75 )) && use_cuda12=1
         (( sm >= 80 )) && has_ampere=1
         (( sm >= 100 )) && has_blackwell=1
+
+        # FlashAttention owns its CUDA target selection and does not consume
+        # TORCH_CUDA_ARCH_LIST. Its supported source targets represent GPU
+        # families: sm_80 covers Ampere/Ada, followed by Hopper and the
+        # Blackwell/Thor families.
+        local flash_arch=""
+        if (( sm >= 80 && sm < 90 )); then
+            flash_arch="80"
+        elif (( sm >= 90 && sm < 100 )); then
+            flash_arch="90"
+        elif (( sm >= 100 && sm < 110 )); then
+            flash_arch="100"
+        elif (( sm >= 110 && sm < 120 )); then
+            flash_arch="110"
+        elif (( sm >= 120 )); then
+            flash_arch="120"
+        fi
+        if [[ -n "$flash_arch" ]]; then
+            local flash_seen=0
+            for existing in "${flash_archs[@]:-}"; do
+                [[ "$existing" == "$flash_arch" ]] && flash_seen=1
+            done
+            (( flash_seen )) || flash_archs+=("$flash_arch")
+        fi
     done
 
     if [[ "$requested" == "13" ]] && (( use_cuda12 )); then
@@ -276,6 +367,18 @@ select_cuda_profile() {
         TORCH_CUDA_ARCH_LIST="8.0+PTX"
     fi
 
+    if ((${#flash_archs[@]} > 0)); then
+        local flash_joined=""
+        for flash_arch in "${flash_archs[@]}"; do
+            flash_joined+="${flash_joined:+;}${flash_arch}"
+        done
+        FLASH_ATTN_CUDA_ARCHS="$flash_joined"
+    elif [[ "$CUDA_LINE" == "13" ]]; then
+        # A login/head-node install gets an Ampere-family cubin plus PTX.
+        # Installs performed on a GPU node are narrowed to its exact family.
+        FLASH_ATTN_CUDA_ARCHS="80"
+    fi
+
     INSTALL_FLASH_ATTN="$has_ampere"
     if ((${#GPU_CAPS[@]} == 0)) && [[ "$CUDA_LINE" == "13" ]]; then
         # Explicit CUDA 13 override normally targets a modern remote GPU.
@@ -286,6 +389,11 @@ select_cuda_profile() {
 }
 
 calculate_build_jobs() {
+    local requested_nvcc_threads="${LOOM_NVCC_THREADS:-${NVCC_THREADS:-2}}"
+    [[ "$requested_nvcc_threads" =~ ^[1-9][0-9]*$ ]] || die \
+        "LOOM_NVCC_THREADS/NVCC_THREADS must be a positive integer."
+    NVCC_BUILD_THREADS="$requested_nvcc_threads"
+
     if [[ -n "${LOOM_BUILD_JOBS:-}" ]]; then
         [[ "$LOOM_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die \
             "LOOM_BUILD_JOBS must be a positive integer."
@@ -295,18 +403,20 @@ calculate_build_jobs() {
 
     local cpu_count=1
     local mem_kib=0
+    local cpu_jobs=1
     local memory_jobs=1
     command -v nproc &>/dev/null && cpu_count=$(nproc)
-    [[ -r /proc/meminfo ]] && mem_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
+    cpu_jobs=$((cpu_count / 2))
+    (( cpu_jobs >= 1 )) || cpu_jobs=1
+    [[ -r /proc/meminfo ]] && mem_kib=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
     if [[ "$mem_kib" =~ ^[0-9]+$ ]] && (( mem_kib > 0 )); then
-        # FlashAttention translation units are memory hungry. Budget roughly
-        # 12 GiB/job and cap parallelism even on very large hosts.
-        memory_jobs=$((mem_kib / 1024 / 1024 / 12))
+        # Match FlashAttention's own worst-case estimate: each Ninja job may
+        # run NVCC_THREADS compiler threads at roughly 5 GiB apiece.
+        memory_jobs=$((mem_kib / 1024 / 1024 / (5 * NVCC_BUILD_THREADS)))
         (( memory_jobs >= 1 )) || memory_jobs=1
     fi
-    BUILD_JOBS="$cpu_count"
+    BUILD_JOBS="$cpu_jobs"
     (( BUILD_JOBS > memory_jobs )) && BUILD_JOBS="$memory_jobs"
-    (( BUILD_JOBS > 8 )) && BUILD_JOBS=8
     (( BUILD_JOBS >= 1 )) || BUILD_JOBS=1
 }
 
@@ -727,20 +837,53 @@ install_venv() {
         return 0
     fi
 
+    backup_incomplete_venv() {
+        [[ -e "$VENV_DIR" ]] || return 0
+        local stamp backup suffix
+        stamp=$(date +%Y%m%d_%H%M%S)
+        backup="${VENV_DIR}.incomplete.${stamp}"
+        suffix=0
+        while [[ -e "$backup" ]]; do
+            suffix=$((suffix + 1))
+            backup="${VENV_DIR}.incomplete.${stamp}.${suffix}"
+        done
+        warn "Preserving incomplete venv as $backup."
+        mv -- "$VENV_DIR" "$backup"
+    }
+
     if [[ -e "$VENV_DIR" ]]; then
-        die "$VENV_DIR exists but is not a healthy venv. It was not removed; move it aside explicitly and retry."
+        backup_incomplete_venv
     fi
 
-    info "Creating Python venv at $VENV_DIR."
-    if "$PYTHON_BIN" -m venv "$VENV_DIR" 2>/dev/null &&
+    if "$PYTHON_BIN" -m ensurepip --version &>/dev/null; then
+        info "Creating Python venv at $VENV_DIR."
+        if "$PYTHON_BIN" -m venv "$VENV_DIR" >/dev/null 2>&1 &&
+           "$VENV_DIR/bin/python3" -m pip --version &>/dev/null; then
+            log "Venv created: $("$VENV_DIR/bin/python3" --version)"
+            return 0
+        fi
+        backup_incomplete_venv
+    fi
+
+    warn "python -m venv is unavailable or did not produce a healthy environment; falling back to virtualenv."
+
+    if ! "$PYTHON_BIN" -m virtualenv --version &>/dev/null; then
+        "$PYTHON_BIN" -m pip --version &>/dev/null || die \
+            "$PYTHON_BIN has neither a working stdlib venv nor pip. Install python3-pip or a matching python-venv package and retry."
+        info "Installing virtualenv into the current user's Python site."
+        "$PYTHON_BIN" -m pip install --user virtualenv
+    fi
+
+    info "Creating Python environment with virtualenv at $VENV_DIR."
+    if "$PYTHON_BIN" -m virtualenv "$VENV_DIR" &&
+       [[ -x "$VENV_DIR/bin/python3" ]] &&
        "$VENV_DIR/bin/python3" -m pip --version &>/dev/null; then
         log "Venv created: $("$VENV_DIR/bin/python3" --version)"
         return 0
     fi
 
-    [[ ! -e "$VENV_DIR" ]] || die \
-        "python -m venv left an incomplete $VENV_DIR. It was not deleted; install the matching python-venv OS package or move the directory aside."
-    die "Unable to create a venv. Install the OS package providing python -m venv and retry."
+    backup_incomplete_venv
+    die "virtualenv did not produce a healthy environment at $VENV_DIR."
 }
 
 install_python_packages() {
@@ -762,6 +905,8 @@ install_python_packages() {
             "torch==${TORCH_VER}" \
             --index-url "$TORCH_IDX"
     fi
+    PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/python3" -c \
+        'from torch.utils.cpp_extension import verify_ninja_availability; verify_ninja_availability(); print("[verify] PyTorch BuildExtension found ninja")'
 
     info "Installing LoomFormer runtime, data and model-conversion dependencies."
     pip_run install --upgrade \
@@ -779,8 +924,32 @@ install_python_packages() {
 
     if (( INSTALL_FLASH_ATTN )); then
         info "Installing FlashAttention for Ampere-or-newer GPU(s)."
-        MAX_JOBS="$BUILD_JOBS" NVCC_THREADS="${NVCC_THREADS:-4}" \
-            pip_run install --upgrade flash-attn --no-build-isolation
+        info "FlashAttention build: arches=$FLASH_ATTN_CUDA_ARCHS, MAX_JOBS=$BUILD_JOBS, NVCC_THREADS=$NVCC_BUILD_THREADS."
+        local build_log
+        local -a pipeline_status
+        build_log=$(mktemp "${TMPDIR:-/tmp}/loomformer-flash-attn.XXXXXX.log")
+
+        # pip only exposes Ninja's [current/total] events in verbose mode.
+        # Keep that stream in a diagnostic log and render a compact live
+        # counter instead of printing compiler command lines.
+        set +e
+        PATH="$VENV_DIR/bin:$PATH" \
+            MAX_JOBS="$BUILD_JOBS" NVCC_THREADS="$NVCC_BUILD_THREADS" \
+            FLASH_ATTN_CUDA_ARCHS="$FLASH_ATTN_CUDA_ARCHS" \
+            "$VENV_DIR/bin/python3" -m pip install --verbose --upgrade \
+                flash-attn --no-build-isolation 2>&1 |
+            filter_flash_attn_build_output "$build_log"
+        pipeline_status=("${PIPESTATUS[@]}")
+        set -e
+
+        if (( pipeline_status[0] != 0 || pipeline_status[1] != 0 )); then
+            echo
+            warn "FlashAttention build failed; last 80 log lines follow."
+            tail -n 80 "$build_log" >&2
+            die "Full FlashAttention build log retained at $build_log"
+        fi
+
+        safe_remove_build_log "$build_log"
         "$VENV_DIR/bin/python3" -c \
             'from flash_attn import flash_attn_varlen_func; print("[verify] flash_attn_varlen_func import OK")'
     else
@@ -845,9 +1014,44 @@ verify_loomformer() {
     set_cuda_env
     (
         cd "$REPO_DIR"
-        "$VENV_DIR/bin/python3" tests/run_matrix.py --setup
+        "$VENV_DIR/bin/python3" tests/run_matrix.py \
+            --setup \
+            --report "$VALIDATION_REPORT"
     )
     log "Complete synthetic PT/SFT/backend/DDP installation matrix passed."
+}
+
+print_attention_summary() {
+    [[ -f "$VALIDATION_REPORT" ]] || return 0
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        echo -e "  Attention    : ${CYAN}${line}${RESET}"
+    done < <(
+        "$VENV_DIR/bin/python3" - "$VALIDATION_REPORT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+for item in report.get("attention", []):
+    def backend(name, label):
+        value = item.get(name, {})
+        if not value.get("forward_backward", False):
+            return f"{label}=unavailable"
+        fused = value.get("fused_value")
+        suffix = "" if fused is None else f", fused-value={'yes' if fused else 'no'}"
+        return f"{label}=fwd+bwd{suffix}"
+
+    fields = [
+        backend("flash_attn", "flash-attn varlen"),
+        backend("transformer_engine", "transformer-engine varlen"),
+        backend("sdpa", "SDPA"),
+        f"selected={item.get('selected', 'unknown')}",
+    ]
+    print(f"cuda:{item['index']} " + " · ".join(fields))
+PY
+    )
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -861,8 +1065,9 @@ export CUDA_HOME="$CUDA_DIR"
 export PATH="$CUDA_DIR/bin:\$PATH"
 export LD_LIBRARY_PATH="$CUDA_DIR/lib64:\${LD_LIBRARY_PATH:-}"
 export TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST"
+export FLASH_ATTN_CUDA_ARCHS="$FLASH_ATTN_CUDA_ARCHS"
 export MAX_JOBS="$BUILD_JOBS"
-export NVCC_THREADS="\${NVCC_THREADS:-4}"
+export NVCC_THREADS="\${NVCC_THREADS:-$NVCC_BUILD_THREADS}"
 EOF
     chmod 0644 "$ENV_FILE"
     log "Wrote CUDA/build environment to $ENV_FILE."
@@ -873,7 +1078,6 @@ patch_venv_activate() {
     local marker="# >>> LoomFormer env <<<"
     [[ -f "$activate" ]] || return 0
     if grep -qF "$marker" "$activate"; then
-        info "Venv activation hook already present."
         return 0
     fi
     cat >> "$activate" <<EOF
@@ -900,7 +1104,7 @@ EOF
     for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
         [[ -f "$rc" ]] || continue
         if grep -qF "$marker" "$rc"; then
-            info "Shell hook already present in $rc."
+            continue
         else
             printf '%s\n' "$snippet" >> "$rc"
             log "Patched $rc."
@@ -955,6 +1159,10 @@ print_summary() {
     echo -e "  PyTorch      : ${CYAN}$TORCH_VER ($TORCH_FLAVOR)${RESET}"
     echo -e "  Python venv  : ${CYAN}$VENV_DIR${RESET}"
     echo -e "  CUDA arches  : ${CYAN}$TORCH_CUDA_ARCH_LIST${RESET}"
+    if (( INSTALL_FLASH_ATTN )); then
+        echo -e "  FlashAttention: ${CYAN}arches=$FLASH_ATTN_CUDA_ARCHS, MAX_JOBS=$BUILD_JOBS, NVCC_THREADS=$NVCC_BUILD_THREADS${RESET}"
+    fi
+    print_attention_summary
     echo
     echo -e "  Activate:"
     echo -e "    ${BOLD}source $VENV_DIR/bin/activate${RESET}"

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import hashlib
+import json
 import os
 from pathlib import Path
 import queue
@@ -435,14 +436,19 @@ def _run_gpu_parity(profile: Dict[str, Any]) -> None:
         )
 
 
-def _probe_cuda_extensions(config_path: Path, modern: bool) -> None:
+def _probe_cuda_extensions(
+    config_path: Path,
+    modern: bool,
+    report_path: Path,
+) -> list[Dict[str, Any]]:
     if not torch.cuda.is_available():
         _status("SKIP", "CUDA extension probe (CUDA unavailable)")
-        return
+        return []
 
     # Keep this probe in its own interpreter: apply_config mutates module-level
     # geometry by design.
     probe = r'''
+import json
 import sys
 import torch
 import loomformer as lf
@@ -467,30 +473,105 @@ missing = [name for name, module in modules.items() if module is None]
 if missing:
     raise RuntimeError(f"fused CUDA extension(s) failed to build/load: {missing}")
 
-if int(sys.argv[2]):
-    for index in range(torch.cuda.device_count()):
-        major, minor = torch.cuda.get_device_capability(index)
-        if major < 8:
-            continue
-        device = torch.device(f"cuda:{index}")
-        fused = lf._probe_flash_value_fusion(device, torch.bfloat16)
-        key = (index, torch.bfloat16, lf.HEAD_DIM)
-        if not lf._flash_backend_cache.get(key, False):
-            detail = lf._flash_probe_errors.get(key, "no detail")
-            raise RuntimeError(
-                f"FlashAttention varlen forward/backward failed on "
-                f"cuda:{index} SM{major}.{minor}: {detail}"
-            )
-        print(
-            f"[matrix] cuda:{index} FlashAttention varlen OK "
-            f"(fused-value={fused})"
+backends = []
+for index in range(torch.cuda.device_count()):
+    major, minor = torch.cuda.get_device_capability(index)
+    device = torch.device(f"cuda:{index}")
+    dtype = torch.bfloat16
+    flash_fused = False
+    te_fused = False
+    if int(sys.argv[2]) and major >= 8:
+        flash_fused = lf._probe_flash_value_fusion(device, dtype)
+        te_fused = lf._probe_te_value_fusion(device, dtype)
+    key = (index, dtype, lf.HEAD_DIM)
+    flash_ok = bool(lf._flash_backend_cache.get(key, False))
+    te_ok = bool(lf._te_backend_cache.get(key, False))
+    if int(sys.argv[2]) and major >= 8 and not (flash_ok or te_ok):
+        raise RuntimeError(
+            f"no validated varlen forward/backward backend on cuda:{index}: "
+            f"{lf._varlen_backend_failure_detail(device, dtype)}"
         )
+    selected = (
+        "flash-attn" if flash_ok
+        else "transformer-engine" if te_ok
+        else "sdpa"
+    )
+    backends.append(
+        {
+            "index": index,
+            "name": torch.cuda.get_device_name(index),
+            "capability": [major, minor],
+            "dtype": str(dtype).removeprefix("torch."),
+            "head_dim": int(lf.HEAD_DIM),
+            "selected": selected,
+            "flash_attn": {
+                "forward_backward": flash_ok,
+                "fused_value": bool(flash_fused),
+            },
+            "transformer_engine": {
+                "forward_backward": te_ok,
+                "fused_value": bool(te_fused),
+            },
+            "sdpa": {"forward_backward": False},
+        }
+    )
+with open(sys.argv[3], "w", encoding="utf-8") as handle:
+    json.dump(backends, handle, indent=2)
 print("[matrix] all fused CUDA extension modules loaded")
 '''
     _run(
         "CUDA extensions and attention backend",
-        [sys.executable, "-c", probe, config_path, int(modern)],
+        [
+            sys.executable,
+            "-c",
+            probe,
+            config_path,
+            int(modern),
+            report_path,
+        ],
     )
+    with report_path.open(encoding="utf-8") as handle:
+        report = json.load(handle)
+    if not isinstance(report, list):
+        raise AssertionError("attention backend probe returned a non-list report")
+    return report
+
+
+def _write_validation_report(
+    output: Path,
+    profile: Dict[str, Any],
+    attention: list[Dict[str, Any]],
+) -> None:
+    output = output.absolute()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 1,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "profile": {
+            "device": profile["device"],
+            "amp_dtype": profile["amp_dtype"],
+            "compile": bool(profile["compile"]),
+            "gpu_count": int(profile["gpu_count"]),
+        },
+        "attention": attention,
+    }
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temporary, output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _assert_split(directory: Path, original_rows: int) -> None:
@@ -587,8 +668,14 @@ def run_matrix(args: argparse.Namespace) -> None:
                 "runpoints_path": str(pt_runpoints),
             },
         )
-        _probe_cuda_extensions(pt_config, bool(profile["modern"]))
+        attention_report = _probe_cuda_extensions(
+            pt_config,
+            bool(profile["modern"]),
+            work / "attention-backends.json",
+        )
         _run_gpu_parity(profile)
+        for backend in attention_report:
+            backend["sdpa"]["forward_backward"] = True
 
         if profile["device"] == "cpu":
             _status(
@@ -806,6 +893,12 @@ def run_matrix(args: argparse.Namespace) -> None:
         else:
             _status("SKIP", "DDP cases (fewer than two GPUs or --no-ddp)")
 
+        if args.report:
+            _write_validation_report(
+                Path(args.report),
+                profile,
+                attention_report,
+            )
         completed = True
         _banner("Validation complete")
         _status("PASS", "all installation matrix cases")
@@ -842,6 +935,10 @@ def main() -> None:
         "--setup",
         action="store_true",
         help="setup.sh mode: require CUDA and run the complete matrix",
+    )
+    parser.add_argument(
+        "--report",
+        help="write an atomic JSON validation report after every matrix case passes",
     )
     try:
         run_matrix(parser.parse_args())

@@ -201,7 +201,13 @@ def set_conditionally_required(op_name: str, required: bool) -> None:
 
 
 def set_runtime_not_required(op_names: Sequence[str]) -> None:
-    """Mark ops hidden behind an intentional Dynamo-disabled region."""
+    """Mark ops hidden behind an intentional Dynamo-disabled region.
+
+    LoomFormer's temporal chunk stack is such a region in both checkpointed
+    and non-checkpointed training. These CUDA ops still execute and receive
+    gradients eagerly; requiring torch.library registration for the outer
+    compiled graph would be a false coverage failure.
+    """
     global _RUNTIME_NOT_REQUIRED
     known = {op_name for op_name, _, _, _ in _KERNELS}
     known.add(_BETA_SPACE_TARGET[0])

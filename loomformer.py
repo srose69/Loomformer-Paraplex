@@ -1863,6 +1863,10 @@ def maybe_auto_val_split(cfg: Config, dataset: str) -> Optional[str]:
         return None
     if not (0.0 < pct < 100.0):
         raise ValueError(f"auto_val_split_pct must be in (0,100), got {pct}")
+    if is_sft_dataset(cfg):
+        # SFT splits examples inside the shared tokenized cache (loomsft.SFTStream,
+        # '#train'/'#val'); the dataset file itself is never rewritten.
+        return None
     if not os.path.isdir(dataset):
         raise ValueError("auto_val_split_pct only works when the training dataset is a directory of shards")
 
@@ -2104,12 +2108,41 @@ class ShardStream:
     def close(self) -> None:
         self._stop.set()
 
+def is_sft_dataset(cfg: Config) -> bool:
+    return str(getattr(cfg, "dataset_format", "auto") or "auto").lower() == "sft"
+
+
 def make_stream(path: str, cfg: Config, device: torch.device):
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
+    if fmt == "sft":
+        import loomsft  # lazy: only SFT runs need the chat template/pyarrow path
+        return loomsft.SFTStream(path, cfg, device)
     if fmt == "bin" or (fmt == "auto" and os.path.isfile(path) and path.endswith(".bin")):
         bos_id = _tok_special_id(build_tokenizer(cfg), "<bos>")
         return TokenStream(path, cfg, device, bos_id=bos_id)
     return ShardStream(path, cfg, device)
+
+
+IGNORE_INDEX = -100  # cross-entropy target for positions that must not be learned
+
+
+def split_train_batch(batch, eos_id: Optional[int]):
+    """Return (x, y, position_ids, attn_mask) from whatever the stream yielded.
+
+    Pretraining streams yield a plain [B, T+1] token tensor and every next token
+    is a target. SFT streams yield (ids, loss_mask) and the masked-out positions
+    become IGNORE_INDEX, so prompt, padding and separator tokens contribute no
+    loss. Positions and the block-diagonal attention mask are the same doc-reset
+    construction in both cases -- SFT just uses <eos> as its example separator.
+    """
+    if isinstance(batch, tuple):
+        ids, loss_mask = batch
+        x, y = ids[:, :-1], ids[:, 1:]
+        y = torch.where(loss_mask[:, 1:].bool(), y, torch.full_like(y, IGNORE_INDEX))
+    else:
+        x, y = batch[:, :-1], batch[:, 1:]
+    position_ids, attn_mask = build_doc_reset_state(x, eos_id)
+    return x, y, position_ids, attn_mask
 
 
 def build_doc_reset_state(x: torch.Tensor, eos_id: Optional[int]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -4523,8 +4556,7 @@ async def eval_loss_async(model: nn.Module, stream: TokenStream, cfg: Config, de
     losses = []
     with torch.no_grad():
         for b in raw_batches:
-            x, y = b[:, :-1], b[:, 1:]
-            position_ids, attn_mask = build_doc_reset_state(x, eos_id)
+            x, y, position_ids, attn_mask = split_train_batch(b, eos_id)
             with amp_autocast(device):
                 loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
             losses.append(float(loss.item()))
@@ -4691,6 +4723,9 @@ def _fast_parquet_token_count(dataset: str, cfg: "Config", tok, sample_docs: int
 
 def dataset_token_count(dataset: str, cfg: Optional["Config"] = None) -> int:
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower() if cfg is not None else "auto"
+    if fmt == "sft":
+        import loomsft  # already-built tokenized cache: an exact count, no re-read
+        return loomsft.cached_token_count(dataset, cfg)
     is_bin = fmt == "bin" or (fmt == "auto" and os.path.isfile(dataset) and dataset.endswith(".bin"))
     if is_bin:
         nbytes = os.path.getsize(dataset)
@@ -5157,6 +5192,7 @@ async def train_one_async(
     val_dataset: Optional[str] = None,
     resume_step: Optional[int] = None,
     resume_dataset_steps: Optional[int] = None,
+    init_weights: Optional[str] = None,
 ) -> Dict[str, float]:
     rank = ddp_rank() if ddp_is_distributed() else 0
     set_seed(int(cfg.seed) + 1000003 * int(rank))
@@ -5209,7 +5245,14 @@ async def train_one_async(
         ) = resolve_resume_dataset_progress(
             cfg, dataset, resume_blob, start_step, resume_dataset_steps)
         ddp_print(f"[resume] data cursor policy: {replay_reason}.")
-        if isinstance(stream, ShardStream) and current_dataset_draws > 0:
+        if hasattr(stream, "fast_forward") and current_dataset_draws > 0:
+            ddp_print(
+                f"[resume] fast-forwarding the packing plan by "
+                f"{current_dataset_draws} saved batch draws for "
+                f"{current_dataset_key!r}...")
+            stream.fast_forward(current_dataset_draws)
+            ddp_print("[resume] fast-forward done.")
+        elif isinstance(stream, ShardStream) and current_dataset_draws > 0:
             ddp_print(
                 f"[resume] fast-forwarding ShardStream RNG by "
                 f"{current_dataset_draws} saved batch draws for "
@@ -5223,17 +5266,23 @@ async def train_one_async(
                   f"LR schedule/log step numbering continue (unchanged if cfg.steps/warmup_steps match the original run).")
     else:
         dataset_progress[current_dataset_key] = {"steps": 0, "draws": 0}
-    if isinstance(stream, ShardStream):
+    if hasattr(stream, "prime"):
         await stream.prime()
     eval_dataset = val_dataset or dataset
     eval_stream = stream if os.path.abspath(eval_dataset) == os.path.abspath(dataset) else make_stream(eval_dataset, cfg, device)
     train_eos_id = getattr(stream, "_eos_id", None) if bool(getattr(cfg, "doc_reset_attn", True)) else None
     eval_eos_id = getattr(eval_stream, "_eos_id", None) if bool(getattr(cfg, "doc_reset_attn", True)) else None
-    train_bpt, _, _ = ensure_train_bytes_per_token_meta(dataset, cfg, device)
-    if os.path.abspath(eval_dataset) == os.path.abspath(dataset):
-        eval_bpt = train_bpt
+    if is_sft_dataset(cfg):
+        # SFT rows are rendered chat, not raw corpus bytes: a bytes/token ratio
+        # (and the bpb it feeds) has no meaning here, and estimating one would
+        # re-read the dataset for nothing.
+        train_bpt = eval_bpt = 1.0
     else:
-        eval_bpt, _, _ = ensure_eval_bytes_per_token_meta(eval_dataset, cfg, device)
+        train_bpt, _, _ = ensure_train_bytes_per_token_meta(dataset, cfg, device)
+        if os.path.abspath(eval_dataset) == os.path.abspath(dataset):
+            eval_bpt = train_bpt
+        else:
+            eval_bpt, _, _ = ensure_eval_bytes_per_token_meta(eval_dataset, cfg, device)
 
     ddp_barrier(device)
     if ddp_is_main():
@@ -5254,12 +5303,21 @@ async def train_one_async(
     model_base = model_base.to(device)
     if resume_in:
         load_model_checkpoint(model_base, resume_in, ablation=ablation, device=device)
+    elif init_weights:
+        # SFT/continued training: weights only. Optimizer state, step counter and
+        # LR schedule all start fresh, unlike --resume.
+        load_model_checkpoint(model_base, init_weights, ablation=ablation, device=device)
+        ddp_print(f"[init] weights loaded from {init_weights} (fresh optimizer, step 0)")
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and resume_in:
         raise ValueError("save_initial_checkpoint requires a fresh run without resume")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(
         model_base, device, enabled=bool(getattr(cfg, "compile", False)))
     if ddp_is_distributed():
+        # static_graph reuses the first iteration's autograd trace, which is
+        # incompatible with the no_sync() windows gradient accumulation needs
+        # (the reducer asserts expect_autograd_hooks_ on the skipped backward).
+        static_graph = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1)) == 1
         model = DDP(
             model_compiled,
             device_ids=[ddp_local_rank()],
@@ -5267,9 +5325,11 @@ async def train_one_async(
             find_unused_parameters=False,
             bucket_cap_mb=64,
             gradient_as_bucket_view=True,
-            static_graph=True,
+            static_graph=static_graph,
         )
-        ddp_print("[ddp] buckets=64MiB gradient_as_bucket_view=true static_graph=true")
+        ddp_print("[ddp] buckets=64MiB gradient_as_bucket_view=true "
+                  f"static_graph={str(static_graph).lower()}"
+                  + ("" if static_graph else " (disabled: grad_accum_steps > 1 needs no_sync)"))
     else:
         model = model_compiled
 
@@ -5598,8 +5658,7 @@ async def train_one_async(
                 _wait_t0 = time.time()
                 batch = await batch_iter.__anext__()
                 data_wait_s += time.time() - _wait_t0
-                x, y = batch[:, :-1], batch[:, 1:]
-                position_ids, attn_mask = build_doc_reset_state(x, train_eos_id)
+                x, y, position_ids, attn_mask = split_train_batch(batch, train_eos_id)
                 sync_ctx = (
                     model.no_sync()
                     if ddp_is_distributed() and micro_idx + 1 < accum_steps
@@ -5798,13 +5857,14 @@ async def train_async(
     resume: Optional[str] = None,
     resume_step: Optional[int] = None,
     resume_dataset_steps: Optional[int] = None,
+    init_weights: Optional[str] = None,
 ) -> None:
     set_seed(int(cfg.seed) + 1000003 * int(ddp_rank()))
     # Persist the effective path even when it came from CLI --dataset. This is
     # what makes resume_data_stream:auto reliable on the next launch.
     cfg.train_dataset = dataset
     build_tokenizer(cfg)
-    restore_temporal_tria_from_checkpoint(cfg, resume)
+    restore_temporal_tria_from_checkpoint(cfg, resume or init_weights)
 
     if ddp_is_main():
         maybe_auto_val_split(cfg, dataset)
@@ -5817,6 +5877,7 @@ async def train_async(
     results["paraplex"] = await train_one_async(
         cfg, dataset, device, ablation, ckpt_out, resume, val_dataset=val_dataset,
         resume_step=resume_step, resume_dataset_steps=resume_dataset_steps,
+        init_weights=init_weights,
     )
 
     ddp_print("\nSummary:")
@@ -5896,6 +5957,45 @@ def _eval_full_batch_nll(model: nn.Module, batch: torch.Tensor, device: torch.de
     return float(nll.item()), int(y.numel())
 
 
+@torch.no_grad()
+def _eval_full_sft(model: nn.Module, cfg: Config, dataset: str, device: torch.device,
+                    eval_batch_size: Optional[int] = None) -> Dict[str, float]:
+    """One deterministic pass over a packed SFT split, loss on target tokens only.
+
+    bpb is reported as NaN: SFT rows are rendered chat, so there is no
+    bytes-per-token ratio to normalize bits against.
+    """
+    stream = make_stream(dataset, cfg, device)
+    try:
+        B = max(1, int(eval_batch_size if eval_batch_size is not None else cfg.batch_size))
+        total_nll, total_tokens = 0.0, 0
+        remaining = int(stream.n_rows)
+        while remaining > 0:
+            rows = stream._take_rows(min(B, remaining))
+            remaining -= len(rows)
+            ids, mask = stream._pack_batch_np(rows)
+            batch = (torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device))
+            x, y, position_ids, attn_mask = split_train_batch(batch, stream._eos_id)
+            ntok = int((y != IGNORE_INDEX).sum().item())
+            if ntok == 0:
+                continue
+            with amp_autocast(device):
+                loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y,
+                             ignore_index=IGNORE_INDEX)
+            total_nll += float(loss.item()) * ntok
+            total_tokens += ntok
+    finally:
+        stream.close()
+    loss_nats = total_nll / max(1, total_tokens)
+    return {
+        "total_tokens": float(total_tokens),
+        "total_nll": float(total_nll),
+        "loss_nats": float(loss_nats),
+        "bits_tok": float(loss_nats / math.log(2.0)),
+        "bpb": float("nan"),
+    }
+
+
 def _tokenize_raw_corpus_full(path: str, cfg: Config) -> Tuple[np.ndarray, float]:
     tok = build_tokenizer(cfg)
     corpus = RawCorpus(path, fmt=getattr(cfg, "dataset_format", "auto"),
@@ -5923,6 +6023,8 @@ def eval_full_model(
 ) -> Dict[str, float]:
     model.eval()
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
+    if fmt == "sft":
+        return _eval_full_sft(model, cfg, dataset, device, eval_batch_size)
     is_bin = fmt == "bin" or (fmt == "auto" and os.path.isfile(dataset) and dataset.endswith(".bin"))
     if is_bin:
         bpt, _, _ = load_bytes_per_token(dataset)
@@ -6064,6 +6166,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="LoomFormer: GQA Transformer LM with Paraplex FFN")
     ap.add_argument("--config", type=str, default=None)
     ap.add_argument("--dataset", type=str, default=None)
+    ap.add_argument("--sft-dataset", type=str, default=None,
+                    help="train on a chat/SFT dataset (JSONL/Arrow/Parquet with a 'messages' "
+                         "column): implies --train and dataset_format=sft, loss is computed on "
+                         "assistant tokens only")
+    ap.add_argument("--init-checkpoint", type=str, default=None,
+                    help="initialize weights from a checkpoint without its optimizer state or "
+                         "step count (SFT from a pretrained model); use --resume to continue a run")
+    ap.add_argument("--val-dataset", type=str, default=None,
+                    help="held-out dataset for eval logs; overrides val_dataset in the config")
     ap.add_argument("--output", type=str, default=None)
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--prepare", type=str, default=None, metavar="RAWDIR")
@@ -6157,8 +6268,11 @@ def main() -> None:
         cfg.amp_dtype = args.amp_dtype
     if args.resume_data is not None:
         cfg.resume_data_stream = args.resume_data
+    if args.val_dataset is not None:
+        cfg.val_dataset = args.val_dataset
     device_pref = args.device if args.device is not None else cfg.device
-    dev, distributed, world_size, rank, local_rank = maybe_launch_or_init_ddp(device_pref, training=bool(args.train))
+    dev, distributed, world_size, rank, local_rank = maybe_launch_or_init_ddp(
+        device_pref, training=bool(args.train or args.sft_dataset))
     if dev.type == "cuda":
         # The distributed setup returns directly after NCCL initialization
         # instead of passing through device_auto(), so configure every rank.
@@ -6211,14 +6325,24 @@ def main() -> None:
         apply_config(cfg)
         prepare(args.prepare, cfg, args.output or "prep.bin")
         return
-    if args.train:
-        train_dataset = args.dataset or cfg.train_dataset
+    if args.train or args.sft_dataset:
+        train_dataset = args.sft_dataset or args.dataset or cfg.train_dataset
         assert train_dataset, "--train needs --dataset or train_dataset in config"
         resume_path = args.resume if args.resume is not None else cfg.resume
+        if args.sft_dataset:
+            cfg.dataset_format = "sft"
+            assert args.init_checkpoint or resume_path, (
+                "--sft-dataset needs --init-checkpoint (the pretrained model to fine-tune) "
+                "or --resume (an interrupted SFT run to continue)"
+            )
+            if _auto_val_split_pct(cfg) > 0.0 and not cfg.val_dataset:
+                # Non-destructive example split inside the shared tokenized cache.
+                cfg.val_dataset = f"{train_dataset}#val"
+                train_dataset = f"{train_dataset}#train"
         asyncio.run(train_async(
             cfg, train_dataset, dev, args.checkpoint or "loomformer.pt",
             args.ablation, resume_path, args.resume_step,
-            args.resume_dataset_steps))
+            args.resume_dataset_steps, init_weights=args.init_checkpoint))
         return
     if args.export_aoti:
         assert args.checkpoint, "--export-aoti needs --checkpoint"

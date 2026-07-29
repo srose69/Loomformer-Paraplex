@@ -150,6 +150,23 @@ def ddp_unwrap_model(model: nn.Module) -> nn.Module:
     return raw._orig_mod if hasattr(raw, "_orig_mod") else raw
 
 
+def ddp_static_graph_policy(cfg: "Config") -> Tuple[bool, str]:
+    """Return whether DDP may safely reuse one fixed reducer-hook trace."""
+    accum_is_single = (
+        max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1)) == 1
+    )
+    compiled_with_eager_islands = bool(
+        getattr(cfg, "compile", False)
+        and bool(getattr(cfg, "tria_carry_enabled", False))
+        and bool(getattr(cfg, "tria_temporal_enabled", True))
+    )
+    if compiled_with_eager_islands:
+        return False, "compiled depth-replay eager island"
+    if not accum_is_single:
+        return False, "grad_accum_steps > 1 needs no_sync"
+    return True, ""
+
+
 def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tuple[torch.device, bool, int, int, int]:
     # Calling a venv interpreter by absolute path does not activate the venv
     # and therefore does not put sibling console tools (notably ninja) on
@@ -6970,7 +6987,10 @@ async def train_one_async(
         # static_graph reuses the first iteration's autograd trace, which is
         # incompatible with the no_sync() windows gradient accumulation needs
         # (the reducer asserts expect_autograd_hooks_ on the skipped backward).
-        static_graph = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1)) == 1
+        # It is also invalid for our compiled model: the depth-replay stack is
+        # an intentional eager island inside the compiled outer model, so its
+        # reducer-hook schedule is not one static compiled autograd graph.
+        static_graph, static_graph_reason = ddp_static_graph_policy(cfg)
         model = DDP(
             model_compiled,
             device_ids=[ddp_local_rank()],
@@ -6980,9 +7000,15 @@ async def train_one_async(
             gradient_as_bucket_view=True,
             static_graph=static_graph,
         )
-        ddp_print("[ddp] buckets=64MiB gradient_as_bucket_view=true "
-                  f"static_graph={str(static_graph).lower()}"
-                  + ("" if static_graph else " (disabled: grad_accum_steps > 1 needs no_sync)"))
+        if static_graph:
+            static_graph_note = ""
+        else:
+            static_graph_note = f" (disabled: {static_graph_reason})"
+        ddp_print(
+            "[ddp] buckets=64MiB gradient_as_bucket_view=true "
+            f"static_graph={str(static_graph).lower()}"
+            f"{static_graph_note}"
+        )
     else:
         model = model_compiled
 

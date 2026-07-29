@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import warnings
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -2846,6 +2846,78 @@ class LayerCache:
 
 
 @dataclass
+class InferenceKVRuntime:
+    """Placement and staging policy for inference KV.
+
+    ``storage_device`` is where layer K/V buffers remain for the whole turn.
+    CPU storage streams pinned chunks through a calibrated compute-GPU staging ring;
+    CUDA storage executes the parameter-free attention reduction on that GPU
+    and returns only the compact contexts to the model device.
+    """
+    storage_device: torch.device
+    compute_device: torch.device
+    chunk_size: int = 1024
+    preload_chunks: int = 1
+    copy_us: float = 0.0
+    consume_us: float = 0.0
+    safety_chunks: int = 2
+    _cpu_buffers: dict = field(default_factory=dict, repr=False)
+    _copy_streams: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        self.storage_device = torch.device(self.storage_device)
+        self.compute_device = torch.device(self.compute_device)
+        self.chunk_size = max(1, int(self.chunk_size))
+        self.preload_chunks = max(1, int(self.preload_chunks))
+        self.copy_us = max(0.0, float(self.copy_us))
+        self.consume_us = max(0.0, float(self.consume_us))
+        self.safety_chunks = max(0, int(self.safety_chunks))
+
+    @property
+    def is_local(self) -> bool:
+        return self.storage_device == self.compute_device
+
+    def preload_for(self, cache_len: int) -> int:
+        chunks = max(1, math.ceil(max(1, int(cache_len)) / self.chunk_size))
+        if self.copy_us <= 0.0 or self.consume_us <= 0.0:
+            return min(chunks, self.preload_chunks)
+        if self.copy_us <= self.consume_us:
+            required = 1
+        else:
+            required = math.ceil(
+                chunks - (chunks - 1) * self.consume_us / self.copy_us)
+        return min(chunks, max(1, required + self.safety_chunks))
+
+    def cpu_staging(
+        self,
+        batch: int,
+        dtype: torch.dtype,
+        preload_chunks: Optional[int] = None,
+    ) -> Tuple[list, torch.cuda.Stream]:
+        preload = self.preload_chunks if preload_chunks is None else max(1, int(preload_chunks))
+        key = (
+            int(batch), dtype, int(self.chunk_size), preload,
+            str(self.compute_device),
+        )
+        buffers = self._cpu_buffers.get(key)
+        if buffers is None:
+            shape = (batch, self.chunk_size, N_KV_HEADS, HEAD_DIM)
+            buffers = [
+                (
+                    torch.empty(shape, dtype=dtype, device=self.compute_device),
+                    torch.empty(shape, dtype=dtype, device=self.compute_device),
+                )
+                for _ in range(max(2, preload + 1))
+            ]
+            self._cpu_buffers[key] = buffers
+        stream = self._copy_streams.get(str(self.compute_device))
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.compute_device)
+            self._copy_streams[str(self.compute_device)] = stream
+        return buffers, stream
+
+
+@dataclass
 class TriaTemporalState:
     carry: Optional[torch.Tensor] = None          # [B,H,3,3] last document_carry
     refeed_pending: Optional[torch.Tensor] = None  # [B] bool: feed `carry` into L0 of current token
@@ -3518,7 +3590,184 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         k_ctx = kctx_g.transpose(1, 2).contiguous()
         return self.o(self._merge_q_heads(c)), q, k_ctx, c
 
-    def step(self, z: torch.Tensor, position_id: int, k_cache: Optional[torch.Tensor], v_cache: Optional[torch.Tensor], cache_len: int):
+    @staticmethod
+    def _online_chunk(
+        qg: torch.Tensor,
+        k_compact: torch.Tensor,
+        v_compact: torch.Tensor,
+        running: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stable online-softmax update over one compact-GQA KV chunk."""
+        k = GroupedQueryCausalSelfAttention._kv_to_q_heads(k_compact)
+        v = GroupedQueryCausalSelfAttention._kv_to_q_heads(v_compact)
+        kg = k.transpose(1, 2)
+        vg = v.transpose(1, 2)
+        scores = torch.matmul(qg, kg.transpose(-1, -2)).float() / math.sqrt(HEAD_DIM)
+        chunk_max = scores.amax(dim=-1)
+        if running is None:
+            new_max = chunk_max
+            probs = torch.exp(scores - new_max.unsqueeze(-1))
+            denom = probs.sum(dim=-1)
+            c_num = torch.matmul(probs, vg.float())
+            k_num = torch.matmul(probs, kg.float())
+            return new_max, denom, c_num, k_num
+        old_max, old_denom, old_c, old_k = running
+        new_max = torch.maximum(old_max, chunk_max)
+        old_scale = torch.exp(old_max - new_max)
+        probs = torch.exp(scores - new_max.unsqueeze(-1))
+        denom = old_denom * old_scale + probs.sum(dim=-1)
+        c_num = old_c * old_scale.unsqueeze(-1) + torch.matmul(probs, vg.float())
+        k_num = old_k * old_scale.unsqueeze(-1) + torch.matmul(probs, kg.float())
+        return new_max, denom, c_num, k_num
+
+    def _step_cpu_kv(
+        self,
+        q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_cache: Optional[torch.Tensor],
+        v_cache: Optional[torch.Tensor],
+        cache_len: int,
+        runtime: InferenceKVRuntime,
+    ):
+        """Attend to pinned CPU KV through an overlapped staging ring."""
+        if q.device.type != "cuda":
+            raise ValueError("CPU KV streaming requires a CUDA compute device")
+        B = q.shape[0]
+        if k_cache is None:
+            shape = (B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+            k_cache = torch.zeros(shape, dtype=k_new.dtype, device="cpu", pin_memory=True)
+            v_cache = torch.zeros(shape, dtype=v_new.dtype, device="cpu", pin_memory=True)
+        elif not k_cache.is_pinned() or not v_cache.is_pinned():
+            k_cache = k_cache.pin_memory()
+            v_cache = v_cache.pin_memory()
+
+        qg = q.transpose(1, 2)
+        running = None
+        C = int(runtime.chunk_size)
+        preload = runtime.preload_for(cache_len)
+        buffers, copy_stream = runtime.cpu_staging(B, k_new.dtype, preload)
+        compute_stream = torch.cuda.current_stream(q.device)
+
+        if cache_len + 1 <= C:
+            kb, vb = buffers[0]
+            ready = torch.cuda.Event()
+            with torch.cuda.stream(copy_stream):
+                if cache_len:
+                    kb[:, :cache_len].copy_(k_cache[:, :cache_len], non_blocking=True)
+                    vb[:, :cache_len].copy_(v_cache[:, :cache_len], non_blocking=True)
+                ready.record(copy_stream)
+            compute_stream.wait_event(ready)
+            kb[:, cache_len:cache_len + 1].copy_(k_new)
+            vb[:, cache_len:cache_len + 1].copy_(v_new)
+            k = self._kv_to_q_heads(kb[:, :cache_len + 1])
+            v = self._kv_to_q_heads(vb[:, :cache_len + 1])
+            kg = k.transpose(1, 2)
+            vg = v.transpose(1, 2)
+            scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(HEAD_DIM)
+            a = torch.softmax(scores.float(), dim=-1).to(vg.dtype)
+            c_g = torch.matmul(a, vg)
+            kctx_g = torch.matmul(a, kg)
+            k_cache[:, cache_len].copy_(k_new[:, 0], non_blocking=False)
+            v_cache[:, cache_len].copy_(v_new[:, 0], non_blocking=False)
+            return c_g, kctx_g, k_cache, v_cache
+
+        ready: Dict[int, torch.cuda.Event] = {}
+        free: List[Optional[torch.cuda.Event]] = [None] * len(buffers)
+        offsets = list(range(0, cache_len, C))
+        preload = min(len(offsets), preload)
+
+        def enqueue(j: int, buffer_index: int) -> None:
+            off = offsets[j]
+            n = min(C, cache_len - off)
+            kb, vb = buffers[buffer_index]
+            with torch.cuda.stream(copy_stream):
+                if free[buffer_index] is not None:
+                    copy_stream.wait_event(free[buffer_index])
+                kb[:, :n].copy_(k_cache[:, off:off + n], non_blocking=True)
+                vb[:, :n].copy_(v_cache[:, off:off + n], non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(copy_stream)
+                ready[j] = event
+
+        for j in range(preload):
+            enqueue(j, j % len(buffers))
+        # "Preload" means ready, not merely queued on the copy stream. Waiting
+        # for the last initial event establishes the measured lead before the
+        # online reducer starts; the +2 calibration margin can then absorb
+        # transfer jitter instead of disappearing during the first chunks.
+        if preload > 1:
+            compute_stream.wait_event(ready[preload - 1])
+
+        for j, off in enumerate(offsets):
+            bi = j % len(buffers)
+            if j not in ready:
+                enqueue(j, bi)
+            compute_stream.wait_event(ready.pop(j))
+            n = min(C, cache_len - off)
+            kb, vb = buffers[bi]
+            running = self._online_chunk(qg, kb[:, :n], vb[:, :n], running)
+            free[bi] = torch.cuda.Event()
+            free[bi].record(compute_stream)
+            nxt = j + preload
+            if nxt < len(offsets) and nxt not in ready:
+                enqueue(nxt, nxt % len(buffers))
+
+        # The current token is already on the compute GPU. Fold it into the
+        # same online reduction without a pointless round trip through RAM.
+        running = self._online_chunk(qg, k_new, v_new, running)
+        _, denom, c_num, k_num = running
+        c_g = (c_num / denom.unsqueeze(-1)).to(q.dtype)
+        kctx_g = (k_num / denom.unsqueeze(-1)).to(q.dtype)
+
+        # Persist the new compact KV only after it has contributed locally.
+        # The destination is pinned, so future H2D reads remain asynchronous.
+        k_cache[:, cache_len].copy_(k_new[:, 0], non_blocking=False)
+        v_cache[:, cache_len].copy_(v_new[:, 0], non_blocking=False)
+        return c_g, kctx_g, k_cache, v_cache
+
+    def _step_remote_cuda_kv(
+        self,
+        q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_cache: Optional[torch.Tensor],
+        v_cache: Optional[torch.Tensor],
+        cache_len: int,
+        storage: torch.device,
+    ):
+        """Execute the complete attention reduction beside remote-resident KV."""
+        B = q.shape[0]
+        q_remote = q.to(storage, non_blocking=True)
+        k_new_remote = k_new.to(storage, non_blocking=True)
+        v_new_remote = v_new.to(storage, non_blocking=True)
+        if k_cache is None:
+            shape = (B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+            k_cache = torch.zeros(shape, dtype=k_new.dtype, device=storage)
+            v_cache = torch.zeros(shape, dtype=v_new.dtype, device=storage)
+        k_cache[:, cache_len] = k_new_remote[:, 0]
+        v_cache[:, cache_len] = v_new_remote[:, 0]
+        new_len = cache_len + 1
+        k = self._kv_to_q_heads(k_cache[:, :new_len])
+        v = self._kv_to_q_heads(v_cache[:, :new_len])
+        qg = q_remote.transpose(1, 2)
+        kg = k.transpose(1, 2)
+        vg = v.transpose(1, 2)
+        scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(HEAD_DIM)
+        a = torch.softmax(scores.float(), dim=-1).to(vg.dtype)
+        c_g = torch.matmul(a, vg).to(q.device, non_blocking=True)
+        kctx_g = torch.matmul(a, kg).to(q.device, non_blocking=True)
+        return c_g, kctx_g, k_cache, v_cache
+
+    def step(
+        self,
+        z: torch.Tensor,
+        position_id: int,
+        k_cache: Optional[torch.Tensor],
+        v_cache: Optional[torch.Tensor],
+        cache_len: int,
+        kv_runtime: Optional[InferenceKVRuntime] = None,
+    ):
         if cache_len >= SEQ_LEN:
             raise ValueError(f"generation exceeded seq_len={SEQ_LEN}; no wraparound support")
         B = z.shape[0]
@@ -3529,23 +3778,31 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         q, k_new_q = self.rope(q, k_new_q, pos)
         k_new = k_new_q.view(B, 1, N_KV_HEADS, GQA_GROUP_SIZE, HEAD_DIM)[:, :, :, 0, :]
         v_new = self._split_kv_heads(v_p)
-        if k_cache is None:
-            k_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
-            v_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
-        k_cache[:, cache_len] = k_new[:, 0]
-        v_cache[:, cache_len] = v_new[:, 0]
-        new_len = cache_len + 1
-        k_all = k_cache[:, :new_len]
-        v_all = v_cache[:, :new_len]
-        k = self._kv_to_q_heads(k_all)
-        v = self._kv_to_q_heads(v_all)
-        qg = q.transpose(1, 2)
-        kg = k.transpose(1, 2)
-        vg = v.transpose(1, 2)
-        scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(HEAD_DIM)
-        a = torch.softmax(scores.float(), dim=-1).to(vg.dtype)
-        c_g = torch.matmul(a, vg)
-        kctx_g = torch.matmul(a, kg)
+        storage = z.device if kv_runtime is None else kv_runtime.storage_device
+        if storage.type == "cpu":
+            c_g, kctx_g, k_cache, v_cache = self._step_cpu_kv(
+                q, k_new, v_new, k_cache, v_cache, cache_len, kv_runtime)
+        elif storage != z.device:
+            c_g, kctx_g, k_cache, v_cache = self._step_remote_cuda_kv(
+                q, k_new, v_new, k_cache, v_cache, cache_len, storage)
+        else:
+            if k_cache is None:
+                k_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+                v_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+            k_cache[:, cache_len] = k_new[:, 0]
+            v_cache[:, cache_len] = v_new[:, 0]
+            new_len = cache_len + 1
+            k_all = k_cache[:, :new_len]
+            v_all = v_cache[:, :new_len]
+            k = self._kv_to_q_heads(k_all)
+            v = self._kv_to_q_heads(v_all)
+            qg = q.transpose(1, 2)
+            kg = k.transpose(1, 2)
+            vg = v.transpose(1, 2)
+            scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(HEAD_DIM)
+            a = torch.softmax(scores.float(), dim=-1).to(vg.dtype)
+            c_g = torch.matmul(a, vg)
+            kctx_g = torch.matmul(a, kg)
         c = c_g.transpose(1, 2).contiguous()
         k_ctx = kctx_g.transpose(1, 2).contiguous()
         # Возвращаем ПОЛНЫЙ буфер (не срез) -- вызывающий код хранит его в LayerCache и
@@ -4377,7 +4634,13 @@ class Model(nn.Module):
         return self._head_or_loss(h, labels, ignore_index)  # [B,T,VOCAB] or scalar loss
 
     @torch.no_grad()
-    def step(self, idx_t: torch.Tensor, pos_t: int, states):
+    def step(
+        self,
+        idx_t: torch.Tensor,
+        pos_t: int,
+        states,
+        kv_runtime: Optional[InferenceKVRuntime] = None,
+    ):
         is_bos = bool(pos_t == 0)
         if states is None:
             caches, tria_ca_cache, tria_temporal_state = None, None, None
@@ -4423,7 +4686,8 @@ class Model(nn.Module):
         )
         for bi, (block, cache) in enumerate(zip(self.blocks, caches)):
             is_last_block = bi == n_blocks - 1
-            attn_out, q_h, k_ctx_h, c_h, k_all, v_all = block.attn.step(h, pos_t, cache.k, cache.v, cache.cache_len)
+            attn_out, q_h, k_ctx_h, c_h, k_all, v_all = block.attn.step(
+                h, pos_t, cache.k, cache.v, cache.cache_len, kv_runtime=kv_runtime)
             skip, _ = self.depth_attn(sub_idx, hist_k[:, :, :sub_idx + 1], hist_v[:, :, :sub_idx + 1])
             h = block.ln_attn(skip + attn_out)
             k_i, v_i = self.depth_attn.project(h)

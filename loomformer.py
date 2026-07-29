@@ -145,7 +145,8 @@ def ddp_sum_int(value: int, device: torch.device) -> int:
 
 
 def ddp_unwrap_model(model: nn.Module) -> nn.Module:
-    raw = model.module if isinstance(model, DDP) else model
+    is_fsdp = model.__class__.__name__ == "FullyShardedDataParallel"
+    raw = model.module if isinstance(model, DDP) or is_fsdp else model
     return raw._orig_mod if hasattr(raw, "_orig_mod") else raw
 
 
@@ -333,9 +334,12 @@ class Config:
     prefetch_batches: int = 256
     gpu_prefetch_batches: int = 8
     grad_checkpointing: bool = False
+    fsdp_full_shard: bool = False
+    optimizer_zero_shard: bool = False
     save_every: int = 0 
     runpoints_path: Optional[str] = None  
     save_initial_checkpoint: bool = False
+    save_final_checkpoint: bool = True
     tria_carry_enabled: bool = False
     # ===AUTO GENERATED=== bookkeeping written by loomcloner.py --scan/--clone.
     # cloned/cloned_from/cloned_mapping are informational only (which donor,
@@ -990,39 +994,6 @@ def init_linear_residual(m: nn.Linear, gain: float = FANIN_GAIN, zero_bias: bool
 
 def init_embedding_fanin(m: nn.Embedding, gain: float = FANIN_GAIN) -> None:
     nn.init.normal_(m.weight, mean=0.0, std=fanin_std(m.embedding_dim, gain))
-
-
-def make_w1_imag_live_flat_indices() -> torch.Tensor:
-    idx: List[int] = []
-    for qh in range(N_Q_HEADS):
-        r0, r1 = qh * HIDDEN_PER_Q_HEAD, (qh + 1) * HIDDEN_PER_Q_HEAD
-        c0, c1 = qh * HEAD_DIM, (qh + 1) * HEAD_DIM
-        if PHASE_SECTORS == "head":
-            cols = (
-                list(range(0 * N + c0, 0 * N + c1)) +  # Q_qh — always own head
-                list(range(1 * N + c0, 1 * N + c1)) +  # Kctx_qh
-                list(range(2 * N + c0, 2 * N + c1)) +  # C_qh
-                list(range(3 * N, 4 * N)) +             # full U stream
-                list(range(4 * N + c0, 4 * N + c1))     # D_qh — own head's depth-selection
-            )
-        else:
-            cols = (
-                list(range(0 * N + c0, 0 * N + c1)) +  # Q_qh — always own head
-                list(range(1 * N, 2 * N)) +             # Kctx all heads
-                list(range(2 * N, 3 * N)) +             # C all heads
-                list(range(3 * N, 4 * N)) +             # full U stream
-                list(range(4 * N, 5 * N))               # D all heads — depth-selection
-            )
-        if len(cols) != IMAG_IN:
-            raise ValueError(f"bad live imag fan-in: got {len(cols)}, expected {IMAG_IN}")
-        for r in range(r0, r1):
-            base = r * (5 * N)
-            idx.extend(base + c for c in cols)
-    expected = HIDDEN * IMAG_IN
-    if len(idx) != expected:
-        raise ValueError(f"bad live imag index count: got {len(idx)}, expected {expected}")
-    return torch.tensor(idx, dtype=torch.long)
-
 
 
 def apply_config(cfg: Config) -> None:
@@ -2130,7 +2101,7 @@ def make_stream(path: str, cfg: Config, device: torch.device):
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
     if fmt == "sft":
         import loomsft  # lazy: only SFT runs need the chat template/pyarrow path
-        return loomsft.SFTStream(path, cfg, device)
+        return loomsft.make_stream(path, cfg, device)
     if fmt == "bin" or (fmt == "auto" and os.path.isfile(path) and path.endswith(".bin")):
         bos_id = _tok_special_id(build_tokenizer(cfg), "<bos>")
         return TokenStream(path, cfg, device, bos_id=bos_id)
@@ -2420,7 +2391,14 @@ def split_train_batch(batch, eos_id: Optional[int]):
             ids, loss_mask = batch
         elif len(batch) == 3:
             ids, loss_mask, metadata = batch
-            if isinstance(metadata, PackedAttentionLayout):
+            if (
+                isinstance(metadata, PackedAttentionLayout)
+                or (
+                    hasattr(metadata, "segment_ids")
+                    and hasattr(metadata, "cu_seqlens")
+                    and hasattr(metadata, "position_ids")
+                )
+            ):
                 supplied_layout = metadata
             else:
                 packed_max_seqlen = metadata
@@ -3240,14 +3218,9 @@ class ParaplexFFN(nn.Module):
         self.ablation = bool(ablation)
         self.w1_real = nn.Linear(N, HIDDEN)
         # Compact PARAMETER storage, dense COMPUTE path.
-        # Only live phase weights are Parameters/optimizer state; forward scatters them
-        # into a transient dense [HIDDEN, 4*N] matrix and keeps the fast single GEMM.
+        # Only live phase weights are Parameters/optimizer state; forward expands them
+        # into a transient dense matrix and keeps the fast single GEMM.
         self.w1_imag = nn.Parameter(torch.empty(HIDDEN, IMAG_IN))
-        self.register_buffer("w1_imag_flat_idx", make_w1_imag_live_flat_indices(), persistent=False)
-        # Кэш нулевого буфера под scatter -- избегаем new_zeros() на КАЖДЫЙ forward.
-        # scatter() (не scatter_()) не мутирует буфер и возвращает новый тензор, так что
-        # переиспользование buf как "self" безопасно для autograd между шагами.
-        self.register_buffer("_imag_zero_buf", torch.zeros(HIDDEN * 5 * N), persistent=False)
         self.w1_imag_trace = nn.Parameter(torch.zeros(HIDDEN))
         self.w1_imag_bias = nn.Parameter(torch.zeros(HIDDEN))
         self.w2 = nn.Linear(HIDDEN, N)
@@ -3296,12 +3269,32 @@ class ParaplexFFN(nn.Module):
         return x.reshape(B, T, N)
 
     def _dense_imag_weight(self) -> torch.Tensor:
-        # No Python loops in forward. This replaces the old `weight * mask`: same dense
-        # GEMM shape, but dead weights do not exist as Parameters or optimizer state.
-        # scatter() is non-mutating (returns a new tensor), so reusing the cached zero
-        # buffer as the base is safe across steps/backward calls.
-        flat = self._imag_zero_buf.scatter(0, self.w1_imag_flat_idx, self.w1_imag.reshape(-1))
-        return flat.view(HIDDEN, 5 * N)
+        # Expand head-local compact columns without a persistent dense zero buffer or
+        # an HIDDEN*IMAG_IN int64 scatter index.  Those buffers cost ~2 GiB for alt6
+        # and DDP tried to broadcast them before every forward.  The head selector is
+        # tiny; multiplication materializes only the required dense head-local block,
+        # and cat produces the single GEMM weight.
+        def expand_head_local(x: torch.Tensor) -> torch.Tensor:
+            x = x.view(N_Q_HEADS, HIDDEN_PER_Q_HEAD, HEAD_DIM)
+            selector = torch.eye(
+                N_Q_HEADS, dtype=x.dtype, device=x.device
+            ).view(N_Q_HEADS, 1, N_Q_HEADS, 1)
+            return (x.unsqueeze(2) * selector).reshape(HIDDEN, N)
+
+        if PHASE_SECTORS == "head":
+            q, k, c, u, d = torch.split(
+                self.w1_imag, (HEAD_DIM, HEAD_DIM, HEAD_DIM, N, HEAD_DIM), dim=1
+            )
+            return torch.cat((
+                expand_head_local(q),
+                expand_head_local(k),
+                expand_head_local(c),
+                u,
+                expand_head_local(d),
+            ), dim=1)
+
+        q, shared = torch.split(self.w1_imag, (HEAD_DIM, 4 * N), dim=1)
+        return torch.cat((expand_head_local(q), shared), dim=1)
 
     def _beta_space(self, u: torch.Tensor, q_h: torch.Tensor, k_ctx_h: torch.Tensor,
                      c_h: torch.Tensor, d_h: torch.Tensor) -> torch.Tensor:
@@ -6613,12 +6606,39 @@ async def train_one_async(
         # LR schedule all start fresh, unlike --resume.
         load_model_checkpoint(model_base, init_weights, ablation=ablation, device=device)
         ddp_print(f"[init] weights loaded from {init_weights} (fresh optimizer, step 0)")
+    if bool(getattr(cfg, "fsdp_full_shard", False)):
+        reshaped_scalars = 0
+        with torch.no_grad():
+            for parameter in model_base.parameters():
+                if parameter.ndim == 0:
+                    parameter.data = parameter.data.reshape(1)
+                    reshaped_scalars += 1
+        ddp_print(
+            f"[fsdp] represented {reshaped_scalars} scalar parameters as "
+            "length-1 tensors for FSDP flattening")
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and resume_in:
         raise ValueError("save_initial_checkpoint requires a fresh run without resume")
     train_lr_by_id = apply_train_lr_overrides(model_base, cfg)
     model_compiled = maybe_compile(
         model_base, device, enabled=bool(getattr(cfg, "compile", False)))
-    if ddp_is_distributed():
+    if ddp_is_distributed() and bool(getattr(cfg, "fsdp_full_shard", False)):
+        if bool(getattr(cfg, "optimizer_zero_shard", False)):
+            raise ValueError(
+                "fsdp_full_shard and optimizer_zero_shard are mutually exclusive")
+        if bool(getattr(cfg, "compile", False)):
+            raise ValueError("fsdp_full_shard local mode requires compile=false")
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        model = FSDP(
+            model_compiled,
+            device_id=device,
+            use_orig_params=True,
+            limit_all_gathers=True,
+            sync_module_states=False,
+        )
+        ddp_print(
+            f"[fsdp] FULL_SHARD across {ddp_world_size()} ranks "
+            "use_orig_params=true limit_all_gathers=true")
+    elif ddp_is_distributed():
         # static_graph reuses the first iteration's autograd trace, which is
         # incompatible with the no_sync() windows gradient accumulation needs
         # (the reducer asserts expect_autograd_hooks_ on the skipped backward).
@@ -6714,11 +6734,33 @@ async def train_one_async(
     if len(groups) > 1:
         summary = ", ".join(f"{len(ps)}@lr_mult={mult:g}/wd={wd:g}" for (wd, mult), ps in groups.items())
         ddp_print(f"[optimizer] {len(groups)} param groups: {summary}")
-    opt = OptimizerClass(
-        [{"params": ps, "weight_decay": wd, "lr_mult": mult} for (wd, mult), ps in groups.items()],
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
+    optimizer_groups = [
+        {"params": ps, "weight_decay": wd, "lr_mult": mult}
+        for (wd, mult), ps in groups.items()
+    ]
+    if bool(getattr(cfg, "optimizer_zero_shard", False)):
+        if not ddp_is_distributed():
+            raise ValueError("optimizer_zero_shard=true requires DDP")
+        if ckpt_out:
+            raise ValueError(
+                "optimizer_zero_shard currently requires checkpoint output to "
+                "be disabled; consolidated optimizer checkpointing is not enabled")
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        opt = ZeroRedundancyOptimizer(
+            optimizer_groups,
+            optimizer_class=OptimizerClass,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+        )
+        ddp_print(
+            f"[optimizer] ZeroRedundancyOptimizer shards {optimizer_name} "
+            f"state across {ddp_world_size()} ranks")
+    else:
+        opt = OptimizerClass(
+            optimizer_groups,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+        )
     if resume_in:
         load_optimizer_checkpoint(opt, resume_in, optimizer_name, device)
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and ckpt_out and ddp_is_main():
@@ -7088,7 +7130,13 @@ async def train_one_async(
                 refeeds_log = int(refeeds_log_t.item())
                 refeeds_since_log.zero_()
                 if step == 1 or step % eval_every == 0:
-                    final_eval_local = await eval_loss_async(model_base, eval_stream, cfg, device, eos_id=eval_eos_id)
+                    eval_model = (
+                        model
+                        if bool(getattr(cfg, "fsdp_full_shard", False))
+                        else model_base
+                    )
+                    final_eval_local = await eval_loss_async(
+                        eval_model, eval_stream, cfg, device, eos_id=eval_eos_id)
                     final_eval = ddp_mean_float(final_eval_local, device)
                     best_eval = min(best_eval, final_eval)
                     bits_tok, bpb = loss_to_bits(final_eval, eval_bpt)
@@ -7644,8 +7692,13 @@ def main() -> None:
                 # Non-destructive example split inside the shared tokenized cache.
                 cfg.val_dataset = f"{train_dataset}#val"
                 train_dataset = f"{train_dataset}#train"
+        checkpoint_out = (
+            args.checkpoint
+            if args.checkpoint is not None
+            else ("loomformer.pt" if cfg.save_final_checkpoint else None)
+        )
         asyncio.run(train_async(
-            cfg, train_dataset, dev, args.checkpoint or "loomformer.pt",
+            cfg, train_dataset, dev, checkpoint_out,
             args.ablation, resume_path, args.resume_step,
             args.resume_dataset_steps, init_weights=args.init_checkpoint))
         return

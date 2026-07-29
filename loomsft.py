@@ -5,8 +5,7 @@
 This module owns exactly three SFT-specific things:
 
   1. the sft_format.json schema check (validate_example),
-  2. a one-time tokenized cache of the dataset (SFTCache: flat ids / loss mask /
-     example offsets on disk, mmap- or RAM-backed),
+  2. cached and on-the-fly tokenization backends,
   3. a stream (SFTStream) that packs cached examples into fixed-length rows and
      exposes the SAME interface loomformer.py's ShardStream/TokenStream do.
 
@@ -38,7 +37,15 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-import loomformer as lf
+# When loomformer.py is the torchrun entrypoint it lives under ``__main__``.
+# Importing ``loomformer`` again would create duplicate Config/layout classes,
+# breaking isinstance checks across the SFT boundary.  Reuse the active module;
+# direct ``python loomsft.py`` still takes the normal import path.
+_active_main = sys.modules.get("__main__")
+if _active_main is not None and hasattr(_active_main, "PackedAttentionLayout"):
+    lf = _active_main
+else:
+    import loomformer as lf
 
 IGNORE_INDEX = lf.IGNORE_INDEX
 
@@ -306,6 +313,15 @@ def _need_pad_id(tok) -> int:
             "tokenizer is missing <pad>. Retrain it with "
             "loomformer.train_tokenizer(..., special_tokens=loomformer.DEFAULT_SPECIAL_TOKENS)."
         )
+    return tid
+
+
+def _need_eos_id(tok) -> int:
+    tid = tok.special_id("<eos>")
+    if tid is None:
+        raise ValueError(
+            "SFT packing needs <eos> as the example separator, but the "
+            "tokenizer has none")
     return tid
 
 
@@ -649,6 +665,241 @@ class SFTStream:
 
     def close(self) -> None:
         self._stop.set()
+
+
+class SFTOnTheFlyStream(SFTStream):
+    """Bounded-memory SFT producer modelled after loomformer's ShardStream.
+
+    Parquet rows are partitioned between DDP ranks, shuffled at row-group and
+    record-batch granularity, rendered/tokenized in batches, and packed into
+    fixed-size rows without first tokenizing the complete dataset.
+    """
+
+    _TOKENIZE_BATCH = 256
+
+    def __init__(self, dataset: str, cfg: "lf.Config", device: torch.device):
+        if not dataset.endswith(".parquet"):
+            raise ValueError(
+                "dataset_cache=otf currently requires a Parquet SFT dataset")
+        self.cfg = cfg
+        self.device = device
+        self.dataset = dataset
+        self.tok = lf.build_tokenizer(cfg)
+        self.chat = lf.ChatTemplate(self.tok)
+        self._eos_id = _need_eos_id(self.tok)
+        self._pad_id = _need_pad_id(self.tok)
+        self._carry_id = lf._tok_special_id(self.tok, "<CARRY>")
+        self.T1 = int(cfg.seq_len) + 1
+        self._rank = lf.ddp_rank() if lf.ddp_is_distributed() else 0
+        self._world_size = lf.ddp_world_size() if lf.ddp_is_distributed() else 1
+
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(dataset)
+        if "messages" not in pf.schema_arrow.names:
+            raise ValueError(
+                f"{dataset}: expected a 'messages' column, got {pf.schema_arrow.names}")
+        self._has_tools = "tools" in pf.schema_arrow.names
+        total = int(pf.metadata.num_rows)
+        self._assigned_rows = (
+            total + self._world_size - 1 - self._rank) // self._world_size
+        if self._assigned_rows <= 0:
+            raise ValueError(f"rank {self._rank} received no SFT rows")
+
+        self._row_groups = []
+        cursor = 0
+        for rg in range(pf.num_row_groups):
+            count = int(pf.metadata.row_group(rg).num_rows)
+            begin, end = cursor, cursor + count
+            self._row_groups.append((rg, begin, end))
+            cursor = end
+        del pf
+
+        self._ram_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(cfg.prefetch_batches)))
+        self._stop = threading.Event()
+        self._producer_error = None
+        self._producer = None
+        self._gpu_ids = None
+        self._gpu_mask = None
+        self._gpu_layouts = None
+        self._gpu_pos = 0
+        self._skip_batches = 0
+        lf.ddp_print(
+            f"[sft-data] otf rank={self._rank} rows={self._assigned_rows:,} "
+            f"partition=row%{self._world_size}=={self._rank} "
+            f"row_groups={len(self._row_groups)}")
+
+    def fast_forward(self, n_batches: int) -> None:
+        if self._producer is not None:
+            raise RuntimeError("fast_forward must run before the OTF producer starts")
+        self._skip_batches = int(n_batches)
+
+    def _iter_epoch_examples(self, epoch: int):
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(self.dataset)
+        columns = ["messages"] + (["tools"] if self._has_tools else [])
+        rng = np.random.default_rng(
+            int(self.cfg.seed) + 1_000_003 * int(epoch) + 97 * self._rank)
+        groups = list(self._row_groups)
+        rng.shuffle(groups)
+        for rg, group_begin, _group_end in groups:
+            batch_cursor = group_begin
+            for batch in pf.iter_batches(
+                row_groups=[rg],
+                columns=columns,
+                batch_size=self._TOKENIZE_BATCH,
+            ):
+                batch_end = batch_cursor + batch.num_rows
+                global_rows = np.arange(
+                    batch_cursor, batch_end, dtype=np.int64)
+                local_positions = np.flatnonzero(
+                    global_rows % self._world_size == self._rank)
+                if local_positions.size:
+                    messages_all = batch.column("messages").to_pylist()
+                    tools_all = (
+                        batch.column("tools").to_pylist()
+                        if self._has_tools else None
+                    )
+                    order = rng.permutation(local_positions.size)
+                    for j in order:
+                        position = int(local_positions[int(j)])
+                        ex = {"messages": messages_all[position]}
+                        tool_value = (
+                            tools_all[position] if tools_all is not None else None)
+                        if tool_value is not None:
+                            ex["tools"] = tool_value
+                        yield int(batch_cursor + position), ex
+                batch_cursor = batch_end
+
+    def _tokenize_examples(self, examples):
+        valid = []
+        texts = []
+        for row, ex in examples:
+            validate_example(ex, line_ctx=f"{self.dataset}:row {row}: ")
+            valid.append((row, ex))
+            texts.append(self.chat.render_text(
+                ex["messages"], tools=ex.get("tools"),
+                add_generation_prompt=False))
+        encoded = lf._encode_batch_any(self.tok, texts)
+        for (row, _ex), ids in zip(valid, encoded):
+            mask = [0] * len(ids)
+            for p in self.chat._find_all(ids, self.chat._assistant_header_ids):
+                start = p + len(self.chat._assistant_header_ids)
+                finish = start
+                while finish < len(ids) and ids[finish] != self.chat.im_end_id:
+                    finish += 1
+                finish = min(finish, len(ids) - 1)
+                for k in range(start, finish + 1):
+                    mask[k] = 1
+            if len(ids) <= int(self.cfg.seq_len) and any(mask):
+                yield (
+                    np.asarray(ids, dtype=np.int64),
+                    np.asarray(mask, dtype=np.int8),
+                )
+
+    def _materialize_batch(self, rows):
+        ids = torch.from_numpy(np.stack([row[0] for row in rows]))
+        mask = torch.from_numpy(np.stack([row[1] for row in rows]))
+        _position_ids, layout = lf.build_doc_reset_state(
+            ids[:, :-1], self._eos_id)
+        if self.device.type == "cuda":
+            ids = ids.pin_memory()
+            mask = mask.pin_memory()
+            layout = layout.pin_memory()
+        return ids, mask, layout
+
+    def _produce_cpu_batches(self) -> None:
+        batch_size = int(self.cfg.batch_size)
+        open_ids = [
+            np.full(self.T1, self._pad_id, dtype=np.int64)
+            for _ in range(batch_size)
+        ]
+        open_mask = [
+            np.zeros(self.T1, dtype=np.int8)
+            for _ in range(batch_size)
+        ]
+        cursors = np.zeros(batch_size, dtype=np.int64)
+        ready = []
+        epoch = 0
+        skipped = 0
+
+        def emit(bin_index: int) -> None:
+            nonlocal skipped
+            if cursors[bin_index] <= 0:
+                return
+            ready.append((open_ids[bin_index].copy(), open_mask[bin_index].copy()))
+            open_ids[bin_index].fill(self._pad_id)
+            open_mask[bin_index].fill(0)
+            cursors[bin_index] = 0
+            if len(ready) == batch_size:
+                batch = self._materialize_batch(ready)
+                ready.clear()
+                if skipped < self._skip_batches:
+                    skipped += 1
+                else:
+                    self._ram_queue.put(batch)
+
+        try:
+            while not self._stop.is_set():
+                pending = []
+                for row, ex in self._iter_epoch_examples(epoch):
+                    pending.append((row, ex))
+                    if len(pending) < self._TOKENIZE_BATCH:
+                        continue
+                    for ids, mask in self._tokenize_examples(pending):
+                        need = len(ids) + 1
+                        fits = np.flatnonzero(cursors + need <= self.T1)
+                        if fits.size == 0:
+                            emit(int(np.argmax(cursors)))
+                            fits = np.flatnonzero(cursors + need <= self.T1)
+                        # Best-fit placement minimizes padding without a global
+                        # length index or an unbounded resident example pool.
+                        remaining = self.T1 - (cursors[fits] + need)
+                        target = int(fits[int(np.argmin(remaining))])
+                        begin = int(cursors[target])
+                        open_ids[target][begin:begin + len(ids)] = ids
+                        local_mask = mask.copy()
+                        local_mask[0] = 0
+                        open_mask[target][begin:begin + len(ids)] = local_mask
+                        open_ids[target][begin + len(ids)] = self._eos_id
+                        cursors[target] += need
+                    pending.clear()
+                if pending:
+                    for ids, mask in self._tokenize_examples(pending):
+                        need = len(ids) + 1
+                        fits = np.flatnonzero(cursors + need <= self.T1)
+                        if fits.size == 0:
+                            emit(int(np.argmax(cursors)))
+                            fits = np.flatnonzero(cursors + need <= self.T1)
+                        remaining = self.T1 - (cursors[fits] + need)
+                        target = int(fits[int(np.argmin(remaining))])
+                        begin = int(cursors[target])
+                        open_ids[target][begin:begin + len(ids)] = ids
+                        local_mask = mask.copy()
+                        local_mask[0] = 0
+                        open_mask[target][begin:begin + len(ids)] = local_mask
+                        open_ids[target][begin + len(ids)] = self._eos_id
+                        cursors[target] += need
+                for target in np.argsort(-cursors):
+                    emit(int(target))
+                epoch += 1
+        except BaseException as exc:
+            self._producer_error = exc
+            try:
+                self._ram_queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+
+def make_stream(dataset: str, cfg: "lf.Config", device: torch.device):
+    mode = str(getattr(cfg, "dataset_cache", "mmap") or "mmap").lower()
+    if mode == "otf":
+        return SFTOnTheFlyStream(dataset, cfg, device)
+    if mode not in ("mmap", "ram"):
+        raise ValueError(
+            f"SFT dataset_cache must be 'otf', 'mmap', or 'ram', got {mode!r}")
+    return SFTStream(dataset, cfg, device)
 
 
 def train_sft(

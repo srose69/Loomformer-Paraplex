@@ -678,12 +678,25 @@ class SFTOnTheFlyStream(SFTStream):
     _TOKENIZE_BATCH = 256
 
     def __init__(self, dataset: str, cfg: "lf.Config", device: torch.device):
-        if not dataset.endswith(".parquet"):
+        if os.path.isdir(dataset):
+            files = sorted(
+                os.path.join(dataset, name)
+                for name in os.listdir(dataset)
+                if name.endswith(".parquet")
+                and os.path.isfile(os.path.join(dataset, name))
+            )
+        elif dataset.endswith(".parquet") and os.path.isfile(dataset):
+            files = [dataset]
+        else:
+            files = []
+        if not files:
             raise ValueError(
-                "dataset_cache=otf currently requires a Parquet SFT dataset")
+                "dataset_cache=otf requires a Parquet SFT file or a directory "
+                "containing top-level .parquet shards")
         self.cfg = cfg
         self.device = device
         self.dataset = dataset
+        self._files = files
         self.tok = lf.build_tokenizer(cfg)
         self.chat = lf.ChatTemplate(self.tok)
         self._eos_id = _need_eos_id(self.tok)
@@ -694,25 +707,33 @@ class SFTOnTheFlyStream(SFTStream):
         self._world_size = lf.ddp_world_size() if lf.ddp_is_distributed() else 1
 
         import pyarrow.parquet as pq
-        pf = pq.ParquetFile(dataset)
-        if "messages" not in pf.schema_arrow.names:
-            raise ValueError(
-                f"{dataset}: expected a 'messages' column, got {pf.schema_arrow.names}")
-        self._has_tools = "tools" in pf.schema_arrow.names
-        total = int(pf.metadata.num_rows)
+        total = 0
+        self._has_tools = None
+        self._row_groups = []
+        cursor = 0
+        for path in files:
+            pf = pq.ParquetFile(path)
+            if "messages" not in pf.schema_arrow.names:
+                raise ValueError(
+                    f"{path}: expected a 'messages' column, got {pf.schema_arrow.names}")
+            has_tools = "tools" in pf.schema_arrow.names
+            if self._has_tools is None:
+                self._has_tools = has_tools
+            elif has_tools != self._has_tools:
+                raise ValueError(
+                    "all SFT Parquet shards must agree on whether the 'tools' "
+                    f"column exists; mismatch at {path}")
+            for rg in range(pf.num_row_groups):
+                count = int(pf.metadata.row_group(rg).num_rows)
+                begin, end = cursor, cursor + count
+                self._row_groups.append((path, rg, begin, end))
+                cursor = end
+            total += int(pf.metadata.num_rows)
+        self._has_tools = bool(self._has_tools)
         self._assigned_rows = (
             total + self._world_size - 1 - self._rank) // self._world_size
         if self._assigned_rows <= 0:
             raise ValueError(f"rank {self._rank} received no SFT rows")
-
-        self._row_groups = []
-        cursor = 0
-        for rg in range(pf.num_row_groups):
-            count = int(pf.metadata.row_group(rg).num_rows)
-            begin, end = cursor, cursor + count
-            self._row_groups.append((rg, begin, end))
-            cursor = end
-        del pf
 
         self._ram_queue: queue.Queue = queue.Queue(
             maxsize=max(1, int(cfg.prefetch_batches)))
@@ -727,7 +748,7 @@ class SFTOnTheFlyStream(SFTStream):
         lf.ddp_print(
             f"[sft-data] otf rank={self._rank} rows={self._assigned_rows:,} "
             f"partition=row%{self._world_size}=={self._rank} "
-            f"row_groups={len(self._row_groups)}")
+            f"files={len(self._files)} row_groups={len(self._row_groups)}")
 
     def fast_forward(self, n_batches: int) -> None:
         if self._producer is not None:
@@ -737,13 +758,18 @@ class SFTOnTheFlyStream(SFTStream):
     def _iter_epoch_examples(self, epoch: int):
         import pyarrow.parquet as pq
 
-        pf = pq.ParquetFile(self.dataset)
         columns = ["messages"] + (["tools"] if self._has_tools else [])
         rng = np.random.default_rng(
             int(self.cfg.seed) + 1_000_003 * int(epoch) + 97 * self._rank)
         groups = list(self._row_groups)
         rng.shuffle(groups)
-        for rg, group_begin, _group_end in groups:
+        active_path = None
+        pf = None
+        for path, rg, group_begin, _group_end in groups:
+            if path != active_path:
+                pf = pq.ParquetFile(path)
+                active_path = path
+            assert pf is not None
             batch_cursor = group_begin
             for batch in pf.iter_batches(
                 row_groups=[rg],
@@ -922,10 +948,6 @@ def train_sft(
     cfg.dataset_format = "sft"
     if val_path:
         cfg.val_dataset = val_path
-    elif float(getattr(cfg, "auto_val_split_pct", 0.0) or 0.0) > 0.0:
-        # Non-destructive example-level split over the shared tokenized cache.
-        cfg.val_dataset = f"{train_path}#val"
-        train_path = f"{train_path}#train"
     asyncio.run(lf.train_async(
         cfg, train_path, device, ckpt_out, ablation=False,
         resume=resume, resume_step=resume_step, init_weights=init_checkpoint,
@@ -1045,17 +1067,16 @@ def smoke_test() -> None:
 # ============================================================================
 
 def main() -> None:
-    """Thin front-end for `loomformer.py --sft-dataset ...`.
+    """Thin front-end for loomformer's shared training CLI.
 
-    Every flag is forwarded verbatim, so SFT runs go through the same CLI as
-    pretraining: same config loading, same multi-GPU self-launch, same
-    checkpoint/resume handling. `--smoke-test` is the only local action.
+    SFT may be selected either by ``--sft-dataset`` or entirely from a YAML
+    with ``dataset_format: sft``. Every flag is forwarded verbatim, so SFT
+    uses the same multi-GPU launch and checkpoint/resume handling as PT.
+    ``--smoke-test`` is the only local action.
     """
     if "--smoke-test" in sys.argv[1:]:
         smoke_test()
         return
-    if not any(a == "--sft-dataset" or a.startswith("--sft-dataset=") for a in sys.argv[1:]):
-        raise SystemExit("loomsft: --sft-dataset is required (see loomformer.py --help)")
     lf.main()
 
 

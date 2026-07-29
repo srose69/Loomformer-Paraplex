@@ -340,6 +340,10 @@ class Config:
     runpoints_path: Optional[str] = None  
     save_initial_checkpoint: bool = False
     save_final_checkpoint: bool = True
+    # Fresh weight initialization and final checkpoint target may live in YAML,
+    # so a complete train/SFT run needs only `--train --config ...`.
+    init_checkpoint: Optional[str] = None
+    checkpoint: Optional[str] = None
     tria_carry_enabled: bool = False
     # ===AUTO GENERATED=== bookkeeping written by loomcloner.py --scan/--clone.
     # cloned/cloned_from/cloned_mapping are informational only (which donor,
@@ -1747,25 +1751,64 @@ def _auto_split_arrow(files: List[str], val_path: str, pct: float) -> Dict[str, 
 
 
 def _auto_split_parquet(files: List[str], val_path: str, pct: float) -> Dict[str, int]:
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    val_tables = []
     train_rows = val_rows = 0
-    for path in files:
-        table = pq.read_table(path)
-        n = int(table.num_rows)
-        k = _split_count(n, pct)
-        if k <= 0:
-            train_rows += n
-            continue
-        train = table.slice(0, n - k)
-        val = table.slice(n - k, k)
-        tmp = path + ".tmp"
-        pq.write_table(train, tmp)
-        os.replace(tmp, path)
-        val_tables.append(val)
-        train_rows += int(train.num_rows)
-        val_rows += int(val.num_rows)
-    pq.write_table(_concat_arrow_tables(val_tables), val_path)
+    val_tmp = val_path + ".tmp"
+    train_tmps: List[Tuple[str, str]] = []
+    val_writer = None
+    val_schema = None
+    try:
+        for path in files:
+            pf = pq.ParquetFile(path)
+            schema = pf.schema_arrow
+            if val_schema is None:
+                val_schema = schema
+                val_writer = pq.ParquetWriter(val_tmp, schema, compression="zstd")
+            elif schema != val_schema:
+                raise ValueError(
+                    "auto_val_split_pct requires identical Parquet schemas; "
+                    f"{path!r} differs from the first shard")
+
+            n = int(pf.metadata.num_rows)
+            k = _split_count(n, pct)
+            cut = n - k
+            tmp = path + ".tmp"
+            train_tmps.append((tmp, path))
+            train_writer = pq.ParquetWriter(tmp, schema, compression="zstd")
+            cursor = 0
+            try:
+                for batch in pf.iter_batches(batch_size=8192):
+                    table = pa.Table.from_batches([batch])
+                    end = cursor + int(table.num_rows)
+                    train_count = max(0, min(end, cut) - cursor)
+                    if train_count:
+                        train_writer.write_table(table.slice(0, train_count))
+                        train_rows += train_count
+                    val_count = int(table.num_rows) - train_count
+                    if val_count:
+                        assert val_writer is not None
+                        val_writer.write_table(table.slice(train_count, val_count))
+                        val_rows += val_count
+                    cursor = end
+            finally:
+                train_writer.close()
+        if val_writer is None or val_rows <= 0:
+            raise ValueError("auto val split produced no validation rows")
+        val_writer.close()
+        val_writer = None
+        for tmp, path in train_tmps:
+            os.replace(tmp, path)
+        os.replace(val_tmp, val_path)
+    except BaseException:
+        if val_writer is not None:
+            val_writer.close()
+        for tmp, _path in train_tmps:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(val_tmp)
+        raise
     return {"train_rows": train_rows, "val_rows": val_rows}
 
 
@@ -1848,18 +1891,21 @@ def maybe_auto_val_split(cfg: Config, dataset: str) -> Optional[str]:
         return None
     if not (0.0 < pct < 100.0):
         raise ValueError(f"auto_val_split_pct must be in (0,100), got {pct}")
-    if is_sft_dataset(cfg):
-        # SFT splits examples inside the shared tokenized cache (loomsft.SFTStream,
-        # '#train'/'#val'); the dataset file itself is never rewritten.
-        return None
     if not os.path.isdir(dataset):
         raise ValueError("auto_val_split_pct only works when the training dataset is a directory of shards")
 
     fmt = str(getattr(cfg, "dataset_format", "auto") or "auto").lower()
-    files = RawCorpus._resolve_files(dataset, fmt)
+    if is_sft_dataset(cfg):
+        # SFT directories are Parquet-only even if the Hub snapshot also ships
+        # a JSONL export of the same examples. Never train on both duplicates.
+        files = sorted(glob.glob(os.path.join(dataset, "*.parquet")))
+        inferred = "parquet"
+    else:
+        files = RawCorpus._resolve_files(dataset, fmt)
+        inferred = fmt if fmt != "auto" else (
+            RawCorpus._infer_format(files[0]) if files else "")
     if not files:
         raise ValueError(f"auto_val_split_pct found no top-level corpus files in {dataset!r} (format={fmt!r})")
-    inferred = fmt if fmt != "auto" else RawCorpus._infer_format(files[0])
     for path in files:
         if RawCorpus._infer_format(path) != inferred:
             raise ValueError("auto_val_split_pct requires one dataset format per folder; found mixed extensions")
@@ -7682,25 +7728,30 @@ def main() -> None:
         train_dataset = args.sft_dataset or args.dataset or cfg.train_dataset
         assert train_dataset, "--train needs --dataset or train_dataset in config"
         resume_path = args.resume if args.resume is not None else cfg.resume
+        init_checkpoint = (
+            args.init_checkpoint
+            if args.init_checkpoint is not None
+            else cfg.init_checkpoint
+        )
         if args.sft_dataset:
             cfg.dataset_format = "sft"
-            assert args.init_checkpoint or resume_path, (
-                "--sft-dataset needs --init-checkpoint (the pretrained model to fine-tune) "
-                "or --resume (an interrupted SFT run to continue)"
-            )
-            if _auto_val_split_pct(cfg) > 0.0 and not cfg.val_dataset:
-                # Non-destructive example split inside the shared tokenized cache.
-                cfg.val_dataset = f"{train_dataset}#val"
-                train_dataset = f"{train_dataset}#train"
+        if is_sft_dataset(cfg):
+            assert init_checkpoint or resume_path, (
+                "SFT needs init_checkpoint in config/--init-checkpoint "
+                "(the pretrained model to fine-tune), or --resume")
         checkpoint_out = (
             args.checkpoint
             if args.checkpoint is not None
-            else ("loomformer.pt" if cfg.save_final_checkpoint else None)
+            else (
+                cfg.checkpoint
+                if cfg.checkpoint is not None
+                else ("loomformer.pt" if cfg.save_final_checkpoint else None)
+            )
         )
         asyncio.run(train_async(
             cfg, train_dataset, dev, checkpoint_out,
             args.ablation, resume_path, args.resume_step,
-            args.resume_dataset_steps, init_weights=args.init_checkpoint))
+            args.resume_dataset_steps, init_weights=init_checkpoint))
         return
     if args.export_aoti:
         assert args.checkpoint, "--export-aoti needs --checkpoint"

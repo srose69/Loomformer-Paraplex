@@ -11,8 +11,9 @@ import os
 import select
 import sys
 import threading
-from dataclasses import dataclass, fields
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass, fields, replace
+from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +79,7 @@ class Settings:
     window: int          # Tria temporal refeed window (model.cfg.tria_temporal_window)
     alpha: float          # Tria carrier write-strength (model.cfg.tria_carrier_alpha)
     beta: float           # PolARM correction strength (model.cfg.tria_polarm_beta)
+    kvstorage: str        # where prefix-KV snapshots live: same | cpu | cuda:N
 
     def torch_dtype(self) -> torch.dtype:
         return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
@@ -332,11 +334,185 @@ def _autocast(settings: Settings):
 
 
 # ============================================================================
+# prefix KV cache
+#
+# Every turn re-renders the whole conversation, so prefilling it from scratch
+# each time is O(turns^2) work over tokens whose KV was already computed one
+# turn ago -- the dominant cost of an agentic tool loop. A snapshot is keyed by
+# the exact token ids it consumed, so a turn only pays for its new suffix.
+#
+# Snapshots are trimmed to their used length (the model preallocates every KV
+# buffer at SEQ_LEN) and can be parked on another device via --kvstorage, which
+# keeps the compute GPU's VRAM free of conversation history it isn't reading.
+# ============================================================================
+
+@dataclass
+class _KVSnapshot:
+    ids: List[int]           # exact prefix this state consumed
+    states: Tuple            # (caches, tria_ca_cache, tria_temporal_state), trimmed
+    nbytes: int
+
+
+def resolve_kv_device(spec: Optional[str], compute: torch.device) -> torch.device:
+    """Resolve --kvstorage: 'same'/'auto' keeps snapshots on the compute device."""
+    s = str(spec or "same").strip().lower()
+    if s in ("", "same", "auto", "model"):
+        return compute
+    try:
+        dev = torch.device(s)
+    except RuntimeError as e:
+        # torch.device reports malformed strings as RuntimeError, while callers
+        # (notably the interactive /kvstorage command) use ValueError for
+        # user-facing validation failures.
+        raise ValueError(f"invalid kvstorage device {spec!r}: {e}") from e
+    if dev.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available, cannot store KV there")
+        idx = 0 if dev.index is None else int(dev.index)
+        if idx >= torch.cuda.device_count():
+            raise ValueError(f"cuda:{idx} does not exist ({torch.cuda.device_count()} visible)")
+        return torch.device(f"cuda:{idx}")
+    if dev.type != "cpu":
+        raise ValueError(f"kvstorage must be cpu, cuda[:N] or same, got {spec!r}")
+    return dev
+
+
+def _copy_to(t: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+    return None if t is None else t.to(device, copy=True)
+
+
+def _trim_to(t: Optional[torch.Tensor], used: int, device: torch.device) -> Optional[torch.Tensor]:
+    return None if t is None else t[:, :int(used)].to(device, copy=True)
+
+
+def _expand_to(t: Optional[torch.Tensor], seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
+    """Re-inflate a trimmed buffer: step() writes in place at index cache_len."""
+    if t is None:
+        return None
+    full = torch.zeros((t.shape[0], seq_len, *t.shape[2:]), dtype=t.dtype, device=device)
+    if t.shape[1]:
+        full[:, :t.shape[1]] = t.to(device)
+    return full
+
+
+def _state_nbytes(states: Tuple) -> int:
+    total = 0
+    for group in states:
+        for obj in (group if isinstance(group, list) else [group]):
+            if obj is None:
+                continue
+            for f in fields(obj):
+                t = getattr(obj, f.name)
+                if isinstance(t, torch.Tensor):
+                    total += t.numel() * t.element_size()
+    return total
+
+
+def snapshot_states(states: Tuple, device: torch.device) -> Tuple:
+    caches, ca_cache, temporal = states
+    snap_caches = [
+        lf.LayerCache(
+            k=_trim_to(c.k, c.cache_len, device),
+            v=_trim_to(c.v, c.cache_len, device),
+            phase_trace=_copy_to(c.phase_trace, device),
+            cache_len=int(c.cache_len),
+        )
+        for c in caches
+    ]
+    snap_ca = None if ca_cache is None else replace(
+        ca_cache,
+        k=_trim_to(ca_cache.k, ca_cache.cache_len, device),
+        v=_trim_to(ca_cache.v, ca_cache.cache_len, device),
+        carry_key_mask=_trim_to(ca_cache.carry_key_mask, ca_cache.cache_len, device),
+    )
+    snap_temporal = None if temporal is None else replace(
+        temporal,
+        carry=_copy_to(temporal.carry, device),
+        refeed_pending=_copy_to(temporal.refeed_pending, device),
+    )
+    return snap_caches, snap_ca, snap_temporal
+
+
+def restore_states(states: Tuple, device: torch.device, seq_len: int) -> Tuple:
+    caches, ca_cache, temporal = states
+    live_caches = [
+        lf.LayerCache(
+            k=_expand_to(c.k, seq_len, device),
+            v=_expand_to(c.v, seq_len, device),
+            phase_trace=_copy_to(c.phase_trace, device),
+            cache_len=int(c.cache_len),
+        )
+        for c in caches
+    ]
+    live_ca = None if ca_cache is None else replace(
+        ca_cache,
+        k=_expand_to(ca_cache.k, seq_len, device),
+        v=_expand_to(ca_cache.v, seq_len, device),
+        carry_key_mask=_expand_to(ca_cache.carry_key_mask, seq_len, device),
+    )
+    live_temporal = None if temporal is None else replace(
+        temporal,
+        carry=_copy_to(temporal.carry, device),
+        refeed_pending=_copy_to(temporal.refeed_pending, device),
+    )
+    return live_caches, live_ca, live_temporal
+
+
+class PrefixKVCache:
+    """Token-id-keyed prefix cache over Model.step states.
+
+    Two snapshots are kept per conversation: the one taken right after a turn's
+    prefill and the one after its generation. The second covers the common case
+    (the next turn strictly extends it); the first is the fallback for when the
+    assistant's own text does not re-tokenize identically once the template
+    folds it back into the history.
+    """
+
+    def __init__(self, storage: Optional[str], compute: torch.device, max_entries: int = 2) -> None:
+        self.compute = compute
+        self.device = resolve_kv_device(storage, compute)
+        self._snaps: Deque[_KVSnapshot] = deque(maxlen=max_entries)
+
+    def clear(self) -> None:
+        self._snaps.clear()
+
+    def retarget(self, storage: Optional[str], compute: torch.device) -> None:
+        """Point at a new storage/compute device. Cached states are dropped:
+        they were produced by the previous device/dtype/Tria settings."""
+        self.compute = compute
+        self.device = resolve_kv_device(storage, compute)
+        self.clear()
+
+    def nbytes(self) -> int:
+        return sum(s.nbytes for s in self._snaps)
+
+    def reuse(self, ids: List[int]) -> Tuple[Optional[Tuple], int]:
+        """Longest cached prefix of ``ids``, restored onto the compute device.
+
+        A snapshot covering all of ``ids`` is rejected: at least one token must
+        be fed for the caller to get logits, and states cannot be rewound.
+        """
+        best: Optional[_KVSnapshot] = None
+        for snap in self._snaps:
+            n = len(snap.ids)
+            if 0 < n < len(ids) and snap.ids == ids[:n] and (best is None or n > len(best.ids)):
+                best = snap
+        if best is None:
+            return None, 0
+        return restore_states(best.states, self.compute, lf.SEQ_LEN), len(best.ids)
+
+    def store(self, ids: List[int], states: Tuple) -> None:
+        snap = snapshot_states(states, self.device)
+        self._snaps.append(_KVSnapshot(ids=list(ids), states=snap, nbytes=_state_nbytes(snap)))
+
+
+# ============================================================================
 # generation
 # ============================================================================
 
 def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
-                   settings: Settings, esc: Optional[EscWatcher] = None) -> Tuple[Dict, bool]:
+                   settings: Settings, esc: Optional[EscWatcher] = None,
+                   kv: Optional[PrefixKVCache] = None) -> Tuple[Dict, bool]:
     """Stream one assistant turn and return its message and interruption status."""
     device = torch.device(settings.device)
     ids = chat.render_prompt_ids(messages)
@@ -347,12 +523,16 @@ def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
             f"(seq_len={lf.SEQ_LEN}); the incremental cache has no wraparound. /reset."
         )
     max_new = min(settings.max_new, room)
-    states = None
+    states, start = kv.reuse(ids) if kv is not None else (None, 0)
+    if start:
+        print(COLOR.gray(f"[kv {start}/{len(ids)} reused from {kv.device}] "), end="", flush=True)
     logits = None
     with torch.inference_mode(), _autocast(settings):
-        for pos, tid in enumerate(ids):
-            x = torch.tensor([int(tid)], device=device, dtype=torch.long)
+        for pos in range(start, len(ids)):
+            x = torch.tensor([int(ids[pos])], device=device, dtype=torch.long)
             logits, states = model.step(x, pos, states)
+        if kv is not None:
+            kv.store(ids, states)
 
         renderer = StreamRenderer()
         gen_ids: List[int] = []
@@ -368,6 +548,8 @@ def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
             renderer.feed(tok.decode(gen_ids, skip_special_tokens=False))
             x = torch.tensor([nxt], device=device, dtype=torch.long)
             logits, states = model.step(x, len(ids) + i, states)
+        if kv is not None and gen_ids:
+            kv.store(ids + gen_ids, states)
     print()
     if interrupted:
         print(COLOR.gray("  (interrupted -- Esc)"))
@@ -390,6 +572,7 @@ def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dic
     print(COLOR.dim(f"  archive: {aio_path}  ({n_params:,} params, packed={quant})"))
     print(COLOR.dim(f"  device={settings.device}  dtype={settings.dtype}  "
                      f"window={settings.window}  alpha={settings.alpha:g}  beta={settings.beta:g}"))
+    print(COLOR.dim(f"  kvstorage={settings.kvstorage}  (prefix-KV reuse across turns)"))
     print(COLOR.dim("  /help for commands · type / to browse them · Esc interrupts a reply\n"))
 
 
@@ -405,6 +588,7 @@ COMMANDS = {
     "/top-k":     "/top-k <int>  (0 = disabled)",
     "/top-p":     "/top-p <float 0..1>",
     "/max-new":   "/max-new <int> -- cap on tokens generated per turn",
+    "/kvstorage": "/kvstorage <same|cpu|cuda:N> -- where prefix-KV snapshots are parked",
     "/system":    "/system <text> -- set/replace the system prompt",
     "/reset":     "clear conversation history (keeps the system prompt)",
     "/reload":    "/reload <model.aio> -- swap archives without restarting",
@@ -435,7 +619,13 @@ def print_settings(settings: Settings) -> None:
 # command dispatch
 # ============================================================================
 
-def apply_setting(name: str, value: str, settings: Settings, model) -> Optional[str]:
+# Settings whose change makes every cached state stale: the states were
+# produced on a specific device/dtype and under specific Tria parameters.
+_KV_INVALIDATING = frozenset({"device", "dtype", "window", "alpha", "beta", "kvstorage"})
+
+
+def apply_setting(name: str, value: str, settings: Settings, model,
+                   kv: Optional[PrefixKVCache] = None) -> Optional[str]:
     """Apply a runtime setting and return a validation error or ``None``."""
     try:
         if name == "device":
@@ -444,6 +634,9 @@ def apply_setting(name: str, value: str, settings: Settings, model) -> Optional[
                 return "CUDA is not available in this environment"
             move_model(model, new_device)
             settings.device = value
+        elif name == "kvstorage":
+            resolve_kv_device(value, torch.device(settings.device))  # validate before committing
+            settings.kvstorage = value
         elif name == "dtype":
             if value not in ("bf16", "fp16", "fp32"):
                 return "dtype must be one of: bf16, fp16, fp32"
@@ -478,8 +671,10 @@ def apply_setting(name: str, value: str, settings: Settings, model) -> Optional[
             settings.max_new = int(value)
         else:
             return f"unknown setting: {name}"
-    except ValueError:
-        return f"couldn't parse {value!r} for {name}"
+    except ValueError as e:
+        return str(e) if name == "kvstorage" else f"couldn't parse {value!r} for {name}"
+    if kv is not None and name in _KV_INVALIDATING:
+        kv.retarget(settings.kvstorage, torch.device(settings.device))
     return None
 
 
@@ -505,6 +700,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
 
     print_banner(aio_path, lf.count_params(model), settings, manifest)
 
+    kv = PrefixKVCache(settings.kvstorage, device)
     messages: List[Dict] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -540,6 +736,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
             continue
         if user_text == "/reset":
             messages = [messages[0]] if messages and messages[0]["role"] == "system" else []
+            kv.clear()
             print(COLOR.dim("(history cleared)"))
             continue
         if user_text.startswith("/system "):
@@ -548,6 +745,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
                 messages[0] = {"role": "system", "content": new_sys}
             else:
                 messages.insert(0, {"role": "system", "content": new_sys})
+            kv.clear()  # the system prompt is the very head of every prefix
             print(COLOR.dim("(system prompt set)"))
             continue
         if user_text.startswith("/reload "):
@@ -563,6 +761,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
                 settings.window = int(cfg.tria_temporal_window)
                 settings.alpha = float(getattr(cfg, "tria_carrier_alpha", settings.alpha))
                 settings.beta = float(getattr(cfg, "tria_polarm_beta", settings.beta))
+                kv.retarget(settings.kvstorage, torch.device(settings.device))
                 aio_path = new_aio
                 print(COLOR.dim(f"(reloaded {new_aio})"))
             except Exception as e:
@@ -572,9 +771,10 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
         handled_setting = False
         for key, attr in (("/device", "device"), ("/dtype", "dtype"), ("/window", "window"),
                           ("/alpha", "alpha"), ("/beta", "beta"), ("/temperature", "temperature"),
-                          ("/top-k", "top_k"), ("/top-p", "top_p"), ("/max-new", "max_new")):
+                          ("/top-k", "top_k"), ("/top-p", "top_p"), ("/max-new", "max_new"),
+                          ("/kvstorage", "kvstorage")):
             if user_text.startswith(key + " "):
-                err = apply_setting(attr, user_text[len(key) + 1:].strip(), settings, model)
+                err = apply_setting(attr, user_text[len(key) + 1:].strip(), settings, model, kv)
                 if not err and attr == "dtype":
                     dtype_forced = True
                 print(COLOR.red(f"  ! {err}") if err else COLOR.dim(f"({attr}={getattr(settings, attr)})"))
@@ -591,7 +791,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
         print(COLOR.bold(COLOR.magenta("loom> ")), end="", flush=True)
         try:
             with EscWatcher() as esc:
-                reply, _ = generate_turn(model, tok, chat, messages, settings, esc)
+                reply, _ = generate_turn(model, tok, chat, messages, settings, esc, kv)
         except RuntimeError as e:
             print(COLOR.red(f"\n  ! {e}"))
             messages.pop()
@@ -617,9 +817,14 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=0, help="0 -> use the archive's Tria window")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--beta", type=float, default=0.1)
+    ap.add_argument("--kvstorage", type=str, default="same", metavar="TARGET",
+                    help="where prefix-KV snapshots are parked between turns: "
+                         "same (compute device) | cpu | cuda:N -- offloading keeps "
+                         "conversation history out of the compute GPU's VRAM")
     args = ap.parse_args()
 
     dev = lf.device_auto(args.device)
+    resolve_kv_device(args.kvstorage, dev)  # fail at startup, not mid-conversation
     settings = Settings(
         device=str(dev),
         dtype=args.dtype or "fp32",
@@ -630,6 +835,7 @@ def main() -> None:
         window=args.window,
         alpha=args.alpha,
         beta=args.beta,
+        kvstorage=args.kvstorage,
     )
     run_chat(args.archive, settings, args.system, args.dtype)
 

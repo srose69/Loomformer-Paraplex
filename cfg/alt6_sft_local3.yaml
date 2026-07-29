@@ -1,0 +1,107 @@
+# Local three-GPU SFT validation for alt6/alt6.pt.
+#
+# Same model, optimizer, BF16 mode, activation checkpointing, Tria temporal
+# refeed, and CUDA fast paths as alt6_sft.yaml.  The run size is reduced and
+# ATOM state is ZeRO-sharded to fit the Pascal development GPUs. Graph/compile
+# stay disabled because this machine is the compatibility floor rather than
+# the L40S/H100 target.
+#
+# Run:
+#   python3 loomsft.py --config cfg/alt6_sft_local3.yaml \
+#       --sft-dataset ./sft/FSSFT1/FSSFT1.parquet \
+#       --init-checkpoint alt6/alt6.pt
+
+optimizer: atom
+steps: 2
+lr: 5e-5
+weight_decay: 0.01
+grad_clip: 1.0
+warmup_steps: 150
+min_lr_frac: 0.1
+seed: 1
+log_every: 1
+eval_every: 999
+eval_batches: 1
+device: cuda:0, cuda:1, cuda:2
+grad_accum_steps: 1
+grad_checkpointing: true
+fsdp_full_shard: false
+optimizer_zero_shard: true
+fused_linear_ce: true
+amp_dtype: bf16
+save_every: 0
+save_initial_checkpoint: false
+save_final_checkpoint: false
+runpoints_path: null
+resume: null
+resume_data_stream: restart
+compile: false
+graph: false
+save_graph: false
+
+# One sequence per GPU and two temporal chunks. GPU0 shares its 8 GiB with
+# the desktop compositor, so this is intentionally the tightest local rank.
+seq_len: 128
+batch_size: 3
+
+dataset_format: sft
+train_dataset: ./sft/FSSFT1/FSSFT1.parquet
+val_dataset: null
+auto_val_split_pct: 0.0
+dataset_cache: otf
+prefetch_batches: 4
+gpu_prefetch_batches: 1
+
+# Positional encoding -- identical to the pretrained checkpoint.
+rope_theta: 10000.0
+rope_original_seq_len: 2048
+rope_factor: 4.0
+rope_beta_fast: 32.0
+rope_beta_slow: 1.0
+rope_attention_factor: null
+
+# Tria parameters match alt6_sft.yaml except the reduced local window.
+tria_carry_enabled: true
+use_cuda_tria: true
+tria_gamma_max: 0.80
+tria_raw_gamma_init: 0.01
+tria_temporal_enabled: true
+tria_temporal_auto: false
+tria_temporal_window: 64
+tria_temporal_window_min: 32
+tria_target_refeeds_per_sequence: 15
+tria_carrier_alpha: 0.1
+tria_polarm_beta: 0.5
+
+# Tokenizer and model geometry -- must match alt6/alt6.pt exactly.
+tokenizer: ./tokenizers/tokenizer32768.json
+vocab: 32768
+tied_embeddings: true
+
+model_dim: 576
+n_q_heads: 24
+head_dim: 24
+n_kv_heads: 6
+gqa_group_size: 4
+
+hidden: null
+hidden_mult: 6
+layers: 20
+final_norm: true
+paraplex_gate_proj: true
+
+phase_sectors: open
+residual_init: beta
+depth_attn_readout: shared
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0
+activation: pvpowlu
+powlu_m: 3.0
+phase_grad_floor: 0.05
+phase_grad_mode: secant
+attn_impl: auto
+
+use_cuda_beta_space: true
+use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true

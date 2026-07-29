@@ -21,13 +21,18 @@ Coverage:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
-import json
 import os
 from pathlib import Path
+import queue
+import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Dict, Iterable, Optional
 
@@ -44,11 +49,109 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 PT_TEMPLATE = TESTS / "test_pt.yaml"
 SFT_TEMPLATE = TESTS / "test_sft.yaml"
+_RUN_LOG_DIR: Optional[Path] = None
+_RUN_INDEX = 0
+_LIVE_ACTIVE = False
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+_COLORS = {
+    "RUN": "\033[1;36m",
+    "PASS": "\033[1;32m",
+    "SKIP": "\033[1;33m",
+    "WARN": "\033[1;33m",
+    "FAIL": "\033[1;31m",
+    "INFO": "\033[0;36m",
+}
+_RESET = "\033[0m"
+
+
+class MatrixFailure(RuntimeError):
+    pass
+
+
+def _paint(text: str, color: str) -> str:
+    return f"{color}{text}{_RESET}" if _COLOR else text
+
+
+def _clear_live() -> None:
+    global _LIVE_ACTIVE
+    if _LIVE_ACTIVE and sys.stdout.isatty():
+        print("\r\033[2K", end="", flush=True)
+    _LIVE_ACTIVE = False
+
+
+def _status(kind: str, message: str) -> None:
+    _clear_live()
+    marker = _paint(f"[{kind}]", _COLORS[kind])
+    print(f"{marker} {message}", flush=True)
+
+
+def _live(message: str) -> None:
+    global _LIVE_ACTIVE
+    if sys.stdout.isatty():
+        print(f"\r\033[2K{_paint('[....]', _COLORS['INFO'])} {message}",
+              end="", flush=True)
+        _LIVE_ACTIVE = True
+    else:
+        print(f"[....] {message}", flush=True)
 
 
 def _banner(label: str) -> None:
-    bar = "=" * 78
-    print(f"\n{bar}\n[matrix] {label}\n{bar}", flush=True)
+    _clear_live()
+    rule = "━" * max(8, 72 - len(label))
+    print(f"\n{_paint(f'━━━ {label} {rule}', _COLORS['INFO'])}", flush=True)
+
+
+def _clean_line(line: str) -> str:
+    return _ANSI_RE.sub("", line).strip()
+
+
+def _emit_child_progress(label: str, line: str) -> None:
+    clean = _clean_line(line)
+    if not clean:
+        return
+    if clean.startswith("[kernels]") and (
+        " compiling " in clean or " compiled " in clean
+    ):
+        _live(clean)
+    elif clean.startswith("[compile]"):
+        _live(clean)
+    elif clean.startswith("[LF]") or clean.startswith("[EVAL]"):
+        _live(f"{label}: {clean}")
+    elif (
+        "worth investigating" in clean
+        or (
+            clean.startswith("[loomformer] CUDA")
+            and (" failed " in clean or " unavailable " in clean)
+        )
+    ):
+        _status("WARN", clean)
+
+
+def _failure_summary(lines: Iterable[str]) -> list[str]:
+    markers = (
+        "AssertionError:",
+        "ChildFailedError:",
+        "CUDA error:",
+        "Error:",
+        "Exception:",
+        "InductorError:",
+        "OSError:",
+        "RuntimeError:",
+        "TypeError:",
+        "ValueError:",
+        "FAILED (",
+    )
+    selected: list[str] = []
+    for raw in lines:
+        line = _clean_line(raw)
+        if line and any(marker in line for marker in markers):
+            if line not in selected:
+                selected.append(line)
+    if selected:
+        return selected[-8:]
+    fallback = [_clean_line(line) for line in lines if _clean_line(line)]
+    return fallback[-5:]
 
 
 def _run(
@@ -58,9 +161,9 @@ def _run(
     timeout: int = 1800,
     extra_env: Optional[Dict[str, str]] = None,
 ) -> None:
+    global _RUN_INDEX
     command = [str(item) for item in argv]
-    _banner(label)
-    print("[matrix] $ " + " ".join(command), flush=True)
+    _status("RUN", label)
     started = time.monotonic()
     env = os.environ.copy()
     # setup.sh invokes the venv interpreter by absolute path without
@@ -72,19 +175,97 @@ def _run(
     env.setdefault("NO_COLOR", "1")
     if extra_env:
         env.update(extra_env)
-    result = subprocess.run(
+
+    _RUN_INDEX += 1
+    log_dir = _RUN_LOG_DIR or Path(tempfile.gettempdir())
+    log_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "case"
+    log_path = log_dir / f"{_RUN_INDEX:02d}-{slug}.log"
+    process = subprocess.Popen(
         command,
         cwd=ROOT,
         env=env,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        start_new_session=True,
     )
+    assert process.stdout is not None
+    output: queue.Queue[Optional[str]] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for child_line in process.stdout:
+                output.put(child_line)
+        finally:
+            output.put(None)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    tail: deque[str] = deque(maxlen=400)
+    reader_done = False
+    timed_out = False
+
+    def _signal_group(sig: signal.Signals) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            while not reader_done or process.poll() is None:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0 and process.poll() is None:
+                    timed_out = True
+                    _signal_group(signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        _signal_group(signal.SIGKILL)
+                    continue
+                try:
+                    item = output.get(
+                        timeout=max(0.05, min(0.25, remaining))
+                    )
+                except queue.Empty:
+                    continue
+                if item is None:
+                    reader_done = True
+                    continue
+                log.write(item)
+                log.flush()
+                for part in re.split(r"[\r\n]+", item):
+                    if not part:
+                        continue
+                    tail.append(part)
+                    _emit_child_progress(label, part)
+    except BaseException:
+        _signal_group(signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _signal_group(signal.SIGKILL)
+        raise
+    reader.join(timeout=1)
+    returncode = process.wait()
     elapsed = time.monotonic() - started
-    if result.returncode:
-        raise RuntimeError(
-            f"{label} failed with exit code {result.returncode} after {elapsed:.1f}s"
+    if timed_out or returncode:
+        reason = f"timeout after {elapsed:.1f}s" if timed_out else (
+            f"exit {returncode} after {elapsed:.1f}s"
         )
-    print(f"[matrix] PASS {label} ({elapsed:.1f}s)", flush=True)
+        _status("FAIL", f"{label} ({reason})")
+        for line in _failure_summary(tail):
+            print(f"       {_paint(line, _COLORS['FAIL'])}", flush=True)
+        print(f"       log: {log_path}", flush=True)
+        raise MatrixFailure(f"{label} failed")
+    log_path.unlink(missing_ok=True)
+    _status("PASS", f"{label} ({elapsed:.1f}s)")
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -110,10 +291,7 @@ def _write_config(
 def _make_tokenizer(work: Path) -> tuple[Path, int]:
     tokenizer = work / "tokenizer.json"
     vocab = build_synthetic_bpe(tokenizer, vocab_size=256)
-    print(
-        f"[matrix] synthetic BPE: vocab={vocab} -> {tokenizer}",
-        flush=True,
-    )
+    _status("PASS", f"synthetic BPE tokenizer ({vocab} tokens)")
     return tokenizer, vocab
 
 
@@ -259,7 +437,7 @@ def _run_gpu_parity(profile: Dict[str, Any]) -> None:
 
 def _probe_cuda_extensions(config_path: Path, modern: bool) -> None:
     if not torch.cuda.is_available():
-        print("[matrix] CUDA unavailable: fused-extension probe skipped", flush=True)
+        _status("SKIP", "CUDA extension probe (CUDA unavailable)")
         return
 
     # Keep this probe in its own interpreter: apply_config mutates module-level
@@ -333,23 +511,35 @@ def _assert_split(directory: Path, original_rows: int) -> None:
 
 
 def run_matrix(args: argparse.Namespace) -> None:
+    global _RUN_LOG_DIR, _RUN_INDEX
     profile = _device_profile(args.device)
-    _banner("host profile")
-    print(json.dumps(profile, indent=2), flush=True)
+    _banner("LoomFormer installation matrix")
+    devices = profile["devices"]
+    if devices:
+        summary = ", ".join(
+            f"cuda:{item['index']} {item['name']} "
+            f"SM{item['capability'][0]}.{item['capability'][1]}"
+            for item in devices
+        )
+        _status(
+            "INFO",
+            f"{summary} · amp={profile['amp_dtype']} · "
+            f"compile={profile['compile']}",
+        )
+    else:
+        _status("WARN", "CUDA unavailable; CPU-only validation profile")
     if args.setup and profile["device"] == "cpu":
-        raise RuntimeError(
+        _status("FAIL", "setup validation requires a visible CUDA GPU")
+        raise MatrixFailure(
             "setup validation requires at least one visible CUDA GPU; refusing "
             "to report a successful installation without exercising GPU "
             "forward/backward, fused kernels and optimizer steps")
 
-    if args.keep_temp:
-        work = Path(tempfile.mkdtemp(prefix="loomformer-matrix."))
-        cleanup = False
-    else:
-        context = tempfile.TemporaryDirectory(prefix="loomformer-matrix.")
-        work = Path(context.name)
-        cleanup = True
-    print(f"[matrix] workspace: {work}", flush=True)
+    work = Path(tempfile.mkdtemp(prefix="loomformer-matrix."))
+    cleanup = not args.keep_temp
+    completed = False
+    _RUN_INDEX = 0
+    _RUN_LOG_DIR = work / "logs"
 
     try:
         tokenizer, vocab = _make_tokenizer(work)
@@ -401,12 +591,12 @@ def run_matrix(args: argparse.Namespace) -> None:
         _run_gpu_parity(profile)
 
         if profile["device"] == "cpu":
-            _banner("CPU-ONLY CHECKS PASSED")
-            print(
-                "[matrix] CUDA was not selected; optimizer-step integration, "
-                "backend parity and DDP were intentionally skipped.",
-                flush=True,
+            _status(
+                "SKIP",
+                "CUDA optimizer steps, backend parity and DDP "
+                "(CPU-only profile)",
             )
+            completed = True
             return
 
         _run(
@@ -614,18 +804,21 @@ def run_matrix(args: argparse.Namespace) -> None:
             )
             _check_checkpoint(ddp_sft_checkpoint, step=1, optimizer="atom")
         else:
-            print("[matrix] DDP cases skipped (fewer than two GPUs or --no-ddp)", flush=True)
+            _status("SKIP", "DDP cases (fewer than two GPUs or --no-ddp)")
 
-        _banner("ALL MATRIX CASES PASSED")
-        print(f"[matrix] synthetic workspace: {work}", flush=True)
+        completed = True
+        _banner("Validation complete")
+        _status("PASS", "all installation matrix cases")
     except BaseException:
-        print(f"[matrix] FAILED; synthetic workspace was {work}", file=sys.stderr, flush=True)
+        cleanup = False
+        _status("FAIL", f"matrix artifacts retained at {work}")
         raise
     finally:
-        if cleanup:
-            context.cleanup()
-        else:
-            print(f"[matrix] retained workspace: {work}", flush=True)
+        _RUN_LOG_DIR = None
+        if cleanup and completed:
+            shutil.rmtree(work)
+        elif completed:
+            _status("INFO", f"matrix artifacts retained at {work}")
 
 
 def main() -> None:
@@ -650,7 +843,16 @@ def main() -> None:
         action="store_true",
         help="setup.sh mode: require CUDA and run the complete matrix",
     )
-    run_matrix(parser.parse_args())
+    try:
+        run_matrix(parser.parse_args())
+    except MatrixFailure:
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        _status("FAIL", "matrix interrupted")
+        raise SystemExit(130) from None
+    except BaseException as exc:
+        _status("FAIL", f"{type(exc).__name__}: {exc}")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

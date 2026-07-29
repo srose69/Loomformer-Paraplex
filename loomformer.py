@@ -7259,7 +7259,18 @@ async def train_one_async(
     seconds = time.time() - t0
     _save_checkpoint()
     if val_dataset:
-        full = eval_full_model(model, cfg, val_dataset, device)
+        # Training compiles the label/loss forward. Full evaluation calls the
+        # logits-only forward with different shapes (including a short tail).
+        # Reusing the compiled wrapper here forces a second, unrelated
+        # Inductor trace and has triggered upstream post-grad matcher failures
+        # on otherwise valid models. The eager module owns the same updated
+        # parameters; retain the FSDP wrapper only when parameters are sharded.
+        full_eval_model = (
+            model
+            if bool(getattr(cfg, "fsdp_full_shard", False))
+            else model_base
+        )
+        full = eval_full_model(full_eval_model, cfg, val_dataset, device)
         full_eval_loss = ddp_mean_float(float(full["loss_nats"]), device)
         full_eval_bpb = ddp_mean_float(float(full["bpb"]), device)
         ddp_print(

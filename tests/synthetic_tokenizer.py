@@ -50,6 +50,7 @@ def build_synthetic_bpe(output: Path, vocab_size: int = 256) -> int:
         trainer=trainers.BpeTrainer(
             vocab_size=vocab_size,
             special_tokens=SPECIAL_TOKENS,
+            show_progress=False,
         ),
         length=len(corpus),
     )

@@ -71,7 +71,7 @@ activation: pvpowlu                 # gelu | powlu | pvpowlu
 powlu_m: 3.0
 phase_grad_floor: 0.05
 phase_grad_mode: secant             # floor | secant
-attn_impl: sdpa                     # sdpa | manual
+attn_impl: auto                     # auto | flash | sdpa | manual
 
 use_cuda_beta_space: true
 use_cuda_phase_sin: true

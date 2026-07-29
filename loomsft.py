@@ -16,9 +16,10 @@ loop, reached through lf.train_async(). Nothing is reimplemented here.
 
 Packing uses <eos> as the per-example separator, which makes loomformer's
 existing build_doc_reset_state() produce exactly the per-example position reset
-and block-diagonal attention SFT needs (the chat template itself never emits
-<eos>, only <|im_start|>/<|im_end|>), so no attention/position code is
-duplicated either. The only SFT-specific tensor is the per-token loss mask.
+and compact varlen document layout SFT needs (the chat template itself never
+emits <eos>, only <|im_start|>/<|im_end|>). Attention consumes cu_seqlens on
+optimized GPUs and never materializes a block-diagonal T² mask. The only
+SFT-specific training tensor is the per-token loss mask.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -332,8 +334,9 @@ def cached_token_count(path: str, cfg: "lf.Config") -> int:
 class SFTStream:
     """Packed SFT batches behind loomformer's stream interface.
 
-    Yields ``(ids, loss_mask)`` pairs of shape ``[B, seq_len+1]``; everything
-    else (positions, block-diagonal attention, LR, DDP, compile, graph, eval,
+    Yields ``(ids, loss_mask, packed_layout)`` where tensors have shape
+    ``[B, seq_len+1]`` and varlen/chunk metadata is prepared by the background
+    CPU packer; everything else (attention, LR, DDP, compile, graph, eval,
     checkpoints) is loomformer's training loop, unchanged. Examples are joined
     by a single <eos>, which is exactly the boundary token
     ``build_doc_reset_state`` splits on, so packed examples cannot attend across
@@ -361,6 +364,7 @@ class SFTStream:
                 "special_tokens=loomformer.DEFAULT_SPECIAL_TOKENS)."
             )
         self._pad_id = _need_pad_id(self.tok)
+        self._carry_id = lf._tok_special_id(self.tok, "<CARRY>")
         self.cache = SFTCache.build_or_load(base, cfg, self.tok, device)
         self._lengths = self.cache.lengths
         self.T1 = int(cfg.seq_len) + 1
@@ -393,6 +397,7 @@ class SFTStream:
         self._producer_error: Optional[BaseException] = None
         self._gpu_ids = None
         self._gpu_mask = None
+        self._gpu_layouts = None
         self._gpu_pos = 0
         self._rank = rank
         # The producer starts on first use, not here: resume fast-forward and the
@@ -466,7 +471,7 @@ class SFTStream:
 
     # -- batch materialization (vectorized) --------------------------------
 
-    def _pack_batch_np(self, rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _pack_batch_np(self, rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
         B = len(rows)
         ids = np.full((B, self.T1), self._pad_id, dtype=np.int64)
         mask = np.zeros((B, self.T1), dtype=np.int8)
@@ -488,17 +493,65 @@ class SFTStream:
 
         ids[row_of_ex, col0 + ex_len] = self._eos_id  # separator: never a target
         mask[row_of_ex, col0] = 0  # never predict an example's first token from the previous <eos>
-        return ids, mask
+        # Exact max document length for x=ids[:,:-1].  Computing this beside
+        # the CPU packing plan avoids the GPU max().item() synchronization that
+        # FlashAttention/Transformer Engine would otherwise need every step.
+        x = ids[:, :-1]
+        boundary = x == self._eos_id
+        seg = np.cumsum(boundary, axis=1, dtype=np.int64) - boundary
+        max_seqlen = 0
+        for row_seg in seg:
+            changes = np.flatnonzero(row_seg[1:] != row_seg[:-1]) + 1
+            edges = np.concatenate(([0], changes, [row_seg.size]))
+            max_seqlen = max(max_seqlen, int(np.diff(edges).max()))
+        return ids, mask, max_seqlen
 
     # -- loomformer stream interface ---------------------------------------
 
-    def _sample_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        ids, mask = self._pack_batch_np(self._take_rows(int(self.cfg.batch_size)))
+    def _sample_batch(self) -> Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"]:
+        ids, mask, max_seqlen = self._pack_batch_np(
+            self._take_rows(int(self.cfg.batch_size)))
         t_ids = torch.from_numpy(ids)
         t_mask = torch.from_numpy(mask)
+        x = t_ids[:, :-1]
+        _position_ids, layout = lf.build_doc_reset_state(
+            x, self._eos_id, max_seqlen=max_seqlen)
         if self.device.type == "cuda":
             t_ids, t_mask = t_ids.pin_memory(), t_mask.pin_memory()
-        return t_ids, t_mask
+            layout = layout.pin_memory()
+        return t_ids, t_mask, layout
+
+    def _attach_chunk_plans(
+        self,
+        ids: torch.Tensor,
+        layout: "lf.PackedAttentionLayout",
+    ) -> "lf.PackedAttentionLayout":
+        if not (
+            bool(getattr(self.cfg, "tria_carry_enabled", False))
+            and bool(getattr(self.cfg, "tria_temporal_enabled", True))
+        ):
+            return layout
+        x = ids[:, :-1]
+        window = int(self.cfg.tria_temporal_window)
+        stops = lf.temporal_chunk_stops(
+            x, window, True, self._carry_id,
+            compiling=bool(getattr(self.cfg, "compile", False)))
+        ranges = []
+        plans = []
+        start = 0
+        for stop in stops:
+            end = min(int(stop) + 1, x.shape[1])
+            if end <= start:
+                continue
+            ranges.append((start, end))
+            plans.append(lf.build_packed_chunk_layout(
+                layout, start, end, tuple(ranges)))
+            start = end
+        if start != x.shape[1]:
+            raise RuntimeError(
+                f"CPU SFT chunk plan stopped at {start}, expected {x.shape[1]}")
+        enriched = replace(layout, chunk_plans=tuple(plans))
+        return enriched.pin_memory() if self.device.type == "cuda" else enriched
 
     def _produce_cpu_batches(self) -> None:
         try:
@@ -517,29 +570,57 @@ class SFTStream:
                                               name=f"sft-data-rank-{self._rank}")
             self._producer.start()
 
-    def _get_cpu_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_raw_cpu_batch(self) -> Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"]:
         self._ensure_producer()
         batch = self._ram_queue.get()
         if batch is None:
             raise RuntimeError("SFT data producer failed") from self._producer_error
         return batch
 
-    def sample_device_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        ids, mask = self._get_cpu_batch()
-        return (ids.to(self.device, non_blocking=True), mask.to(self.device, non_blocking=True))
+    def _attach_cpu_batch(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"],
+    ) -> Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"]:
+        ids, mask, layout = batch
+        return ids, mask, self._attach_chunk_plans(ids, layout)
+
+    def _get_cpu_batch(self) -> Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"]:
+        return self._attach_cpu_batch(self._get_raw_cpu_batch())
+
+    def sample_device_batch(self) -> Tuple[torch.Tensor, torch.Tensor, "lf.PackedAttentionLayout"]:
+        ids, mask, layout = self._get_cpu_batch()
+        return (
+            ids.to(self.device, non_blocking=True),
+            mask.to(self.device, non_blocking=True),
+            layout.to(self.device, non_blocking=True),
+        )
 
     def _gpu_chunk_size(self) -> int:
         return max(1, min(int(self.cfg.gpu_prefetch_batches), int(self.cfg.prefetch_batches)))
 
     async def _load_gpu_chunk(self, count: int) -> None:
         loop = asyncio.get_running_loop()
-        ids_l, mask_l = [], []
+        # Dequeue serially to preserve the deterministic packing order, then
+        # build independent integer gather plans in parallel.
+        raw_batches = []
         for _ in range(count):
-            ids, mask = await loop.run_in_executor(None, self._get_cpu_batch)
+            raw_batches.append(
+                await loop.run_in_executor(None, self._get_raw_cpu_batch))
+        batches = await asyncio.gather(*[
+            loop.run_in_executor(None, self._attach_cpu_batch, batch)
+            for batch in raw_batches
+        ])
+        ids_l, mask_l, layouts = [], [], []
+        for ids, mask, layout in batches:
             ids_l.append(ids)
             mask_l.append(mask)
+            layouts.append(layout)
         self._gpu_ids = torch.stack(ids_l).to(self.device, non_blocking=True)
         self._gpu_mask = torch.stack(mask_l).to(self.device, non_blocking=True)
+        # Keep future plans in pinned RAM. Moving every prefetched batch's
+        # gather indices to VRAM would multiply metadata by gpu_prefetch_batches
+        # for no compute benefit; transfer only the batch being yielded.
+        self._gpu_layouts = layouts
         self._gpu_pos = 0
 
     async def prime(self) -> None:
@@ -556,7 +637,12 @@ class SFTStream:
             if self._gpu_ids is None or self._gpu_pos >= self._gpu_ids.shape[0]:
                 await self._load_gpu_chunk(min(chunk, n - yielded))
             while self._gpu_pos < self._gpu_ids.shape[0] and yielded < n:
-                out = (self._gpu_ids[self._gpu_pos], self._gpu_mask[self._gpu_pos])
+                out = (
+                    self._gpu_ids[self._gpu_pos],
+                    self._gpu_mask[self._gpu_pos],
+                    self._gpu_layouts[self._gpu_pos].to(
+                        self.device, non_blocking=True),
+                )
                 self._gpu_pos += 1
                 yielded += 1
                 yield out
@@ -650,20 +736,25 @@ def smoke_test() -> None:
     print(f"[smoke] SFTCache OK: {stream.cache.n_examples} examples, "
           f"{int(stream.cache.lengths.sum())} tokens")
 
-    ids, loss_mask = stream._sample_batch()
+    ids, loss_mask, cpu_layout = stream._sample_batch()
     assert ids.shape == (cfg.batch_size, cfg.seq_len + 1), ids.shape
     assert loss_mask.shape == ids.shape
 
-    x, y, position_ids, attn_mask = lf.split_train_batch((ids.to(dev), loss_mask.to(dev)), stream._eos_id)
+    x, y, position_ids, attn_layout = lf.split_train_batch(
+        (ids.to(dev), loss_mask.to(dev), cpu_layout.to(dev)), stream._eos_id)
     assert x.shape == (cfg.batch_size, cfg.seq_len)
-    assert attn_mask.shape == (cfg.batch_size, 1, cfg.seq_len, cfg.seq_len)
+    assert isinstance(attn_layout, lf.PackedAttentionLayout)
+    assert attn_layout.segment_ids.shape == (cfg.batch_size, cfg.seq_len)
+    assert attn_layout.cu_seqlens.dtype == torch.int32
+    assert attn_layout.segment_ids.numel() == cfg.batch_size * cfg.seq_len
+    assert attn_layout.max_seqlen == cpu_layout.max_seqlen
     n_loss = int((y != IGNORE_INDEX).sum().item())
     assert n_loss > 0, "packed batch carries no loss tokens"
     # Only assistant tokens may be targets: everything the renderer masked out
     # (prompt, padding, separators) must be IGNORE_INDEX.
     assert torch.equal((y != IGNORE_INDEX), loss_mask.to(dev)[:, 1:].bool())
-    print(f"[smoke] packing + loss mask OK: x={tuple(x.shape)} attn_mask={tuple(attn_mask.shape)} "
-          f"loss_tokens={n_loss}")
+    print(f"[smoke] packing + compact layout OK: x={tuple(x.shape)} "
+          f"segments={attn_layout.cu_seqlens.numel() - 1} loss_tokens={n_loss}")
 
     # Segment ids exactly as build_doc_reset_state derives them: the exclusive
     # cumsum keeps each <eos> separator inside the example it terminates.
@@ -675,7 +766,7 @@ def smoke_test() -> None:
 
     model = lf.Model(cfg).to(dev)
     with torch.no_grad(), lf.amp_autocast(dev):
-        loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y,
+        loss = model(x, attn_mask=attn_layout, position_ids=position_ids, labels=y,
                      ignore_index=IGNORE_INDEX)
     assert torch.isfinite(loss)
     print(f"[smoke] masked forward OK, loss={loss.item():.4f}")
@@ -686,10 +777,11 @@ def smoke_test() -> None:
     later = (seg > 0)
     if first_len > 0 and bool(later.any()):
         with torch.no_grad():
-            base = model(x[:1], attn_mask=attn_mask[:1], position_ids=position_ids[:1])
+            one_layout = attn_layout[:1]
+            base = model(x[:1], attn_mask=one_layout, position_ids=position_ids[:1])
             x2 = x[:1].clone()
             x2[0, :first_len] = (x2[0, :first_len] + 1) % int(cfg.vocab)
-            other = model(x2, attn_mask=attn_mask[:1], position_ids=position_ids[:1])
+            other = model(x2, attn_mask=one_layout, position_ids=position_ids[:1])
         delta = (base[0, later] - other[0, later]).abs().max().item()
         assert delta < 1e-4, f"packed examples are NOT isolated: max delta {delta}"
         print(f"[smoke] cross-example isolation OK (max delta {delta:.2e})")

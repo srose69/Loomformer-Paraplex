@@ -303,7 +303,10 @@ class Config:
     # AMP/autocast mode: "bf16" (default), "fp32"/"off" (no autocast), or "fp16".
     amp_dtype: str = "fp32"
     dataset_cache: str = "mmap"
-    attn_impl: str = "sdpa"
+    # auto: FlashAttention varlen on supported CUDA GPUs, compact SDPA/manual
+    # fallback everywhere else.  "flash" is strict (fail instead of silently
+    # falling back), while sdpa/manual are explicit diagnostic overrides.
+    attn_impl: str = "auto"
     # SDPA-only compute dtype: "model" keeps q/k/v dtype, "fp32"/"fp16"/"bf16"
     # force attention compute dtype, "auto" keeps BF16 only when the efficient
     # backend accepts it and otherwise promotes SDPA inputs to FP32.
@@ -903,11 +906,20 @@ _graph_phase_sin_secant_op = None
 _graph_depth_attn_op = None
 _graph_beta_space_op = None
 AMP_DTYPE = "fp32"
-ATTN_IMPL = "sdpa"
+ATTN_IMPL = "auto"
 ATTN_SDPA_COMPUTE_DTYPE = "auto"
 ATTN_SDPA_VALUE_FUSION = True
 ATTN_SDPA_RECOMPUTE_BACKWARD = True
 _sdpa_bf16_efficient_cache: Dict[Tuple[int, int, int], bool] = {}
+_flash_varlen_func = None
+_flash_varlen_import_tried = False
+_flash_deterministic_kw_supported: Optional[bool] = None
+_flash_backend_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_flash_value_fusion_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_te_backend_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_te_value_fusion_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_te_dpa_modules: Dict[Tuple[int, int, int, int, int], nn.Module] = {}
+_attention_backend_reported: set = set()
 _REAL_STDOUT = sys.stdout
 _activation_checkpoint_tls = threading.local()
 ROPE_THETA = 10000.0
@@ -1115,9 +1127,10 @@ def apply_config(cfg: Config) -> None:
 
     KV_DIM = N_KV_HEADS * HEAD_DIM
     HIDDEN_PER_Q_HEAD = HIDDEN // N_Q_HEADS
-    ATTN_IMPL = str(getattr(cfg, "attn_impl", "sdpa") or "sdpa").lower()
-    if ATTN_IMPL not in ("sdpa", "manual"):
-        raise ValueError(f"attn_impl must be 'sdpa' or 'manual', got {ATTN_IMPL!r}")
+    ATTN_IMPL = str(getattr(cfg, "attn_impl", "auto") or "auto").lower()
+    if ATTN_IMPL not in ("auto", "flash", "sdpa", "manual"):
+        raise ValueError(
+            f"attn_impl must be 'auto', 'flash', 'sdpa' or 'manual', got {ATTN_IMPL!r}")
     if HEAD_DIM % 2 != 0:
         raise ValueError("head_dim must be even for rotary attention")
     raw_rope_theta = getattr(cfg, "rope_theta", 10000.0)
@@ -1179,9 +1192,10 @@ def apply_config(cfg: Config) -> None:
     if AMP_DTYPE not in ("bf16", "fp32", "fp16", "off"):
         raise ValueError(f"amp_dtype must be bf16, fp32/off, or fp16, got {AMP_DTYPE!r}")
     cfg.amp_dtype = AMP_DTYPE
-    ATTN_IMPL = str(getattr(cfg, "attn_impl", "sdpa") or "sdpa").lower()
-    if ATTN_IMPL not in ("sdpa", "manual"):
-        raise ValueError(f"attn_impl must be 'sdpa' or 'manual', got {ATTN_IMPL!r}")
+    ATTN_IMPL = str(getattr(cfg, "attn_impl", "auto") or "auto").lower()
+    if ATTN_IMPL not in ("auto", "flash", "sdpa", "manual"):
+        raise ValueError(
+            f"attn_impl must be 'auto', 'flash', 'sdpa' or 'manual', got {ATTN_IMPL!r}")
     ATTN_SDPA_COMPUTE_DTYPE = str(getattr(cfg, "attn_sdpa_compute_dtype", "auto") or "auto").lower()
     if ATTN_SDPA_COMPUTE_DTYPE in ("none", "native"):
         ATTN_SDPA_COMPUTE_DTYPE = "model"
@@ -2126,26 +2140,314 @@ def make_stream(path: str, cfg: Config, device: torch.device):
 IGNORE_INDEX = -100  # cross-entropy target for positions that must not be learned
 
 
+@dataclass(frozen=True)
+class PackedAttentionLayout:
+    """Compact document layout shared by every attention consumer.
+
+    ``segment_ids`` is O(B*T), while ``cu_seqlens`` is O(number of documents).
+    Neither tensor contains an attention matrix.  Row-major flattening of
+    [B,T,...] places every document contiguously in exactly the order described
+    by ``cu_seqlens``.
+    """
+
+    segment_ids: torch.Tensor       # [B,T] int32, monotonically increasing per row
+    position_ids: torch.Tensor      # [B,T] int32, reset to zero at each segment
+    cu_seqlens: torch.Tensor        # [num_documents+1] int32
+    max_seqlen: int
+    chunk_plans: Tuple["PackedChunkLayout", ...] = ()
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return tuple(self.segment_ids.shape)
+
+    def slice_batch(self, item) -> "PackedAttentionLayout":
+        segment_ids = self.segment_ids[item]
+        position_ids = self.position_ids[item]
+        if segment_ids.dim() == 1:
+            segment_ids = segment_ids.unsqueeze(0)
+            position_ids = position_ids.unsqueeze(0)
+        return packed_layout_from_segment_ids(
+            segment_ids, max_seqlen=self.max_seqlen,
+            position_ids=position_ids)
+
+    def __getitem__(self, item) -> "PackedAttentionLayout":
+        return self.slice_batch(item)
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "PackedAttentionLayout":
+        return PackedAttentionLayout(
+            segment_ids=self.segment_ids.to(device, non_blocking=non_blocking),
+            position_ids=self.position_ids.to(device, non_blocking=non_blocking),
+            cu_seqlens=self.cu_seqlens.to(device, non_blocking=non_blocking),
+            max_seqlen=self.max_seqlen,
+            chunk_plans=tuple(
+                p.to(device, non_blocking=non_blocking)
+                for p in self.chunk_plans),
+        )
+
+    def pin_memory(self) -> "PackedAttentionLayout":
+        if self.segment_ids.device.type != "cpu":
+            return self
+
+        return PackedAttentionLayout(
+            segment_ids=self.segment_ids.pin_memory(),
+            position_ids=self.position_ids.pin_memory(),
+            cu_seqlens=self.cu_seqlens.pin_memory(),
+            max_seqlen=self.max_seqlen,
+            chunk_plans=tuple(p.pin_memory() for p in self.chunk_plans),
+        )
+
+
+@dataclass(frozen=True)
+class PackedChunkLayout:
+    """Varlen metadata and gather plan for one temporal query chunk.
+
+    K/V history remains as disjoint autograd-connected chunks.  ``selectors``
+    gathers only document prefixes used by this query chunk; ``destinations``
+    writes each gathered piece into one document-major THD output allocation.
+    Completed documents from old chunks are never copied.
+    """
+
+    start: int
+    end: int
+    selectors: torch.Tensor
+    destinations: torch.Tensor
+    piece_sizes: Tuple[int, ...]
+    piece_offsets: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "PackedChunkLayout":
+        return PackedChunkLayout(
+            start=self.start,
+            end=self.end,
+            selectors=self.selectors.to(device, non_blocking=non_blocking),
+            destinations=self.destinations.to(device, non_blocking=non_blocking),
+            piece_sizes=self.piece_sizes,
+            piece_offsets=self.piece_offsets.to(device, non_blocking=non_blocking),
+            cu_seqlens_q=self.cu_seqlens_q.to(device, non_blocking=non_blocking),
+            cu_seqlens_k=self.cu_seqlens_k.to(device, non_blocking=non_blocking),
+            max_seqlen_q=self.max_seqlen_q,
+            max_seqlen_k=self.max_seqlen_k,
+        )
+
+    def pin_memory(self) -> "PackedChunkLayout":
+        if self.selectors.device.type != "cpu":
+            return self
+        return PackedChunkLayout(
+            start=self.start,
+            end=self.end,
+            selectors=self.selectors.pin_memory(),
+            destinations=self.destinations.pin_memory(),
+            piece_sizes=self.piece_sizes,
+            piece_offsets=self.piece_offsets.pin_memory(),
+            cu_seqlens_q=self.cu_seqlens_q.pin_memory(),
+            cu_seqlens_k=self.cu_seqlens_k.pin_memory(),
+            max_seqlen_q=self.max_seqlen_q,
+            max_seqlen_k=self.max_seqlen_k,
+        )
+
+
+def _cu_seqlens_from_counts(counts: torch.Tensor) -> torch.Tensor:
+    counts = counts.to(dtype=torch.int32)
+    cu = torch.zeros(counts.numel() + 1, dtype=torch.int32, device=counts.device)
+    torch.cumsum(counts, dim=0, out=cu[1:])
+    return cu
+
+
+def packed_layout_from_segment_ids(
+    segment_ids: torch.Tensor,
+    max_seqlen: Optional[int] = None,
+    position_ids: Optional[torch.Tensor] = None,
+) -> PackedAttentionLayout:
+    if segment_ids.dim() != 2:
+        raise ValueError(f"segment_ids must be [B,T], got {tuple(segment_ids.shape)}")
+    B, T = segment_ids.shape
+    seg = segment_ids.to(dtype=torch.int32)
+    if position_ids is None:
+        idx = torch.arange(T, device=seg.device, dtype=torch.int32).unsqueeze(0).expand(B, T)
+        new_seg = torch.ones_like(seg, dtype=torch.bool)
+        new_seg[:, 1:] = seg[:, 1:] != seg[:, :-1]
+        starts = torch.cummax(
+            torch.where(new_seg, idx, torch.zeros_like(idx)), dim=1).values
+        positions = idx - starts
+    else:
+        if position_ids.shape != segment_ids.shape:
+            raise ValueError(
+                f"position_ids must match segment_ids, got {tuple(position_ids.shape)} "
+                f"vs {tuple(segment_ids.shape)}")
+        positions = position_ids.to(device=seg.device, dtype=torch.int32)
+    row = torch.arange(B, device=seg.device, dtype=torch.int64).unsqueeze(1)
+    codes = row * (T + 1) + seg.to(torch.int64)
+    _, counts = torch.unique_consecutive(codes.reshape(-1), return_counts=True)
+    if max_seqlen is None:
+        max_seqlen = int(counts.max().item()) if counts.numel() else 0
+    return PackedAttentionLayout(
+        seg, positions, _cu_seqlens_from_counts(counts), int(max_seqlen))
+
+
+def _unpacked_attention_layout(batch: int, length: int, device: torch.device) -> PackedAttentionLayout:
+    seg = torch.zeros(batch, length, dtype=torch.int32, device=device)
+    positions = torch.arange(
+        length, dtype=torch.int32, device=device).unsqueeze(0).expand(batch, length)
+    counts = torch.full((batch,), length, dtype=torch.int32, device=device)
+    return PackedAttentionLayout(
+        seg, positions, _cu_seqlens_from_counts(counts), int(length))
+
+
+def build_packed_chunk_layout(
+    layout: PackedAttentionLayout,
+    start: int,
+    end: int,
+    chunk_ranges: Tuple[Tuple[int, int], ...],
+) -> PackedChunkLayout:
+    """Build a reusable, tensor-only gather plan for one Tria temporal chunk."""
+    segment_ids = layout.segment_ids
+    B, T = segment_ids.shape
+    if not (0 <= start < end <= T):
+        raise ValueError(f"bad packed chunk [{start},{end}) for T={T}")
+    if not chunk_ranges or chunk_ranges[-1] != (start, end):
+        raise ValueError("chunk_ranges must end with the current query chunk")
+
+    q_seg = segment_ids[:, start:end].to(torch.int64)
+    first_active = q_seg[:, :1]
+    last_active = q_seg[:, -1:]
+    active_counts = (last_active - first_active + 1).flatten()
+    row_doc_offsets = torch.zeros(B, dtype=torch.int64, device=segment_ids.device)
+    if B > 1:
+        torch.cumsum(active_counts[:-1], dim=0, out=row_doc_offsets[1:])
+    q_doc = row_doc_offsets[:, None] + (q_seg - first_active)
+    q_counts = torch.bincount(q_doc.reshape(-1))
+
+    selectors: List[torch.Tensor] = []
+    source_docs: List[torch.Tensor] = []
+    source_positions: List[torch.Tensor] = []
+    for chunk_start, chunk_end in chunk_ranges:
+        chunk_seg = segment_ids[:, chunk_start:chunk_end].to(torch.int64)
+        keep = (chunk_seg >= first_active) & (chunk_seg <= last_active)
+        local = keep.reshape(-1).nonzero(as_tuple=False).flatten().to(torch.int32)
+        selectors.append(local)
+        if local.numel() == 0:
+            continue
+        b_idx, local_pos = keep.nonzero(as_tuple=True)
+        docs = (
+            row_doc_offsets.index_select(0, b_idx)
+            + chunk_seg[b_idx, local_pos]
+            - first_active.flatten().index_select(0, b_idx)
+        )
+        abs_pos = local_pos.to(torch.int64) + int(chunk_start)
+        source_docs.append(docs)
+        source_positions.append(
+            layout.position_ids[b_idx, abs_pos].to(torch.int64))
+
+    if not source_docs:
+        raise RuntimeError("packed chunk has queries but selected no K/V tokens")
+    source_doc = torch.cat(source_docs)
+    k_counts = torch.bincount(source_doc)
+    if q_counts.numel() != k_counts.numel():
+        raise RuntimeError("packed Q/K document count mismatch")
+    cu_k = _cu_seqlens_from_counts(k_counts)
+    destination_parts = tuple(
+        (
+            cu_k[:-1].to(torch.int64).index_select(0, docs)
+            + positions
+        ).to(torch.int32)
+        for docs, positions in zip(source_docs, source_positions)
+    )
+
+    piece_sizes = tuple(x.numel() for x in selectors)
+    piece_offsets = torch.zeros(
+        len(piece_sizes) + 1, dtype=torch.int32, device=segment_ids.device)
+    if piece_sizes:
+        sizes_tensor = torch.tensor(
+            piece_sizes, dtype=torch.int32, device=segment_ids.device)
+        torch.cumsum(sizes_tensor, dim=0, out=piece_offsets[1:])
+
+    return PackedChunkLayout(
+        start=int(start),
+        end=int(end),
+        selectors=torch.cat(selectors),
+        destinations=torch.cat(destination_parts),
+        piece_sizes=piece_sizes,
+        piece_offsets=piece_offsets,
+        cu_seqlens_q=_cu_seqlens_from_counts(q_counts),
+        cu_seqlens_k=cu_k,
+        # FlashAttention accepts upper bounds.  Reusing static bounds avoids
+        # two GPU->CPU synchronizations per temporal chunk.
+        max_seqlen_q=int(end - start),
+        max_seqlen_k=int(layout.max_seqlen),
+    )
+
+
+def temporal_chunk_stops(
+    idx: torch.Tensor,
+    window: int,
+    hard_fire_enabled: bool,
+    carry_token_id: Optional[int],
+    compiling: bool = False,
+) -> List[int]:
+    """Return inclusive Tria chunk endpoints using the model's exact policy."""
+    T = idx.shape[1]
+    if compiling:
+        boundaries = list(range(window - 1, T, window)) if hard_fire_enabled else []
+    else:
+        boundary_mask = torch.zeros(T, dtype=torch.bool, device=idx.device)
+        if hard_fire_enabled:
+            boundary_mask[window - 1:T:window] = True
+            boundary_mask[-1] = False
+        if carry_token_id is not None:
+            boundary_mask |= idx.eq(int(carry_token_id)).any(dim=0)
+        boundaries = boundary_mask.nonzero(as_tuple=False).flatten().tolist()
+    if not boundaries or boundaries[-1] != T - 1:
+        boundaries.append(T - 1)
+    return boundaries
+
+
 def split_train_batch(batch, eos_id: Optional[int]):
-    """Return (x, y, position_ids, attn_mask) from whatever the stream yielded.
+    """Return (x, y, position_ids, attention_layout) from a stream batch.
 
     Pretraining streams yield a plain [B, T+1] token tensor and every next token
-    is a target. SFT streams yield (ids, loss_mask) and the masked-out positions
-    become IGNORE_INDEX, so prompt, padding and separator tokens contribute no
-    loss. Positions and the block-diagonal attention mask are the same doc-reset
-    construction in both cases -- SFT just uses <eos> as its example separator.
+    is a target. SFT streams yield (ids, loss_mask, packed_layout); the
+    masked-out positions become IGNORE_INDEX, while CPU-produced cu-seqlens and
+    chunk gather plans avoid per-step GPU synchronization/sorting. A quadratic
+    block-diagonal mask is never materialized.
     """
+    packed_max_seqlen = None
+    supplied_layout = None
     if isinstance(batch, tuple):
-        ids, loss_mask = batch
+        if len(batch) == 2:
+            ids, loss_mask = batch
+        elif len(batch) == 3:
+            ids, loss_mask, metadata = batch
+            if isinstance(metadata, PackedAttentionLayout):
+                supplied_layout = metadata
+            else:
+                packed_max_seqlen = metadata
+        else:
+            raise ValueError(f"unexpected SFT batch tuple of length {len(batch)}")
         x, y = ids[:, :-1], ids[:, 1:]
         y = torch.where(loss_mask[:, 1:].bool(), y, torch.full_like(y, IGNORE_INDEX))
     else:
         x, y = batch[:, :-1], batch[:, 1:]
-    position_ids, attn_mask = build_doc_reset_state(x, eos_id)
+    if supplied_layout is not None:
+        if supplied_layout.segment_ids.shape != x.shape:
+            raise ValueError(
+                f"supplied packed layout shape {tuple(supplied_layout.segment_ids.shape)} "
+                f"does not match training input {tuple(x.shape)}")
+        position_ids = supplied_layout.position_ids.to(dtype=torch.long)
+        attn_mask = supplied_layout
+    else:
+        position_ids, attn_mask = build_doc_reset_state(
+            x, eos_id, max_seqlen=packed_max_seqlen)
     return x, y, position_ids, attn_mask
 
 
-def build_doc_reset_state(x: torch.Tensor, eos_id: Optional[int]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def build_doc_reset_state(
+    x: torch.Tensor,
+    eos_id: Optional[int],
+    max_seqlen: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[PackedAttentionLayout]]:
     B, T = x.shape
     idx = torch.arange(T, device=x.device, dtype=torch.long).unsqueeze(0).expand(B, T)
     if eos_id is None:
@@ -2156,10 +2458,8 @@ def build_doc_reset_state(x: torch.Tensor, eos_id: Optional[int]) -> Tuple[torch
     new_seg[:, 1:] = seg[:, 1:] != seg[:, :-1]
     seg_start_idx = torch.cummax(torch.where(new_seg, idx, torch.zeros_like(idx)), dim=1).values
     position_ids = idx - seg_start_idx
-    causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-    allowed = seg.unsqueeze(2) == seg.unsqueeze(1)  # (B,T,T)
-    attn_mask = allowed.unsqueeze(1) & causal.unsqueeze(0).unsqueeze(0)  # (B,1,T,T)
-    return position_ids, attn_mask
+    return position_ids, packed_layout_from_segment_ids(
+        seg.to(torch.int32), max_seqlen=max_seqlen, position_ids=position_ids)
 
 
 def prepare(raw_dir: str, cfg: Config, out: str) -> None:
@@ -3308,6 +3608,564 @@ def _bf16_efficient_sdpa_supported(device: torch.device) -> bool:
     return ok
 
 
+def _get_flash_varlen_func():
+    global _flash_varlen_func, _flash_varlen_import_tried
+    if _flash_varlen_import_tried:
+        return _flash_varlen_func
+    _flash_varlen_import_tried = True
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except (ImportError, OSError):
+        _flash_varlen_func = None
+    else:
+        _flash_varlen_func = flash_attn_varlen_func
+    return _flash_varlen_func
+
+
+def _call_flash_varlen(func, q, k, v, *args, **kwargs):
+    """Call both current and older FA2 varlen bindings without hiding errors."""
+    global _flash_deterministic_kw_supported
+    if _flash_deterministic_kw_supported is False:
+        kwargs.pop("deterministic", None)
+        return func(q, k, v, *args, **kwargs)
+    try:
+        out = func(q, k, v, *args, **kwargs)
+    except TypeError as error:
+        if (
+            _flash_deterministic_kw_supported is None
+            and "deterministic" in kwargs
+            and "deterministic" in str(error)
+        ):
+            kwargs.pop("deterministic")
+            out = func(q, k, v, *args, **kwargs)
+            _flash_deterministic_kw_supported = False
+            return out
+        raise
+    _flash_deterministic_kw_supported = True
+    return out
+
+
+def _flash_varlen_eligible(tensor: torch.Tensor) -> bool:
+    if tensor.device.type != "cuda" or tensor.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    idx = torch.cuda.current_device() if tensor.device.index is None else int(tensor.device.index)
+    major, _minor = torch.cuda.get_device_capability(idx)
+    key = (idx, tensor.dtype, HEAD_DIM)
+    probed = _flash_backend_cache.get(key)
+    if probed is not None:
+        return probed
+    return major >= 8 and HEAD_DIM <= 256 and _get_flash_varlen_func() is not None
+
+
+def _attention_compute_dtype(device: torch.device, parameter_dtype: torch.dtype) -> torch.dtype:
+    if device.type != "cuda":
+        return parameter_dtype
+    try:
+        if torch.is_autocast_enabled("cuda"):
+            return torch.get_autocast_dtype("cuda")
+    except TypeError:  # PyTorch before the device-typed autocast query
+        if torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return parameter_dtype
+
+
+def _probe_flash_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
+    """Verify fused value=[K;V] forward *and backward once per device/shape."""
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return False
+    idx = torch.cuda.current_device() if device.index is None else int(device.index)
+    key = (idx, dtype, HEAD_DIM)
+    cached = _flash_value_fusion_cache.get(key)
+    if cached is not None:
+        return cached
+    func = _get_flash_varlen_func()
+    major, _minor = torch.cuda.get_device_capability(idx)
+    if func is None or major < 8 or HEAD_DIM > 256:
+        _flash_backend_cache[key] = False
+        _flash_value_fusion_cache[key] = False
+        return False
+    try:
+        total = 4
+        q = torch.randn(
+            total, N_Q_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(
+            total, N_KV_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        v_base = torch.randn(
+            total, N_KV_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        cu = torch.tensor([0, total], dtype=torch.int32, device=device)
+        with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
+            device_type="cuda", enabled=False
+        ):
+            base_out = _call_flash_varlen(
+                func,
+                q, k, v_base, cu, cu, total, total,
+                dropout_p=0.0, causal=True,
+                deterministic=torch.are_deterministic_algorithms_enabled(),
+            )
+            base_out.float().sum().backward()
+            torch.cuda.synchronize(device)
+        _flash_backend_cache[key] = True
+        del q, k, v_base, base_out
+    except Exception:
+        _flash_backend_cache[key] = False
+        _flash_value_fusion_cache[key] = False
+        return False
+    if 2 * HEAD_DIM > 256:
+        _flash_value_fusion_cache[key] = False
+        return False
+    try:
+        q = torch.randn(
+            total, N_Q_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        fused_kv = torch.randn(
+            total, N_KV_HEADS, 2 * HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        k = fused_kv[..., :HEAD_DIM]
+        with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
+            device_type="cuda", enabled=False
+        ):
+            out = _call_flash_varlen(
+                func,
+                q, k, fused_kv, cu, cu, total, total,
+                dropout_p=0.0, causal=True,
+                deterministic=torch.are_deterministic_algorithms_enabled(),
+            )
+            out.float().sum().backward()
+            torch.cuda.synchronize(device)
+        ok = out.shape[-1] == 2 * HEAD_DIM
+        del q, k, fused_kv, cu, out
+    except Exception:
+        ok = False
+    _flash_value_fusion_cache[key] = ok
+    return ok
+
+
+def _flash_attention_contexts(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Varlen causal attention in THD layout, returning (attention@K, attention@V)."""
+    func = _get_flash_varlen_func()
+    if func is None:
+        raise RuntimeError(
+            "FlashAttention was selected but flash_attn.flash_attn_varlen_func is unavailable")
+    common = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=int(max_seqlen_q),
+        max_seqlen_k=int(max_seqlen_k),
+        dropout_p=0.0,
+        causal=True,
+        deterministic=torch.are_deterministic_algorithms_enabled(),
+    )
+    with torch.autocast(device_type="cuda", enabled=False):
+        k_ctx = _call_flash_varlen(func, q, k, k, **common)
+        value_ctx = _call_flash_varlen(func, q, k, v, **common)
+    return k_ctx, value_ctx
+
+
+def _get_te_dpa(device: torch.device, value_dim: int):
+    idx = torch.cuda.current_device() if device.index is None else int(device.index)
+    key = (idx, N_Q_HEADS, N_KV_HEADS, HEAD_DIM, int(value_dim))
+    module = _te_dpa_modules.get(key)
+    if module is not None:
+        return module
+    try:
+        from transformer_engine.pytorch import DotProductAttention
+        with torch.cuda.device(idx):
+            module = DotProductAttention(
+                num_attention_heads=N_Q_HEADS,
+                kv_channels=(HEAD_DIM, int(value_dim)),
+                num_gqa_groups=N_KV_HEADS,
+                attention_dropout=0.0,
+                qkv_format="thd",
+                attn_mask_type="padding_causal_bottom_right",
+            )
+    except (ImportError, OSError, RuntimeError):
+        return None
+    _te_dpa_modules[key] = module
+    return module
+
+
+def _te_varlen_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    module = _get_te_dpa(q.device, v.shape[-1])
+    if module is None:
+        raise RuntimeError("Transformer Engine DotProductAttention is unavailable")
+    return module(
+        q, k, v,
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_k,
+        max_seqlen_q=int(max_seqlen_q),
+        max_seqlen_kv=int(max_seqlen_k),
+        attn_mask_type="padding_causal_bottom_right",
+    )
+
+
+def _probe_te_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return False
+    idx = torch.cuda.current_device() if device.index is None else int(device.index)
+    key = (idx, dtype, HEAD_DIM)
+    cached = _te_value_fusion_cache.get(key)
+    if cached is not None:
+        return cached
+    major, _minor = torch.cuda.get_device_capability(idx)
+    if major < 8:
+        _te_backend_cache[key] = False
+        _te_value_fusion_cache[key] = False
+        return False
+    total = 4
+    cu = torch.tensor([0, total], dtype=torch.int32, device=device)
+    try:
+        q = torch.randn(
+            total, N_Q_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(
+            total, N_KV_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn(
+            total, N_KV_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
+            device_type="cuda", enabled=False
+        ):
+            out = _te_varlen_call(q, k, v, cu, cu, total, total)
+            out.float().sum().backward()
+            torch.cuda.synchronize(device)
+        _te_backend_cache[key] = True
+        del q, k, v, out
+    except Exception:
+        _te_backend_cache[key] = False
+        _te_value_fusion_cache[key] = False
+        return False
+    if 2 * HEAD_DIM > 256:
+        _te_value_fusion_cache[key] = False
+        return False
+    try:
+        q = torch.randn(
+            total, N_Q_HEADS, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        fused_kv = torch.randn(
+            total, N_KV_HEADS, 2 * HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+        k = fused_kv[..., :HEAD_DIM]
+        with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
+            device_type="cuda", enabled=False
+        ):
+            out = _te_varlen_call(q, k, fused_kv, cu, cu, total, total)
+            out.float().sum().backward()
+            torch.cuda.synchronize(device)
+        ok = out.shape[-1] == 2 * HEAD_DIM
+        del q, k, fused_kv, out
+    except Exception:
+        ok = False
+    del cu
+    _te_value_fusion_cache[key] = ok
+    return ok
+
+
+def _te_varlen_eligible(tensor: torch.Tensor) -> bool:
+    if tensor.device.type != "cuda" or tensor.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    idx = torch.cuda.current_device() if tensor.device.index is None else int(tensor.device.index)
+    return _te_backend_cache.get((idx, tensor.dtype, HEAD_DIM), False)
+
+
+def _te_attention_contexts(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    with torch.autocast(device_type="cuda", enabled=False):
+        k_ctx = _te_varlen_call(
+            q, k, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+        value_ctx = _te_varlen_call(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    return k_ctx, value_ctx
+
+
+def _varlen_backend(tensor: torch.Tensor) -> Optional[str]:
+    if ATTN_IMPL not in ("auto", "flash"):
+        return None
+    backend = None
+    if _flash_varlen_eligible(tensor):
+        backend = "flash"
+    elif _te_varlen_eligible(tensor):
+        backend = "transformer_engine"
+    if backend is not None:
+        idx = torch.cuda.current_device() if tensor.device.index is None else int(tensor.device.index)
+        report_key = (idx, tensor.dtype, HEAD_DIM, backend)
+        if report_key not in _attention_backend_reported:
+            _attention_backend_reported.add(report_key)
+            ddp_print(
+                f"[attention] packed varlen backend={backend} device=cuda:{idx} "
+                f"dtype={tensor.dtype} head_dim={HEAD_DIM}")
+    return backend
+
+
+def _varlen_value_fusion_enabled(backend: str, tensor: torch.Tensor) -> bool:
+    if not ATTN_SDPA_VALUE_FUSION:
+        return False
+    idx = torch.cuda.current_device() if tensor.device.index is None else int(tensor.device.index)
+    key = (idx, tensor.dtype, HEAD_DIM)
+    if backend == "flash":
+        return _flash_value_fusion_cache.get(key, False)
+    if backend == "transformer_engine":
+        return _te_value_fusion_cache.get(key, False)
+    return False
+
+
+def _varlen_attention_contexts(
+    backend: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    fused_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if fused_value is not None:
+        k_view = fused_value[..., :HEAD_DIM]
+        if backend == "flash":
+            func = _get_flash_varlen_func()
+            with torch.autocast(device_type="cuda", enabled=False):
+                out = _call_flash_varlen(
+                    func,
+                    q, k_view, fused_value,
+                    cu_seqlens_q, cu_seqlens_k,
+                    int(max_seqlen_q), int(max_seqlen_k),
+                    dropout_p=0.0,
+                    causal=True,
+                    deterministic=torch.are_deterministic_algorithms_enabled(),
+                )
+        elif backend == "transformer_engine":
+            with torch.autocast(device_type="cuda", enabled=False):
+                out = _te_varlen_call(
+                    q, k_view, fused_value,
+                    cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k)
+        else:
+            raise ValueError(f"unknown varlen attention backend {backend!r}")
+        return out.split(HEAD_DIM, dim=-1)
+    if backend == "flash":
+        return _flash_attention_contexts(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    if backend == "transformer_engine":
+        return _te_attention_contexts(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    raise ValueError(f"unknown varlen attention backend {backend!r}")
+
+
+_cuda_packed_gather_module = None
+_cuda_packed_gather_tried = False
+
+
+def _try_load_cuda_packed_gather():
+    """Load the one-launch THD history packer used before varlen attention."""
+    global _cuda_packed_gather_module, _cuda_packed_gather_tried
+    if _cuda_packed_gather_tried:
+        return _cuda_packed_gather_module
+    _cuda_packed_gather_tried = True
+    try:
+        from kernels.build import build_or_load
+        _cuda_packed_gather_module = build_or_load(
+            "loomformer_packed_gather",
+            ["packed_gather/packed_gather_launcher.cu"],
+            ptx_kernels={"packed_gather": "packed_gather/packed_gather_kernel.cu"},
+        )
+    except Exception as e:
+        _cuda_packed_gather_module = None
+        ddp_print(
+            f"[loomformer] CUDA packed_gather failed ({type(e).__name__}: {e}).")
+    return _cuda_packed_gather_module
+
+
+def _cuda_packed_gather_or_fallback(tensor: torch.Tensor):
+    if tensor.device.type != "cuda":
+        return None
+    module = _try_load_cuda_packed_gather()
+    if module is not None:
+        return module
+    major, _minor = torch.cuda.get_device_capability(tensor.device)
+    if major >= 8 and ATTN_IMPL in ("auto", "flash"):
+        raise RuntimeError(
+            "packed varlen attention needs the CUDA packed_gather extension, "
+            "but it failed to build/load; refusing the O(history_chunks) "
+            "PyTorch packer on a production FlashAttention GPU")
+    return None
+
+
+class _PackedGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, selectors, destinations, piece_offsets, count, *chunks):
+        module = _cuda_packed_gather_or_fallback(chunks[0])
+        if module is None:
+            raise RuntimeError("CUDA packed_gather extension is unavailable")
+        count = int(count)
+        if count != len(chunks):
+            raise ValueError(f"packed_gather expected {count} chunks, got {len(chunks)}")
+        first = chunks[0]
+        ctx.save_for_backward(selectors, destinations, piece_offsets)
+        ctx.chunk_lengths = tuple(int(chunk.shape[1]) for chunk in chunks)
+        ctx.batch = int(first.shape[0])
+        ctx.heads = int(first.shape[2])
+        ctx.head_dim = int(first.shape[3])
+        return module.forward(
+            list(chunks), selectors, destinations, piece_offsets)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        selectors, destinations, piece_offsets = ctx.saved_tensors
+        module = _cuda_packed_gather_module
+        if module is None:
+            raise RuntimeError("CUDA packed_gather disappeared before backward")
+        grads = module.backward(
+            grad_output.contiguous(),
+            selectors,
+            destinations,
+            piece_offsets,
+            list(ctx.chunk_lengths),
+            ctx.batch,
+            ctx.heads,
+            ctx.head_dim,
+        )
+        return (None, None, None, None, *grads)
+
+
+class _PackedGatherPair(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, selectors, destinations, piece_offsets, count, *chunks):
+        count = int(count)
+        if len(chunks) != 2 * count:
+            raise ValueError(
+                f"packed_gather_pair expected {2 * count} tensors, got {len(chunks)}")
+        k_chunks = chunks[:count]
+        v_chunks = chunks[count:]
+        module = _cuda_packed_gather_or_fallback(k_chunks[0])
+        if module is None:
+            raise RuntimeError("CUDA packed_gather extension is unavailable")
+        first = k_chunks[0]
+        ctx.save_for_backward(selectors, destinations, piece_offsets)
+        ctx.chunk_lengths = tuple(int(chunk.shape[1]) for chunk in k_chunks)
+        ctx.batch = int(first.shape[0])
+        ctx.heads = int(first.shape[2])
+        ctx.head_dim = int(first.shape[3])
+        return module.forward_pair(
+            list(k_chunks), list(v_chunks),
+            selectors, destinations, piece_offsets)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        selectors, destinations, piece_offsets = ctx.saved_tensors
+        module = _cuda_packed_gather_module
+        if module is None:
+            raise RuntimeError("CUDA packed_gather disappeared before backward")
+        grads = module.backward_pair(
+            grad_output.contiguous(),
+            selectors,
+            destinations,
+            piece_offsets,
+            list(ctx.chunk_lengths),
+            ctx.batch,
+            ctx.heads,
+            ctx.head_dim,
+        )
+        return (None, None, None, None, *grads)
+
+
+def _pack_selected_chunk_history(
+    chunks: Tuple[torch.Tensor, ...],
+    packed: PackedChunkLayout,
+) -> torch.Tensor:
+    """Gather live document prefixes without concatenating completed history."""
+    if len(chunks) != len(packed.piece_sizes):
+        raise ValueError(
+            f"packed selector count {len(packed.piece_sizes)} != chunk count {len(chunks)}")
+    total = packed.destinations.numel()
+    if total == 0:
+        raise RuntimeError("packed attention selected no history")
+    first = chunks[0]
+    if first.device.type == "cuda" and _cuda_packed_gather_or_fallback(first) is not None:
+        return _PackedGather.apply(
+            packed.selectors, packed.destinations, packed.piece_offsets,
+            len(chunks), *chunks)
+    document_major = first.new_empty(total, first.shape[-2], first.shape[-1])
+    offset = 0
+    for chunk, size in zip(chunks, packed.piece_sizes):
+        selector = packed.selectors[offset:offset + size]
+        destination = packed.destinations[offset:offset + size]
+        offset += size
+        if size == 0:
+            continue
+        selected = chunk.reshape(
+            -1, chunk.shape[-2], chunk.shape[-1]).index_select(0, selector)
+        # index_copy_ accepts only int64 indices. Keep persistent metadata
+        # int32 and widen only the current small index vector.
+        document_major.index_copy_(0, destination.to(torch.int64), selected)
+    return document_major
+
+
+def _pack_selected_chunk_kv(
+    k_chunks: Tuple[torch.Tensor, ...],
+    v_chunks: Tuple[torch.Tensor, ...],
+    packed: PackedChunkLayout,
+) -> torch.Tensor:
+    """Pack [K|V] directly into one THD allocation for fused value attention."""
+    if len(k_chunks) != len(v_chunks) or len(k_chunks) != len(packed.piece_sizes):
+        raise ValueError("K/V chunk history does not match packed selectors")
+    total = packed.destinations.numel()
+    if total == 0:
+        raise RuntimeError("packed attention selected no history")
+    first = k_chunks[0]
+    if first.device.type == "cuda" and _cuda_packed_gather_or_fallback(first) is not None:
+        return _PackedGatherPair.apply(
+            packed.selectors, packed.destinations, packed.piece_offsets,
+            len(k_chunks), *k_chunks, *v_chunks)
+    fused = first.new_empty(total, first.shape[-2], 2 * first.shape[-1])
+    offset = 0
+    for k_chunk, v_chunk, size in zip(k_chunks, v_chunks, packed.piece_sizes):
+        selector = packed.selectors[offset:offset + size]
+        destination = packed.destinations[offset:offset + size]
+        offset += size
+        if size == 0:
+            continue
+        shape = (-1, k_chunk.shape[-2], k_chunk.shape[-1])
+        k_selected = k_chunk.reshape(shape).index_select(0, selector)
+        v_selected = v_chunk.reshape(shape).index_select(0, selector)
+        piece = torch.cat((k_selected, v_selected), dim=-1)
+        fused.index_copy_(0, destination.to(torch.int64), piece)
+    return fused
+
+
+def _packed_chunk_mask(
+    layout: Optional[PackedAttentionLayout],
+    start: int,
+    end: int,
+    device: torch.device,
+) -> torch.Tensor:
+    q_pos = torch.arange(start, end, device=device, dtype=torch.long).view(1, 1, end - start, 1)
+    k_pos = torch.arange(end, device=device, dtype=torch.long).view(1, 1, 1, end)
+    allowed = k_pos <= q_pos
+    if layout is not None:
+        q_seg = layout.segment_ids[:, start:end].view(-1, 1, end - start, 1)
+        k_seg = layout.segment_ids[:, :end].view(-1, 1, 1, end)
+        allowed = allowed & (q_seg == k_seg)
+    return allowed
+
+
 def _sdpa_compute_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.dtype]:
     src_dtype = q.dtype
     mode = ATTN_SDPA_COMPUTE_DTYPE
@@ -3405,6 +4263,45 @@ def _attention_contexts_sdpa(qg: torch.Tensor, kg: torch.Tensor, vg: torch.Tenso
             kctx_g = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, k_sdpa, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
     return kctx_g.to(dtype=out_dtype), c_g.to(dtype=out_dtype)
+
+
+def _attention_contexts_packed_sdpa(
+    q: torch.Tensor,
+    k_compact: torch.Tensor,
+    v_compact: torch.Tensor,
+    layout: PackedAttentionLayout,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact compact fallback: one causal SDPA per packed document.
+
+    This path is primarily the Pascal/CPU correctness floor.  It never creates
+    a block-diagonal T² mask and never lets one document enter another's SDPA
+    call.  Production Ampere+ training takes the varlen FlashAttention path.
+    """
+    B, T, _hq, _d = q.shape
+    q_flat = q.reshape(B * T, N_Q_HEADS, HEAD_DIM)
+    k_flat = k_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
+    v_flat = v_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
+    # One host transfer per batch layout, not one per layer/document.
+    offsets = layout.cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    kctx_parts: List[torch.Tensor] = []
+    value_parts: List[torch.Tensor] = []
+    for begin, finish in zip(offsets[:-1], offsets[1:]):
+        q_doc = q_flat[begin:finish].transpose(0, 1).unsqueeze(0)
+        k_doc = GroupedQueryCausalSelfAttention._kv_to_q_heads(
+            k_flat[begin:finish].unsqueeze(0)).transpose(1, 2)
+        v_doc = GroupedQueryCausalSelfAttention._kv_to_q_heads(
+            v_flat[begin:finish].unsqueeze(0)).transpose(1, 2)
+        kctx, value = _attention_contexts_sdpa(
+            q_doc, k_doc, v_doc, attn_mask=None, is_causal=True,
+            cat_label="loom.attn.cat_kv_value_packed_fallback")
+        kctx_parts.append(kctx.squeeze(0).transpose(0, 1))
+        value_parts.append(value.squeeze(0).transpose(0, 1))
+    kctx_flat = torch.cat(kctx_parts, dim=0)
+    value_flat = torch.cat(value_parts, dim=0)
+    return (
+        kctx_flat.view(B, T, N_Q_HEADS, HEAD_DIM),
+        value_flat.view(B, T, N_Q_HEADS, HEAD_DIM),
+    )
 
 
 _cuda_chunk_attn_module = None
@@ -3511,8 +4408,6 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         self.qkv_weight = nn.Parameter(torch.empty(N + 2 * KV_DIM, N))
         self.o = nn.Linear(N, N, bias=False)
         self.rope = YaRNRotaryEmbedding()
-        mask = torch.tril(torch.ones(SEQ_LEN, SEQ_LEN, dtype=torch.bool))
-        self.register_buffer("causal_mask", mask.view(1, 1, SEQ_LEN, SEQ_LEN), persistent=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -3550,7 +4445,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         qkv = F.linear(z, self.qkv_weight)
         return torch.split(qkv, (N, KV_DIM, KV_DIM), dim=-1)
 
-    def forward(self, z: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+    def forward(self, z: torch.Tensor, attn_mask: Optional[Any] = None,
                 position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = z.shape
         if T > SEQ_LEN:
@@ -3559,26 +4454,77 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             position_ids = torch.arange(T, device=z.device, dtype=torch.long)
         q_p, k_p, v_p = self._qkv(z)
         q = self._split_q_heads(q_p)
-        k = self._kv_to_q_heads(self._split_kv_heads(k_p))
-        q, k = self.rope(q, k, position_ids)
-        v = self._kv_to_q_heads(self._split_kv_heads(v_p))
-        qg = q.transpose(1, 2)
-        kg = k.transpose(1, 2)
-        vg = v.transpose(1, 2)
-        # attn_mask (B,1,T,T) bool, True=attend: used for packed-example training (SFT),
-        # where several examples share one row and must NOT attend across each other's
-        # boundary. None (the pretrain/normal path) keeps the exact prior fast path --
-        # zero behavior change, zero speed cost, when packing is not in play.
-        if ATTN_IMPL == "sdpa":
-            # Ключевой трюк: value = [K;V] -> один фьюзнутый кернел возвращает aK и aV
-            # разом, БЕЗ материализации (B,h,T,T). mem-efficient бэкенд поддерживает sm50+.
+        k_compact = self._split_kv_heads(k_p)
+        v_compact = self._split_kv_heads(v_p)
+        q, k_compact = self.rope(q, k_compact, position_ids)
+        packed = attn_mask if isinstance(attn_mask, PackedAttentionLayout) else None
+
+        flash_layout = packed
+        if flash_layout is None and attn_mask is None:
+            flash_layout = _unpacked_attention_layout(B, T, z.device)
+        varlen_backend = _varlen_backend(q) if flash_layout is not None else None
+        if ATTN_IMPL == "flash" and varlen_backend is None:
+            raise RuntimeError(
+                "attn_impl='flash' requires a validated varlen forward+backward "
+                "backend (FlashAttention or Transformer Engine), fp16/bf16 CUDA "
+                "tensors, and compact causal layout metadata")
+
+        if varlen_backend is not None:
+            with torch.profiler.record_function(f"loom.attn.{varlen_backend}_varlen_flat"):
+                q_flat = q.reshape(B * T, N_Q_HEADS, HEAD_DIM)
+                k_flat = k_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
+                v_flat = v_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
+                fused_value = None
+                if _varlen_value_fusion_enabled(varlen_backend, q):
+                    fused_value = torch.cat(
+                        (k_compact, v_compact), dim=-1
+                    ).reshape(B * T, N_KV_HEADS, 2 * HEAD_DIM)
+                kctx_flat, c_flat = _varlen_attention_contexts(
+                    varlen_backend,
+                    q_flat, k_flat, v_flat,
+                    flash_layout.cu_seqlens, flash_layout.cu_seqlens,
+                    flash_layout.max_seqlen, flash_layout.max_seqlen,
+                    fused_value=fused_value)
+                k_ctx = kctx_flat.view(B, T, N_Q_HEADS, HEAD_DIM)
+                c = c_flat.view(B, T, N_Q_HEADS, HEAD_DIM)
+        elif packed is not None and ATTN_IMPL != "manual":
+            with torch.profiler.record_function("loom.attn.sdpa_packed_fallback"):
+                k_ctx, c = _attention_contexts_packed_sdpa(
+                    q, k_compact, v_compact, packed)
+        elif ATTN_IMPL in ("auto", "sdpa"):
+            k = self._kv_to_q_heads(k_compact)
+            v = self._kv_to_q_heads(v_compact)
+            qg = q.transpose(1, 2)
+            kg = k.transpose(1, 2)
+            vg = v.transpose(1, 2)
+            dense_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
             with torch.profiler.record_function("loom.attn.sdpa_flat"):
                 kctx_g, c_g = _attention_contexts_sdpa(
-                    qg, kg, vg, attn_mask=attn_mask, is_causal=attn_mask is None,
+                    qg, kg, vg, attn_mask=dense_mask, is_causal=dense_mask is None,
                     cat_label="loom.attn.cat_kv_value_flat")
+            k_ctx = kctx_g.transpose(1, 2).contiguous()
+            c = c_g.transpose(1, 2).contiguous()
         else:
+            k = self._kv_to_q_heads(k_compact)
+            v = self._kv_to_q_heads(v_compact)
+            qg = q.transpose(1, 2)
+            kg = k.transpose(1, 2)
+            vg = v.transpose(1, 2)
             scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(HEAD_DIM)
-            m = attn_mask if attn_mask is not None else self.causal_mask[:, :, :T, :T]
+            if packed is not None:
+                pos = torch.arange(T, device=z.device)
+                causal = pos[None, :] <= pos[:, None]
+                m = (
+                    packed.segment_ids.unsqueeze(2) == packed.segment_ids.unsqueeze(1)
+                ).unsqueeze(1) & causal.view(1, 1, T, T)
+            else:
+                if isinstance(attn_mask, torch.Tensor):
+                    m = attn_mask
+                else:
+                    # Explicit manual mode is a debugging fallback.  Do not
+                    # pin a [SEQ_LEN,SEQ_LEN] buffer in every attention layer.
+                    m = torch.ones(T, T, dtype=torch.bool, device=z.device).tril_(
+                    ).view(1, 1, T, T)
             scores = scores.masked_fill(~m, float("-inf"))
             # fp32 softmax accumulation regardless of qg/kg/vg's dtype -- see
             # the sibling manual-attention path below for why (bf16 exp/sum
@@ -3586,8 +4532,8 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             a = torch.softmax(scores.float(), dim=-1).to(vg.dtype)
             c_g = torch.matmul(a, vg)
             kctx_g = torch.matmul(a, kg)
-        c = c_g.transpose(1, 2).contiguous()
-        k_ctx = kctx_g.transpose(1, 2).contiguous()
+            c = c_g.transpose(1, 2).contiguous()
+            k_ctx = kctx_g.transpose(1, 2).contiguous()
         return self.o(self._merge_q_heads(c)), q, k_ctx, c
 
     @staticmethod
@@ -3809,27 +4755,56 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         # переиспользует на следующем шаге; срез k_all был только для этого forward.
         return self.o(self._merge_q_heads(c)), q, k_ctx, c, k_cache, v_cache
 
-    def forward_chunk(self, z: torch.Tensor, past_k_chunks: tuple, past_v_chunks: tuple,
-                       position_ids: torch.Tensor, chunk_mask: Optional[torch.Tensor]):
+    def forward_chunk(
+        self,
+        z: torch.Tensor,
+        past_k_chunks: tuple,
+        past_v_chunks: tuple,
+        position_ids: torch.Tensor,
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
+    ):
         B, T, _ = z.shape
         q_p, k_p, v_p = self._qkv(z)
         q = self._split_q_heads(q_p)
-        k_new_q = self._kv_to_q_heads(self._split_kv_heads(k_p))
-        q, k_new_q = self.rope(q, k_new_q, position_ids)
-        k_new = k_new_q.view(B, T, N_KV_HEADS, GQA_GROUP_SIZE, HEAD_DIM)[:, :, :, 0, :].contiguous()
+        k_new = self._split_kv_heads(k_p)
         v_new = self._split_kv_heads(v_p).contiguous()
+        q, k_new = self.rope(q, k_new, position_ids)
+        k_new = k_new.contiguous()
         k_chunks = (*past_k_chunks, k_new)
         v_chunks = (*past_v_chunks, v_new)
-        if ATTN_IMPL == "sdpa":
-            # Same fused K;V SDPA trick as forward()'s flat path -- this def
-            # was previously stuck on _chunk_attention_list (CUDA chunk_attn
-            # kernel, never implemented -> naive quadratic-softmax fallback)
-            # regardless of attn_impl, so the chunked training hot loop
-            # (_forward_chunked, active whenever tria_carry+temporal are on,
-            # e.g. nano.yaml) never got the efficient-attention backend.
+
+        varlen_backend = _varlen_backend(q)
+        if ATTN_IMPL == "flash" and varlen_backend is None:
+            raise RuntimeError(
+                "attn_impl='flash' requires a validated FlashAttention or "
+                "Transformer Engine varlen forward+backward backend")
+        if varlen_backend is not None:
+            with torch.profiler.record_function(f"loom.attn.{varlen_backend}_varlen_chunk"):
+                q_packed = q.reshape(B * T, N_Q_HEADS, HEAD_DIM)
+                fused_value = None
+                if _varlen_value_fusion_enabled(varlen_backend, q):
+                    fused_value = _pack_selected_chunk_kv(
+                        k_chunks, v_chunks, packed_chunk)
+                    k_packed = fused_value[..., :HEAD_DIM]
+                    v_packed = k_packed  # unused by the fused branch
+                else:
+                    k_packed = _pack_selected_chunk_history(k_chunks, packed_chunk)
+                    v_packed = _pack_selected_chunk_history(v_chunks, packed_chunk)
+                kctx, value_ctx = _varlen_attention_contexts(
+                    varlen_backend,
+                    q_packed, k_packed, v_packed,
+                    packed_chunk.cu_seqlens_q, packed_chunk.cu_seqlens_k,
+                    packed_chunk.max_seqlen_q, packed_chunk.max_seqlen_k,
+                    fused_value=fused_value)
+                k_ctx = kctx.view(B, T, N_Q_HEADS, HEAD_DIM)
+                c = value_ctx.view(B, T, N_Q_HEADS, HEAD_DIM)
+        elif ATTN_IMPL in ("auto", "sdpa"):
             kg = self._kv_to_q_heads(torch.cat(k_chunks, dim=1)).transpose(1, 2)
             vg = self._kv_to_q_heads(torch.cat(v_chunks, dim=1)).transpose(1, 2)
             qg = q.transpose(1, 2)
+            chunk_mask = _packed_chunk_mask(
+                attention_layout, packed_chunk.start, packed_chunk.end, z.device)
             with torch.profiler.record_function("loom.attn.sdpa_chunk"):
                 kctx_g, c_g = _attention_contexts_sdpa(
                     qg, kg, vg, attn_mask=chunk_mask, is_causal=chunk_mask is None,
@@ -3837,6 +4812,8 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             k_ctx = kctx_g.transpose(1, 2).contiguous()
             c = c_g.transpose(1, 2).contiguous()
         else:
+            chunk_mask = _packed_chunk_mask(
+                attention_layout, packed_chunk.start, packed_chunk.end, z.device)
             k_ctx, c = _chunk_attention_list(q.contiguous(), k_chunks, v_chunks, chunk_mask)
         return self.o(self._merge_q_heads(c)), q, k_ctx, c, k_new, v_new
 
@@ -4284,7 +5261,7 @@ class Model(nn.Module):
         hist_k: list,
         hist_v: list,
         sub_idx0: int,
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: Optional[Any],
         position_ids: torch.Tensor,
         carry_prev: Optional[torch.Tensor],
         p_in: Optional[torch.Tensor],
@@ -4306,7 +5283,8 @@ class Model(nn.Module):
         hist_v: list,
         sub_idx0: int,
         position_ids: torch.Tensor,
-        chunk_mask: Optional[torch.Tensor],
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
         past_k_chunks: tuple,
         past_v_chunks: tuple,
         phase_trace: Optional[torch.Tensor],
@@ -4318,7 +5296,7 @@ class Model(nn.Module):
         is_last_block: bool,
     ):
         attn_out, q_h, k_ctx_h, c_h, k_new, v_new = block.attn.forward_chunk(
-            h, past_k_chunks, past_v_chunks, position_ids, chunk_mask)
+            h, past_k_chunks, past_v_chunks, position_ids, attention_layout, packed_chunk)
         h, hist_k, hist_v, next_phase_trace, carry_new, p_out = self._block_core(
             block, h, hist_k, hist_v, sub_idx0,
             attn_out, q_h, k_ctx_h, c_h, position_ids,
@@ -4327,7 +5305,8 @@ class Model(nn.Module):
         return h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry_new, p_out
 
     def _run_chunk_stack_impl(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
-                              chunk_mask: Optional[torch.Tensor], layer_states: list,
+                              attention_layout: Optional[PackedAttentionLayout],
+                              packed_chunk: PackedChunkLayout, layer_states: list,
                               accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
                               endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool,
                               replay_tape):
@@ -4348,7 +5327,8 @@ class Model(nn.Module):
             for bi, block in enumerate(self.blocks):
                 ls = layer_states[bi]
                 h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry, p = self._run_block_chunk(
-                    block, h, hist_k, hist_v, 2 * bi, position_ids_chunk, chunk_mask,
+                    block, h, hist_k, hist_v, 2 * bi, position_ids_chunk,
+                    attention_layout, packed_chunk,
                     ls.k_chunks, ls.v_chunks, ls.phase_trace, carry, p,
                     accT_seed, seed_valid, bi == 0, bi == n_blocks - 1)
                 k_new_out.append(k_new)
@@ -4366,7 +5346,8 @@ class Model(nn.Module):
 
     @torch._dynamo.disable
     def _run_chunk_stack(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
-                          chunk_mask: Optional[torch.Tensor], layer_states: list,
+                          attention_layout: Optional[PackedAttentionLayout],
+                          packed_chunk: PackedChunkLayout, layer_states: list,
                           accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
                           endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool):
         """Checkpointed Tria stack is an intentional Dynamo boundary.
@@ -4397,7 +5378,8 @@ class Model(nn.Module):
                 self._run_chunk_stack_impl,
                 h_emb_chunk,
                 position_ids_chunk,
-                chunk_mask,
+                attention_layout,
+                packed_chunk,
                 layer_states,
                 accT_seed,
                 seed_valid,
@@ -4420,7 +5402,7 @@ class Model(nn.Module):
             }
         else:
             flat = self._run_chunk_stack_impl(
-                h_emb_chunk, position_ids_chunk, chunk_mask, layer_states,
+                h_emb_chunk, position_ids_chunk, attention_layout, packed_chunk, layer_states,
                 accT_seed, seed_valid, endpoint_reset, want_endpoint, want_tail,
                 replay_tape)
         h = flat[0]
@@ -4439,7 +5421,7 @@ class Model(nn.Module):
         ]
         return h, endpoint, tail, new_layer_states
 
-    def forward(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+    def forward(self, idx: torch.Tensor, attn_mask: Optional[Any] = None,
                 position_ids: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None, ignore_index: int = -100) -> torch.Tensor:
         """Forward pass. With `labels=None` (default, all existing call sites
@@ -4450,11 +5432,47 @@ class Model(nn.Module):
         B, T = idx.shape
         if T > SEQ_LEN:
             raise ValueError(f"input length {T} exceeds configured seq_len {SEQ_LEN}")
-        # In auto mode the first BF16 SDPA call probes whether efficient attention
-        # is supported. Do that outside checkpointed regions: the probe runs a tiny
-        # backward once, so doing it inside the original checkpoint forward but not
-        # during recompute changes PyTorch's saved-tensor count.
-        if ATTN_SDPA_COMPUTE_DTYPE == "auto" and idx.device.type == "cuda":
+        # Backend probes perform a tiny backward and therefore belong outside
+        # activation-checkpointed regions.  Results are cached per device/dtype.
+        compute_dtype = _attention_compute_dtype(idx.device, self.emb.weight.dtype)
+        if ATTN_IMPL in ("auto", "flash") and idx.device.type == "cuda":
+            _probe_flash_value_fusion(idx.device, compute_dtype)
+            idx_cuda = torch.cuda.current_device() if idx.device.index is None else int(idx.device.index)
+            if not _flash_backend_cache.get((idx_cuda, compute_dtype, HEAD_DIM), False):
+                _probe_te_value_fusion(idx.device, compute_dtype)
+            major, _minor = torch.cuda.get_device_capability(idx_cuda)
+            optimized = (
+                _flash_backend_cache.get((idx_cuda, compute_dtype, HEAD_DIM), False)
+                or _te_backend_cache.get((idx_cuda, compute_dtype, HEAD_DIM), False)
+            )
+            if (
+                optimized
+                and TRIA_CARRY_ENABLED
+                and TRIA_TEMPORAL_ENABLED
+                and not self.ablation
+                and _try_load_cuda_packed_gather() is None
+                and major >= 8
+            ):
+                raise RuntimeError(
+                    "validated varlen attention is available, but the CUDA "
+                    "packed_gather extension failed to build/load; refusing "
+                    "the O(history_chunks) fallback in production mode")
+            if (
+                ATTN_IMPL == "auto"
+                and major >= 8
+                and compute_dtype in (torch.float16, torch.bfloat16)
+                and not optimized
+            ):
+                raise RuntimeError(
+                    "attn_impl='auto' found no validated varlen forward+backward "
+                    f"backend on cuda:{idx_cuda} (SM{major}x, {compute_dtype}). "
+                    "Install a compatible flash-attn or Transformer Engine build; "
+                    "set attn_impl='sdpa' explicitly only if the slow fallback is intentional.")
+        if (
+            ATTN_IMPL in ("auto", "sdpa")
+            and ATTN_SDPA_COMPUTE_DTYPE == "auto"
+            and idx.device.type == "cuda"
+        ):
             _bf16_efficient_sdpa_supported(idx.device)
         if position_ids is None:
             position_ids = torch.arange(T, device=idx.device, dtype=torch.long).view(1, T).expand(B, T)
@@ -4462,19 +5480,31 @@ class Model(nn.Module):
             position_ids = position_ids.to(device=idx.device, dtype=torch.long)
         want_chunked = TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED and not self.ablation
         if not want_chunked:
-            return self._forward_flat(idx, attn_mask=attn_mask, position_ids=position_ids,
+            effective_attn = attn_mask
+            if attn_mask is None and ATTN_IMPL in ("auto", "flash"):
+                effective_attn = _unpacked_attention_layout(B, T, idx.device)
+            return self._forward_flat(idx, attn_mask=effective_attn, position_ids=position_ids,
                                        labels=labels, ignore_index=ignore_index)
         return self._forward_chunked(idx, attn_mask=attn_mask, position_ids=position_ids,
                                       labels=labels, ignore_index=ignore_index)
 
-    def _forward_chunked(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor],
+    def _forward_chunked(self, idx: torch.Tensor, attn_mask: Optional[Any],
                           position_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
                           ignore_index: int = -100) -> torch.Tensor:
         B, T = idx.shape
         W = int(self.cfg.tria_temporal_window)
         h_emb = self.emb(idx)
         document_reset = self._build_tria_document_reset_mask(idx, position_ids)
-        base_causal = torch.ones(T, T, dtype=torch.bool, device=idx.device).tril()
+        if isinstance(attn_mask, PackedAttentionLayout):
+            attention_layout = attn_mask
+        elif attn_mask is None:
+            attention_layout = _unpacked_attention_layout(B, T, idx.device)
+        else:
+            # Compatibility for old callers that still provide a dense
+            # block-causal mask: recover its document layout from the already
+            # authoritative reset positions, then never retain/slice the mask.
+            seg = torch.cumsum(position_ids.eq(0).to(torch.int32), dim=1) - 1
+            attention_layout = packed_layout_from_segment_ids(seg)
         layer_states = [TrainChunkLayerState() for _ in self.blocks]
         carry_token_id = CARRY_TOKEN_ID
         explicit_fire = (
@@ -4505,14 +5535,23 @@ class Model(nn.Module):
         key_positions = []
         temporal_state = None
         s = 0
-        stops = boundary_positions + ([T - 1] if not boundary_positions or boundary_positions[-1] != T - 1 else [])
+        chunk_ranges: List[Tuple[int, int]] = []
+        stops = temporal_chunk_stops(
+            idx, W, self.tria_hard_fire_enabled, carry_token_id,
+            compiling=torch.compiler.is_compiling())
+        precomputed_plans = {
+            (plan.start, plan.end): plan
+            for plan in attention_layout.chunk_plans
+        }
         for bp in stops:
             e = min(bp + 1, T)
             if e <= s:
                 continue
-            chunk_mask = base_causal[s:e, :e].view(1, 1, e - s, e)
-            if attn_mask is not None:
-                chunk_mask = chunk_mask & attn_mask[:, :, s:e, :e]
+            chunk_ranges.append((s, e))
+            packed_chunk = precomputed_plans.get((s, e))
+            if packed_chunk is None:
+                packed_chunk = build_packed_chunk_layout(
+                    attention_layout, s, e, tuple(chunk_ranges))
             seed_valid = None
             temporal_seed = None
             if temporal_state is not None:
@@ -4533,7 +5572,8 @@ class Model(nn.Module):
             # it changes neither loss nor any gradient.
             endpoint_consumed = (e != T) or ((e - 1) in boundary_set)
             h_chunk, temporal_endpoint, depth_tail, layer_states = self._run_chunk_stack(
-                h_emb[:, s:e], position_ids[:, s:e], chunk_mask, layer_states,
+                h_emb[:, s:e], position_ids[:, s:e],
+                attention_layout, packed_chunk, layer_states,
                 temporal_seed, seed_valid, local_reset, endpoint_consumed,
                 self.capture_tria_depth_carry)
             if endpoint_consumed:
@@ -4573,10 +5613,11 @@ class Model(nn.Module):
             self.last_tria_document_carry = None
         a_keys = self.tria_agg(document_keys)
         h_full = self.tria_final_ca(
-            a_keys, h_full, attn_mask, carry_key_mask=valid_keys, key_positions=positions)
+            a_keys, h_full, attention_layout,
+            carry_key_mask=valid_keys, key_positions=positions)
         return self._head_or_loss(h_full, labels, ignore_index)
 
-    def _forward_flat(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+    def _forward_flat(self, idx: torch.Tensor, attn_mask: Optional[Any] = None,
                        position_ids: Optional[torch.Tensor] = None,
                        labels: Optional[torch.Tensor] = None, ignore_index: int = -100) -> torch.Tensor:
         B, T = idx.shape

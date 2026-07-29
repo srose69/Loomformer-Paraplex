@@ -1549,10 +1549,12 @@ class TriaFinalCrossAttention(nn.Module):
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask,
         carry_key_mask: Optional[torch.Tensor] = None,
         key_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        segment_ids = getattr(mask, "segment_ids", None)
+        dense_mask = mask if isinstance(mask, torch.Tensor) else None
         if key_positions is not None:
             B, T = b.shape[:2]
             K = a.shape[1]
@@ -1566,21 +1568,52 @@ class TriaFinalCrossAttention(nn.Module):
             q_pos = torch.arange(T, device=b.device)[:, None]
             allowed = key_positions.to(device=b.device)[None, None, :] <= q_pos[None, :, :]
             allowed = allowed & carry_key_mask[:, None, :]
-            if mask is not None:
-                mask3 = mask.squeeze(1) if mask.dim() == 4 else mask
+            if segment_ids is not None:
+                seg = segment_ids.to(device=b.device)
+                key_seg = seg.index_select(1, key_positions.to(device=b.device))
+                allowed = allowed & (seg[:, :, None] == key_seg[:, None, :])
+            elif dense_mask is not None:
+                mask3 = dense_mask.squeeze(1) if dense_mask.dim() == 4 else dense_mask
                 gather_idx = key_positions.view(1, 1, K).expand(B, T, K)
                 allowed = allowed & torch.gather(mask3, 2, gather_idx)
             attn_out = final_ca_sparse(q, k, v, allowed, self.scale)
         elif carry_key_mask is None:
-            q = self.w_qk(b).unsqueeze(1)
-            k = self.w_qk(a).unsqueeze(1)
-            v = self.w_v(a).unsqueeze(1)
-            if mask is None:
-                attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+            q_full = self.w_qk(b)
+            k_full = self.w_qk(a)
+            v_full = self.w_v(a)
+            if segment_ids is not None:
+                # Compact correctness path for the unusual no-fire-mask case:
+                # documents are separate SDPA calls, never a dense [B,T,T]
+                # block mask.  Normal LoomFormer training uses sparse fired
+                # carry keys and takes the branch above.
+                parts = []
+                for batch_idx in range(b.shape[0]):
+                    row_seg = segment_ids[batch_idx]
+                    _, counts = torch.unique_consecutive(row_seg, return_counts=True)
+                    offset = 0
+                    row_parts = []
+                    for length in counts.detach().to("cpu", torch.int64).tolist():
+                        finish = offset + int(length)
+                        q_doc = q_full[batch_idx:batch_idx + 1, offset:finish].unsqueeze(1)
+                        k_doc = k_full[batch_idx:batch_idx + 1, offset:finish].unsqueeze(1)
+                        v_doc = v_full[batch_idx:batch_idx + 1, offset:finish].unsqueeze(1)
+                        row_parts.append(F.scaled_dot_product_attention(
+                            q_doc, k_doc, v_doc, dropout_p=0.0, is_causal=True).squeeze(1))
+                        offset = finish
+                    parts.append(torch.cat(row_parts, dim=1))
+                attn_out = torch.cat(parts, dim=0)
             else:
-                m = mask if mask.dim() == 4 else mask.unsqueeze(1)
-                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=m, dropout_p=0.0)
-            attn_out = attn_out.squeeze(1)
+                q = q_full.unsqueeze(1)
+                k = k_full.unsqueeze(1)
+                v = v_full.unsqueeze(1)
+                if dense_mask is None:
+                    attn_out = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=0.0, is_causal=True)
+                else:
+                    m = dense_mask if dense_mask.dim() == 4 else dense_mask.unsqueeze(1)
+                    attn_out = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=m, dropout_p=0.0)
+                attn_out = attn_out.squeeze(1)
         else:
             active_positions = carry_key_mask.any(dim=0).nonzero(as_tuple=False).flatten()
             if active_positions.numel() == 0:

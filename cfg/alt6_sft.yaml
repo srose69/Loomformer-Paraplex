@@ -10,10 +10,7 @@
 # MUST match the pretrained checkpoint's geometry, since --init-checkpoint loads
 # weights into a freshly constructed Model(cfg).
 #
-#   python3 loomsft.py --config cfg/alt6_sft.yaml \
-#       --sft-dataset ./sft/FSSFT1/FSSFT1.parquet \
-#       --init-checkpoint alt6/alt6.pt \
-#       --checkpoint alt6_sft.pt
+#   python3 loomsft.py --train --config cfg/alt6_sft.yaml
 #
 # (identical to: python3 loomformer.py --config ... --sft-dataset ... )
 
@@ -31,13 +28,18 @@ eval_batches: 8
 device: cuda:0, cuda:1              # DDP self-launch, same as pretraining
 grad_accum_steps: 1
 grad_checkpointing: true
+fsdp_full_shard: false              # ordinary DDP; 318M model fits L40S/H100 comfortably
+optimizer_zero_shard: false         # keep full optimizer checkpoint/resume support
 fused_linear_ce: true               # chunked LM-head+CE, avoids materializing [N,VOCAB] logits
 amp_dtype: bf16                     # bf16 | fp32 | fp16 | off
 save_every: 1000
 save_initial_checkpoint: false      # true only on a fresh run (rejected with --resume)
+save_final_checkpoint: true
+init_checkpoint: ./alt6/alt6.pt     # fresh SFT initialization; CLI override remains available
+checkpoint: ./alt6_sft.pt           # final checkpoint; runpoints are configured separately
 runpoints_path: ./runpoints
 resume: null
-resume_data_stream: auto            # auto | always | never
+resume_data_stream: auto            # auto | continue | restart
 compile: false
 graph: false
 save_graph: false
@@ -47,14 +49,15 @@ seq_len: 4096                       # must be > 0
 batch_size: 40                      # global batch: must be divisible by the GPU count
 
 # SFT data
-# train_dataset is informational: --sft-dataset sets dataset_format=sft and the
-# path. auto_val_split_pct carves the tail of the tokenized cache into a '#val'
-# split -- unlike pretraining, the dataset file itself is never rewritten.
+# Top-level Parquet shards are streamed and tokenized in bounded batches on
+# every rank: no complete tokenized cache and no multi-GB resident example
+# pool. As in PT, auto_val_split_pct destructively cuts each shard's tail into
+# <train_dataset>/val/val_split.parquet once; subsequent runs reuse that split.
 dataset_format: sft
-train_dataset: ./sft/FSSFT1/FSSFT1.parquet
+train_dataset: ./datasets/sft/FSSFT1
 val_dataset: null
 auto_val_split_pct: 0.5
-dataset_cache: mmap                 # mmap | ram (tokenized example cache)
+dataset_cache: otf                  # bounded Parquet render/tokenize/pack stream
 prefetch_batches: 16
 gpu_prefetch_batches: 4
 

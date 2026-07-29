@@ -278,15 +278,33 @@ def _model_run(
     lf.apply_config(cfg)
     model = lf.Model(cfg).to(tokens.device).train()
     model.load_state_dict(state)
+    runner = lf.maybe_compile(model, tokens.device, enabled=bool(cfg.compile))
     torch.manual_seed(303)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(
-            tokens,
-            attn_mask=layout,
-            position_ids=positions,
-            labels=labels,
+    checkpoint_calls = 0
+    original_checkpoint = torch.utils.checkpoint.checkpoint
+
+    def counted_checkpoint(*args, **kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return original_checkpoint(*args, **kwargs)
+
+    if cfg.grad_checkpointing:
+        torch.utils.checkpoint.checkpoint = counted_checkpoint
+    try:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = runner(
+                tokens,
+                attn_mask=layout,
+                position_ids=positions,
+                labels=labels,
+            )
+        loss.backward()
+    finally:
+        torch.utils.checkpoint.checkpoint = original_checkpoint
+    if cfg.grad_checkpointing and checkpoint_calls == 0:
+        raise AssertionError(
+            "grad_checkpointing=True did not invoke activation checkpointing"
         )
-    loss.backward()
     grads = {
         name: parameter.grad.detach().float().cpu()
         for name, parameter in model.named_parameters()
@@ -295,7 +313,33 @@ def _model_run(
     return loss.detach().float().cpu(), grads
 
 
-def _checkpoint_matrix(device: torch.device, modern: bool) -> None:
+def _compare_model_runs(
+    label: str,
+    actual: Tuple[torch.Tensor, Dict[str, torch.Tensor]],
+    reference: Tuple[torch.Tensor, Dict[str, torch.Tensor]],
+) -> None:
+    _assert_close(
+        actual[0], reference[0], label=f"{label} loss",
+        atol=2e-2, rtol=2e-2,
+    )
+    if actual[1].keys() != reference[1].keys():
+        missing = reference[1].keys() ^ actual[1].keys()
+        raise AssertionError(
+            f"{label}: gradient key mismatch: {sorted(missing)}"
+        )
+    for name in reference[1]:
+        _assert_gradient_close(
+            actual[1][name],
+            reference[1][name],
+            label=f"{label} gradient {name}",
+        )
+
+
+def _checkpoint_matrix(
+    device: torch.device,
+    modern: bool,
+    compile_supported: bool,
+) -> None:
     base_cfg = _config(
         device=str(device),
         attn_impl="sdpa",
@@ -327,19 +371,48 @@ def _checkpoint_matrix(device: torch.device, modern: bool) -> None:
         layout,
         positions,
     )
-    _assert_close(
-        checkpointed[0], eager[0], label="checkpointed model loss",
-        atol=2e-2, rtol=2e-2)
-    if checkpointed[1].keys() != eager[1].keys():
-        missing = eager[1].keys() ^ checkpointed[1].keys()
-        raise AssertionError(f"checkpointing gradient key mismatch: {sorted(missing)}")
-    for name in eager[1]:
-        _assert_gradient_close(
-            checkpointed[1][name],
-            eager[1][name],
-            label=f"checkpointed model gradient {name}",
+    _compare_model_runs("eager checkpoint=on", checkpointed, eager)
+    print(
+        "[gpu-parity] PASS eager checkpoint=off/on forward/backward",
+        flush=True,
+    )
+
+    if compile_supported:
+        compiled = _model_run(
+            replace(base_cfg, compile=True),
+            state,
+            tokens,
+            labels,
+            layout,
+            positions,
         )
-    print("[gpu-parity] PASS activation-checkpoint forward/backward", flush=True)
+        compiled_checkpointed = _model_run(
+            replace(base_cfg, compile=True, grad_checkpointing=True),
+            state,
+            tokens,
+            labels,
+            layout,
+            positions,
+        )
+        _compare_model_runs("compiled checkpoint=off", compiled, eager)
+        _compare_model_runs(
+            "compiled checkpoint=on", compiled_checkpointed, eager
+        )
+        _compare_model_runs(
+            "compiled checkpoint off/on",
+            compiled_checkpointed,
+            compiled,
+        )
+        print(
+            "[gpu-parity] PASS compile checkpoint=off/on "
+            "forward/backward and eager parity",
+            flush=True,
+        )
+    else:
+        print(
+            "[gpu-parity] SKIP compile checkpoint matrix (SM<7)",
+            flush=True,
+        )
 
     if modern:
         varlen = _model_run(
@@ -412,7 +485,7 @@ def main() -> None:
         flush=True,
     )
     _attention_matrix(device, major >= 8)
-    _checkpoint_matrix(device, major >= 8)
+    _checkpoint_matrix(device, major >= 8, major >= 7)
     _incremental_model_parity(device)
     torch.cuda.synchronize(device)
     print(f"[gpu-parity] ALL CASES PASSED on {device}", flush=True)

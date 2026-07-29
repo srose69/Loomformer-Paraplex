@@ -13,9 +13,10 @@ Coverage:
   * PT bin train, checkpoint, runpoint, resume, eval and inference;
   * PT Parquet/OTF train and destructive automatic validation split;
   * SFT Parquet/OTF packing, assistant-only loss, PT initialization,
-    activation checkpointing, checkpoint and resume;
-  * torch.compile + custom-op graph on supported modern CUDA;
-  * PT and SFT DDP on every visible GPU when at least two are available.
+    checkpoint and resume;
+  * activation-checkpoint off/on parity in eager and compiled execution;
+  * torch.compile + custom-op graph with checkpointing off/on on supported CUDA;
+  * PT and SFT DDP with checkpointing off/on on every visible GPU.
 """
 
 from __future__ import annotations
@@ -311,8 +312,8 @@ def _make_pt_bin(work: Path, tokenizer_path: Path) -> Path:
     return path
 
 
-def _make_pt_parquet(work: Path) -> Path:
-    directory = work / "pt_parquet"
+def _make_pt_parquet(work: Path, name: str = "pt_parquet") -> Path:
+    directory = work / name
     directory.mkdir()
     rows = [
         {
@@ -327,8 +328,8 @@ def _make_pt_parquet(work: Path) -> Path:
     return directory
 
 
-def _make_sft_parquet(work: Path) -> Path:
-    directory = work / "sft_parquet"
+def _make_sft_parquet(work: Path, name: str = "sft_parquet") -> Path:
+    directory = work / name
     directory.mkdir()
     rows = []
     for index in range(40):
@@ -400,6 +401,7 @@ def _device_profile(requested: str) -> Dict[str, Any]:
             "modern": False,
             "all_modern": False,
             "compile": False,
+            "all_compile": False,
             "gpu_count": 0,
             "devices": [],
         }
@@ -422,6 +424,7 @@ def _device_profile(requested: str) -> Dict[str, Any]:
         "modern": major >= 8,
         "all_modern": all(item["capability"][0] >= 8 for item in devices),
         "compile": major >= 7,
+        "all_compile": all(item["capability"][0] >= 7 for item in devices),
         "gpu_count": torch.cuda.device_count(),
         "devices": devices,
     }
@@ -645,9 +648,6 @@ def run_matrix(args: argparse.Namespace) -> None:
         )
 
         pt_bin = _make_pt_bin(work, tokenizer)
-        pt_parquet = _make_pt_parquet(work)
-        sft_parquet = _make_sft_parquet(work)
-
         common = {
             "device": profile["device"],
             "amp_dtype": profile["amp_dtype"],
@@ -687,7 +687,7 @@ def run_matrix(args: argparse.Namespace) -> None:
             return
 
         _run(
-            "PT bin: two optimizer steps",
+            "PT bin: two optimizer steps [checkpointing=off, compile=off]",
             [sys.executable, "loomformer.py", "--train", "--config", pt_config],
         )
         pt_digest = _check_checkpoint(
@@ -767,63 +767,136 @@ def run_matrix(args: argparse.Namespace) -> None:
             ],
         )
 
-        otf_checkpoint = work / "pt_otf.pt"
-        otf_config = _write_config(
+        eager_checkpoint = work / "pt_eager_checkpointed.pt"
+        eager_checkpoint_config = _write_config(
             PT_TEMPLATE,
-            work / "pt_otf.yaml",
+            work / "pt_eager_checkpointed.yaml",
             {
                 **common,
                 "steps": 1,
                 "grad_accum_steps": 1,
                 "save_every": 0,
                 "save_initial_checkpoint": False,
-                "train_dataset": str(pt_parquet),
-                "dataset_format": "parquet",
-                "dataset_cache": "ram",
-                "auto_val_split_pct": 20.0,
-                "checkpoint": str(otf_checkpoint),
+                "train_dataset": str(pt_bin),
+                "dataset_format": "bin",
+                "dataset_cache": "mmap",
+                "checkpoint": str(eager_checkpoint),
                 "runpoints_path": None,
-                # Exercise Dynamo/custom-op integration where the architecture
-                # supports torch.compile; Pascal intentionally stays eager.
-                "compile": bool(profile["compile"]),
-                "graph": bool(profile["compile"]),
-                "attn_impl": "auto" if profile["modern"] else "sdpa",
+                "grad_checkpointing": True,
+                "compile": False,
+                "graph": False,
             },
         )
         _run(
-            "PT Parquet OTF + auto-val + compile/custom-op graph",
-            [sys.executable, "loomformer.py", "--train", "--config", otf_config],
+            "PT bin: optimizer step [checkpointing=on, compile=off]",
+            [
+                sys.executable,
+                "loomformer.py",
+                "--train",
+                "--config",
+                eager_checkpoint_config,
+            ],
         )
-        _check_checkpoint(otf_checkpoint, step=1, optimizer="adamw")
-        _assert_split(pt_parquet, 30)
+        _check_checkpoint(eager_checkpoint, step=1, optimizer="adamw")
 
-        sft_checkpoint = work / "sft.pt"
-        sft_config = _write_config(
-            SFT_TEMPLATE,
-            work / "sft.yaml",
-            {
-                **common,
-                "train_dataset": str(sft_parquet),
-                "init_checkpoint": str(pt_checkpoint),
-                "checkpoint": str(sft_checkpoint),
-                "attn_impl": "auto" if profile["modern"] else "sdpa",
-                "compile": bool(profile["compile"]),
-                "graph": bool(profile["compile"]),
-            },
-        )
-        _run(
-            "SFT Parquet OTF: PT init, packed masks and activation checkpointing",
-            [sys.executable, "loomformer.py", "--train", "--config", sft_config],
-        )
-        sft_digest = _check_checkpoint(
-            sft_checkpoint, step=2, optimizer="atom"
-        )
-        if sft_digest == pt_digest:
-            raise AssertionError("SFT did not change pretrained model weights")
-        _assert_split(sft_parquet, 40)
+        # Each destructive split gets its own corpus. Reusing one would turn
+        # the second matrix cell into a materially different dataset.
+        for checkpointing in (False, True):
+            suffix = "on" if checkpointing else "off"
+            pt_parquet = _make_pt_parquet(work, f"pt_parquet_ckpt_{suffix}")
+            otf_checkpoint = work / f"pt_otf_ckpt_{suffix}.pt"
+            otf_config = _write_config(
+                PT_TEMPLATE,
+                work / f"pt_otf_ckpt_{suffix}.yaml",
+                {
+                    **common,
+                    "steps": 1,
+                    "grad_accum_steps": 1,
+                    "save_every": 0,
+                    "save_initial_checkpoint": False,
+                    "train_dataset": str(pt_parquet),
+                    "dataset_format": "parquet",
+                    "dataset_cache": "ram",
+                    "auto_val_split_pct": 20.0,
+                    "checkpoint": str(otf_checkpoint),
+                    "runpoints_path": None,
+                    "grad_checkpointing": checkpointing,
+                    # Exercise Dynamo/custom-op integration where the
+                    # architecture supports torch.compile; Pascal stays eager.
+                    "compile": bool(profile["compile"]),
+                    "graph": bool(profile["compile"]),
+                    "attn_impl": "auto" if profile["modern"] else "sdpa",
+                },
+            )
+            _run(
+                "PT Parquet OTF + auto-val + compile/custom-op graph "
+                f"[checkpointing={suffix}]",
+                [
+                    sys.executable,
+                    "loomformer.py",
+                    "--train",
+                    "--config",
+                    otf_config,
+                ],
+            )
+            _check_checkpoint(otf_checkpoint, step=1, optimizer="adamw")
+            _assert_split(pt_parquet, 30)
+
+        sft_config: Optional[Path] = None
+        sft_checkpoint: Optional[Path] = None
+        sft_digest: Optional[str] = None
+        for checkpointing in (False, True):
+            suffix = "on" if checkpointing else "off"
+            sft_parquet = _make_sft_parquet(work, f"sft_parquet_ckpt_{suffix}")
+            case_checkpoint = work / f"sft_ckpt_{suffix}.pt"
+            case_config = _write_config(
+                SFT_TEMPLATE,
+                work / f"sft_ckpt_{suffix}.yaml",
+                {
+                    **common,
+                    "steps": 2 if checkpointing else 1,
+                    "train_dataset": str(sft_parquet),
+                    "init_checkpoint": str(pt_checkpoint),
+                    "checkpoint": str(case_checkpoint),
+                    "grad_checkpointing": checkpointing,
+                    "attn_impl": "auto" if profile["modern"] else "sdpa",
+                    "compile": bool(profile["compile"]),
+                    "graph": bool(profile["compile"]),
+                },
+            )
+            _run(
+                "SFT Parquet OTF: PT init, packed masks, "
+                "compile/custom-op graph "
+                f"[checkpointing={suffix}]",
+                [
+                    sys.executable,
+                    "loomformer.py",
+                    "--train",
+                    "--config",
+                    case_config,
+                ],
+            )
+            case_digest = _check_checkpoint(
+                case_checkpoint,
+                step=2 if checkpointing else 1,
+                optimizer="atom",
+            )
+            if case_digest == pt_digest:
+                raise AssertionError(
+                    f"SFT checkpointing={suffix} did not change pretrained "
+                    "model weights"
+                )
+            _assert_split(sft_parquet, 40)
+            if checkpointing:
+                sft_config = case_config
+                sft_checkpoint = case_checkpoint
+                sft_digest = case_digest
+
+        if sft_config is None or sft_checkpoint is None or sft_digest is None:
+            raise AssertionError("checkpointed SFT matrix cell was not created")
 
         _run(
-            "SFT checkpoint resume",
+            "SFT checkpoint resume [checkpointing=on]",
             [
                 sys.executable,
                 "loomformer.py",
@@ -846,50 +919,102 @@ def run_matrix(args: argparse.Namespace) -> None:
         gpu_count = int(profile["gpu_count"])
         if gpu_count >= 2 and not args.no_ddp:
             ddp_device = "cudas"
-            ddp_pt_checkpoint = work / "pt_ddp.pt"
-            ddp_pt_config = _write_config(
-                PT_TEMPLATE,
-                work / "pt_ddp.yaml",
-                {
-                    **common,
-                    "device": ddp_device,
-                    "batch_size": gpu_count,
-                    "steps": 1,
-                    "grad_accum_steps": 1,
-                    "save_every": 0,
-                    "save_initial_checkpoint": False,
-                    "checkpoint": str(ddp_pt_checkpoint),
-                    "train_dataset": str(pt_bin),
-                    "runpoints_path": None,
-                },
+            compile_modes = (
+                (False, True) if profile["all_compile"] else (False,)
             )
-            _run(
-                f"PT DDP across all {gpu_count} visible GPUs",
-                [sys.executable, "loomformer.py", "--train", "--config", ddp_pt_config],
-            )
-            _check_checkpoint(ddp_pt_checkpoint, step=1, optimizer="adamw")
+            for compile_enabled in compile_modes:
+                compile_suffix = "on" if compile_enabled else "off"
+                for checkpointing in (False, True):
+                    checkpoint_suffix = "on" if checkpointing else "off"
+                    case_suffix = (
+                        f"compile_{compile_suffix}_ckpt_{checkpoint_suffix}"
+                    )
+                    ddp_pt_checkpoint = work / f"pt_ddp_{case_suffix}.pt"
+                    ddp_pt_config = _write_config(
+                        PT_TEMPLATE,
+                        work / f"pt_ddp_{case_suffix}.yaml",
+                        {
+                            **common,
+                            "device": ddp_device,
+                            "batch_size": gpu_count,
+                            "steps": 1,
+                            "grad_accum_steps": 1,
+                            "save_every": 0,
+                            "save_initial_checkpoint": False,
+                            "checkpoint": str(ddp_pt_checkpoint),
+                            "train_dataset": str(pt_bin),
+                            "runpoints_path": None,
+                            "grad_checkpointing": checkpointing,
+                            "compile": compile_enabled,
+                            "graph": compile_enabled,
+                            "attn_impl": (
+                                "auto" if profile["all_modern"] else "sdpa"
+                            ),
+                        },
+                    )
+                    _run(
+                        f"PT DDP across all {gpu_count} visible GPUs "
+                        f"[compile={compile_suffix}, "
+                        f"checkpointing={checkpoint_suffix}]",
+                        [
+                            sys.executable,
+                            "loomformer.py",
+                            "--train",
+                            "--config",
+                            ddp_pt_config,
+                        ],
+                    )
+                    _check_checkpoint(
+                        ddp_pt_checkpoint, step=1, optimizer="adamw"
+                    )
 
-            ddp_sft_checkpoint = work / "sft_ddp.pt"
-            ddp_sft_config = _write_config(
-                SFT_TEMPLATE,
-                work / "sft_ddp.yaml",
-                {
-                    **common,
-                    "device": ddp_device,
-                    "batch_size": gpu_count,
-                    "steps": 1,
-                    "train_dataset": str(sft_parquet),
-                    "auto_val_split_pct": 20.0,
-                    "init_checkpoint": str(pt_checkpoint),
-                    "checkpoint": str(ddp_sft_checkpoint),
-                    "attn_impl": "auto" if profile["all_modern"] else "sdpa",
-                },
-            )
-            _run(
-                f"SFT DDP across all {gpu_count} visible GPUs",
-                [sys.executable, "loomformer.py", "--train", "--config", ddp_sft_config],
-            )
-            _check_checkpoint(ddp_sft_checkpoint, step=1, optimizer="atom")
+            for compile_enabled in compile_modes:
+                compile_suffix = "on" if compile_enabled else "off"
+                for checkpointing in (False, True):
+                    checkpoint_suffix = "on" if checkpointing else "off"
+                    case_suffix = (
+                        f"compile_{compile_suffix}_ckpt_{checkpoint_suffix}"
+                    )
+                    ddp_sft_dataset = _make_sft_parquet(
+                        work, f"sft_ddp_parquet_{case_suffix}"
+                    )
+                    ddp_sft_checkpoint = work / f"sft_ddp_{case_suffix}.pt"
+                    ddp_sft_config = _write_config(
+                        SFT_TEMPLATE,
+                        work / f"sft_ddp_{case_suffix}.yaml",
+                        {
+                            **common,
+                            "device": ddp_device,
+                            "batch_size": gpu_count,
+                            "steps": 1,
+                            "train_dataset": str(ddp_sft_dataset),
+                            "auto_val_split_pct": 20.0,
+                            "init_checkpoint": str(pt_checkpoint),
+                            "checkpoint": str(ddp_sft_checkpoint),
+                            "grad_checkpointing": checkpointing,
+                            "compile": compile_enabled,
+                            "graph": compile_enabled,
+                            "attn_impl": (
+                                "auto" if profile["all_modern"] else "sdpa"
+                            ),
+                        },
+                    )
+                    _run(
+                        f"SFT DDP across all {gpu_count} visible GPUs "
+                        f"[compile={compile_suffix}, "
+                        f"checkpointing={checkpoint_suffix}]",
+                        [
+                            sys.executable,
+                            "loomformer.py",
+                            "--train",
+                            "--config",
+                            ddp_sft_config,
+                        ],
+                    )
+                    _check_checkpoint(
+                        ddp_sft_checkpoint, step=1, optimizer="atom"
+                    )
+                    _assert_split(ddp_sft_dataset, 40)
         else:
             _status("SKIP", "DDP cases (fewer than two GPUs or --no-ddp)")
 

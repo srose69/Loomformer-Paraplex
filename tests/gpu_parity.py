@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import loomformer as lf
+import graph_helper
 import tria
 
 
@@ -281,6 +282,34 @@ def _model_run(
     lf.apply_config(cfg)
     model = lf.Model(cfg).to(tokens.device).train()
     model.load_state_dict(state)
+    if cfg.graph and not graph_helper.is_finalized():
+        for _attempt in range(1, 6):
+            torch.manual_seed(303)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                capture_loss = model(
+                    tokens,
+                    attn_mask=layout,
+                    position_ids=positions,
+                    labels=labels,
+                )
+            capture_loss.backward()
+            model.zero_grad(set_to_none=True)
+            registered_now = graph_helper.finalize_registration(lf, tria)
+            del capture_loss
+            if graph_helper.is_finalized() or registered_now == 0:
+                break
+        _registered, missing, _inactive = (
+            graph_helper.registration_summary()
+        )
+        if missing:
+            raise AssertionError(
+                "compiled parity custom-op registration missing: "
+                + ", ".join(missing)
+            )
+        # Capture is an instrumentation pass, not a training iteration.
+        # Restore mutable buffers (notably secant anchors) and parameters.
+        model.load_state_dict(state)
+        model.zero_grad(set_to_none=True)
     runner = lf.maybe_compile(model, tokens.device, enabled=bool(cfg.compile))
     torch.manual_seed(303)
     checkpoint_calls = 0
@@ -338,7 +367,7 @@ def _compare_model_runs(
         )
 
 
-def _run_with_production_kernel_coverage(run, *, modern: bool):
+def _run_with_production_kernel_coverage(run):
     """Require the real chunked PT fused paths to execute fwd and bwd."""
     classes = {
         "paraplex": lf._ParaplexFused,
@@ -351,8 +380,6 @@ def _run_with_production_kernel_coverage(run, *, modern: bool):
         "slot_attention_pool": tria._SlotAttentionPoolFused,
         "final_ca_sparse": tria._FinalCASparseFused,
     }
-    if modern:
-        classes["packed_gather_pair"] = lf._PackedGatherPair
     counts = {
         name: {"forward": 0, "backward": 0}
         for name in classes
@@ -398,6 +425,55 @@ def _run_with_production_kernel_coverage(run, *, modern: bool):
     return result
 
 
+def _run_with_packed_gather_coverage(run):
+    """Require the selected varlen history packer to run fwd and bwd."""
+    classes = {
+        "single": lf._PackedGather,
+        "pair": lf._PackedGatherPair,
+    }
+    counts = {
+        name: {"forward": 0, "backward": 0}
+        for name in classes
+    }
+    originals = {}
+    for name, cls in classes.items():
+        original_forward = cls.forward
+        original_backward = cls.backward
+        originals[cls] = (original_forward, original_backward)
+
+        def forward(*args, _name=name, _original=original_forward):
+            counts[_name]["forward"] += 1
+            return _original(*args)
+
+        def backward(*args, _name=name, _original=original_backward):
+            counts[_name]["backward"] += 1
+            return _original(*args)
+
+        cls.forward = staticmethod(forward)
+        cls.backward = staticmethod(backward)
+    try:
+        result = run()
+    finally:
+        for cls, (forward, backward) in originals.items():
+            cls.forward = staticmethod(forward)
+            cls.backward = staticmethod(backward)
+    forward_count = sum(item["forward"] for item in counts.values())
+    backward_count = sum(item["backward"] for item in counts.values())
+    if forward_count == 0 or backward_count == 0:
+        raise AssertionError(
+            "varlen packed-gather coverage missing: "
+            f"single={counts['single']}, pair={counts['pair']}"
+        )
+    selected = ", ".join(
+        name for name, item in counts.items() if item["forward"]
+    )
+    print(
+        f"[gpu-parity] PASS varlen packed-gather fwd/bwd ({selected})",
+        flush=True,
+    )
+    return result
+
+
 def _checkpoint_matrix(
     device: torch.device,
     modern: bool,
@@ -427,8 +503,7 @@ def _checkpoint_matrix(
     eager = _run_with_production_kernel_coverage(
         lambda: _model_run(
             base_cfg, state, tokens, labels, layout, positions
-        ),
-        modern=modern,
+        )
     )
     checkpointed = _model_run(
         replace(base_cfg, grad_checkpointing=True),
@@ -446,7 +521,7 @@ def _checkpoint_matrix(
 
     if compile_supported:
         compiled = _model_run(
-            replace(base_cfg, compile=True),
+            replace(base_cfg, compile=True, graph=True),
             state,
             tokens,
             labels,
@@ -454,7 +529,12 @@ def _checkpoint_matrix(
             positions,
         )
         compiled_checkpointed = _model_run(
-            replace(base_cfg, compile=True, grad_checkpointing=True),
+            replace(
+                base_cfg,
+                compile=True,
+                graph=True,
+                grad_checkpointing=True,
+            ),
             state,
             tokens,
             labels,
@@ -482,13 +562,15 @@ def _checkpoint_matrix(
         )
 
     if modern:
-        varlen = _model_run(
-            replace(base_cfg, attn_impl="flash"),
-            state,
-            tokens,
-            labels,
-            layout,
-            positions,
+        varlen = _run_with_packed_gather_coverage(
+            lambda: _model_run(
+                replace(base_cfg, attn_impl="flash"),
+                state,
+                tokens,
+                labels,
+                layout,
+                positions,
+            )
         )
         _assert_close(
             varlen[0], eager[0], label="varlen model loss",

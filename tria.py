@@ -878,6 +878,7 @@ def tria_init_seed_reference(
     return _local_normalize(pre)
 
 
+@torch._dynamo.disable
 def tria_init_seed(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor,
     seed: torch.Tensor, seed_valid: torch.Tensor, axis: int = 0,
@@ -898,6 +899,7 @@ def tria_init_seed(
     return _capture_depth_output(tria_init_seed_reference(r, i, o, seed, valid, axis, alpha))
 
 
+@torch._dynamo.disable
 def tria_init_seed_and_gate(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor,
     seed: torch.Tensor, seed_valid: torch.Tensor, w: torch.Tensor, axis: int = 0,
@@ -921,6 +923,7 @@ def tria_init_seed_and_gate(
     return _capture_depth_output(carry), (tria_slots(carry) * w).sum(dim=-1)
 
 
+@torch._dynamo.disable
 def tria_step(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor, carry_prev: torch.Tensor,
     axis: int = 0, alpha: Optional[float] = None,
@@ -978,6 +981,7 @@ def tria_init_and_gate(
     return _capture_depth_output(carry_1), p_out
 
 
+@torch._dynamo.disable
 def tria_step_and_gate(
     r: torch.Tensor, i: torch.Tensor, o: torch.Tensor, carry_prev: torch.Tensor,
     w: torch.Tensor, axis: int = 0, alpha: Optional[float] = None,
@@ -1157,6 +1161,7 @@ def temporal_carry_endpoint_reference(
     return state
 
 
+@torch._dynamo.disable
 def temporal_carry_endpoint(
     depth_carry: torch.Tensor,
     reset_mask: torch.Tensor,

@@ -204,9 +204,9 @@ def set_conditionally_required(op_name: str, required: bool) -> None:
 def set_runtime_not_required(op_names: Sequence[str]) -> None:
     """Mark ops hidden behind an intentional Dynamo-disabled region.
 
-    LoomFormer's non-reentrant activation-checkpoint stack is such a region.
-    The ordinary non-checkpointed temporal stack remains visible to Dynamo
-    and its active CUDA ops are required to register.
+    LoomFormer's temporal depth-replay stack is such a region. Its Python/TLS
+    tape ordering is required by both ordinary and activation-checkpointed
+    backward and cannot be represented as implicit state in a compiled graph.
     """
     global _RUNTIME_NOT_REQUIRED
     known = {op_name for op_name, _, _, _ in _KERNELS}

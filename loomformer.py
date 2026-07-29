@@ -230,6 +230,15 @@ def amp_autocast(dev: torch.device):
     raise ValueError(f"amp_dtype must be fp32/off, bf16, or fp16; got {amp!r}")
 
 
+def _profile_region(name: str):
+    # record_function is useful in eager profiling but Dynamo explicitly
+    # ignores it and emits a warning. Keep compiled graphs free of profiler
+    # marker objects and retain the markers for normal profiler runs.
+    if torch.compiler.is_compiling():
+        return contextlib.nullcontext()
+    return torch.profiler.record_function(name)
+
+
 @dataclass
 class Config:
     # tokenizer / data
@@ -1267,13 +1276,13 @@ def apply_config(cfg: Config) -> None:
                 {"phase_sin", "phase_sin_secant", "pvpowlu", "beta_space"}
             )
         graph_helper.set_shadowed_by_fused(shadowed_by_fused)
-        # Only the non-reentrant activation-checkpoint region is deliberately
-        # opaque to Dynamo. A normal PT/SFT forward must capture and register
-        # every active fused op; treating the whole temporal stack as
-        # "not required" hid shallow-test coverage holes.
-        checkpoint_stack_is_eager = bool(
+        # Depth replay is a Python/TLS side effect: record_depth_replay()
+        # establishes ordering consumed later by Tria backward. Dynamo cannot
+        # represent that hidden state and may otherwise run a registered Tria
+        # op without its preceding tape record. Keep the replay-sensitive
+        # temporal stack eager for both normal and checkpointed training.
+        replay_stack_is_eager = bool(
             getattr(cfg, "compile", False)
-            and bool(getattr(cfg, "grad_checkpointing", False))
             and TRIA_CARRY_ENABLED
             and TRIA_TEMPORAL_ENABLED
         )
@@ -1283,7 +1292,7 @@ def apply_config(cfg: Config) -> None:
                 "gate_slot_mix", "temporal_carry", "phase_sin",
                 "phase_sin_secant", "pvpowlu", "depth_attn", "beta_space",
             }
-            if checkpoint_stack_is_eager
+            if replay_stack_is_eager
             else set()
         )
         graph_helper.install_capture_hooks(sys.modules[__name__], tria)
@@ -2867,6 +2876,7 @@ class _DepthAttnListFused(torch.autograd.Function):
         return (gq, None, *gk_list, *gv_list)
 
 
+@torch._dynamo.disable
 def depth_attn_online_list_cuda(q: torch.Tensor, hist_k, hist_v) -> Optional[torch.Tensor]:
     if not hist_k:
         return None
@@ -3434,6 +3444,7 @@ class ParaplexFFN(nn.Module):
         r_all = torch.cat((q_all, kctx_all, c_all, u, d_all), dim=-1)        # (B,T,5N)
         return F.linear(r_all, self._dense_imag_weight())                    # один dense GEMM
 
+    @torch._dynamo.disable
     def _fused_paraplex(
         self, p_real: torch.Tensor, gate_src: torch.Tensor, u: torch.Tensor, q_h: torch.Tensor,
         k_ctx_h: torch.Tensor, c_h: torch.Tensor, d_h: torch.Tensor,
@@ -4208,6 +4219,7 @@ class _PackedGatherPair(torch.autograd.Function):
         return (None, None, None, None, *grads)
 
 
+@torch._dynamo.disable
 def _pack_selected_chunk_history(
     chunks: Tuple[torch.Tensor, ...],
     packed: PackedChunkLayout,
@@ -4240,6 +4252,7 @@ def _pack_selected_chunk_history(
     return document_major
 
 
+@torch._dynamo.disable
 def _pack_selected_chunk_kv(
     k_chunks: Tuple[torch.Tensor, ...],
     v_chunks: Tuple[torch.Tensor, ...],
@@ -4365,7 +4378,7 @@ def _attention_contexts_sdpa(qg: torch.Tensor, kg: torch.Tensor, vg: torch.Tenso
         else contextlib.nullcontext()
     )
     if ATTN_SDPA_VALUE_FUSION:
-        with torch.profiler.record_function(cat_label):
+        with _profile_region(cat_label):
             kv = torch.cat((k_sdpa, v_sdpa), dim=-1)
         with ac:
             if ATTN_SDPA_RECOMPUTE_BACKWARD:
@@ -4592,7 +4605,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
                 "tensors, and compact causal layout metadata")
 
         if varlen_backend is not None:
-            with torch.profiler.record_function(f"loom.attn.{varlen_backend}_varlen_flat"):
+            with _profile_region(f"loom.attn.{varlen_backend}_varlen_flat"):
                 q_flat = q.reshape(B * T, N_Q_HEADS, HEAD_DIM)
                 k_flat = k_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
                 v_flat = v_compact.reshape(B * T, N_KV_HEADS, HEAD_DIM)
@@ -4610,7 +4623,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
                 k_ctx = kctx_flat.view(B, T, N_Q_HEADS, HEAD_DIM)
                 c = c_flat.view(B, T, N_Q_HEADS, HEAD_DIM)
         elif packed is not None and ATTN_IMPL != "manual":
-            with torch.profiler.record_function("loom.attn.sdpa_packed_fallback"):
+            with _profile_region("loom.attn.sdpa_packed_fallback"):
                 k_ctx, c = _attention_contexts_packed_sdpa(
                     q, k_compact, v_compact, packed)
         elif ATTN_IMPL in ("auto", "sdpa"):
@@ -4620,7 +4633,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             kg = k.transpose(1, 2)
             vg = v.transpose(1, 2)
             dense_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
-            with torch.profiler.record_function("loom.attn.sdpa_flat"):
+            with _profile_region("loom.attn.sdpa_flat"):
                 kctx_g, c_g = _attention_contexts_sdpa(
                     qg, kg, vg, attn_mask=dense_mask, is_causal=dense_mask is None,
                     cat_label="loom.attn.cat_kv_value_flat")
@@ -4902,7 +4915,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
                 "attn_impl='flash' requires a validated FlashAttention or "
                 "Transformer Engine varlen forward+backward backend")
         if varlen_backend is not None:
-            with torch.profiler.record_function(f"loom.attn.{varlen_backend}_varlen_chunk"):
+            with _profile_region(f"loom.attn.{varlen_backend}_varlen_chunk"):
                 q_packed = q.reshape(B * T, N_Q_HEADS, HEAD_DIM)
                 fused_value = None
                 if _varlen_value_fusion_enabled(varlen_backend, q):
@@ -4927,7 +4940,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             qg = q.transpose(1, 2)
             chunk_mask = _packed_chunk_mask(
                 attention_layout, packed_chunk.start, packed_chunk.end, z.device)
-            with torch.profiler.record_function("loom.attn.sdpa_chunk"):
+            with _profile_region("loom.attn.sdpa_chunk"):
                 kctx_g, c_g = _attention_contexts_sdpa(
                     qg, kg, vg, attn_mask=chunk_mask, is_causal=chunk_mask is None,
                     cat_label="loom.attn.cat_kv_value_chunk")
@@ -5531,6 +5544,7 @@ class Model(nn.Module):
         }
         return flat
 
+    @torch._dynamo.disable
     def _run_chunk_stack(
         self,
         h_emb_chunk: torch.Tensor,
@@ -5544,7 +5558,7 @@ class Model(nn.Module):
         want_endpoint: bool,
         want_tail: bool,
     ):
-        """Run one temporal stack, compiling the non-checkpointed tensor path."""
+        """Run the replay-sensitive temporal stack as one eager island."""
         n_blocks = len(self.blocks)
         if GRAD_CHECKPOINTING and self.training:
             flat = self._run_chunk_stack_checkpointed(

@@ -37,6 +37,8 @@ import pyarrow.parquet as pq
 import torch
 import yaml
 
+from synthetic_tokenizer import build_synthetic_bpe
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
@@ -49,14 +51,27 @@ def _banner(label: str) -> None:
     print(f"\n{bar}\n[matrix] {label}\n{bar}", flush=True)
 
 
-def _run(label: str, argv: Iterable[object], *, timeout: int = 1800) -> None:
+def _run(
+    label: str,
+    argv: Iterable[object],
+    *,
+    timeout: int = 1800,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> None:
     command = [str(item) for item in argv]
     _banner(label)
     print("[matrix] $ " + " ".join(command), flush=True)
     started = time.monotonic()
     env = os.environ.copy()
+    # setup.sh invokes the venv interpreter by absolute path without
+    # activating it. Keep sibling console tools such as ninja visible to
+    # PyTorch's C++/CUDA extension loader in every matrix subprocess.
+    interpreter_bin = str(Path(sys.executable).absolute().parent)
+    env["PATH"] = interpreter_bin + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("NO_COLOR", "1")
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         command,
         cwd=ROOT,
@@ -93,30 +108,13 @@ def _write_config(
 
 
 def _make_tokenizer(work: Path) -> tuple[Path, int]:
-    raw = work / "tokenizer_corpus"
-    raw.mkdir()
-    text = (
-        "LoomFormer synthetic corpus. The assistant answers carefully. "
-        "Tokens cross document boundaries and exercise causal packing. "
-        "<think>reason</think> <tool_call>call</tool_call> "
-    )
-    (raw / "corpus.txt").write_text((text + "\n") * 128, encoding="utf-8")
     tokenizer = work / "tokenizer.json"
-
-    # Exercise the repository tokenizer builder, including all chat/control
-    # special tokens needed by SFT.
-    code = (
-        "import loomformer as lf; "
-        f"lf.train_tokenizer({str(raw)!r}, 320, {str(tokenizer)!r})"
+    vocab = build_synthetic_bpe(tokenizer, vocab_size=256)
+    print(
+        f"[matrix] synthetic BPE: vocab={vocab} -> {tokenizer}",
+        flush=True,
     )
-    _run("synthetic tokenizer", [sys.executable, "-c", code])
-
-    from tokenizers import Tokenizer
-
-    vocab = Tokenizer.from_file(str(tokenizer)).get_vocab_size()
-    if vocab < 256:
-        raise AssertionError(f"synthetic tokenizer unexpectedly small: {vocab}")
-    return tokenizer, int(vocab)
+    return tokenizer, vocab
 
 
 def _make_pt_bin(work: Path, tokenizer_path: Path) -> Path:
@@ -354,6 +352,8 @@ def run_matrix(args: argparse.Namespace) -> None:
     print(f"[matrix] workspace: {work}", flush=True)
 
     try:
+        tokenizer, vocab = _make_tokenizer(work)
+
         _run(
             "focused unittest suite",
             [
@@ -367,9 +367,12 @@ def run_matrix(args: argparse.Namespace) -> None:
                 "test_*.py",
                 "-v",
             ],
+            extra_env={
+                "LOOM_TEST_TOKENIZER": str(tokenizer),
+                "LOOM_TEST_VOCAB": str(vocab),
+            },
         )
 
-        tokenizer, vocab = _make_tokenizer(work)
         pt_bin = _make_pt_bin(work, tokenizer)
         pt_parquet = _make_pt_parquet(work)
         sft_parquet = _make_sft_parquet(work)

@@ -39,7 +39,7 @@ prefetch_batches: 2
 gpu_prefetch_batches: 1
 
 tokenizer: null
-vocab: 320
+vocab: 256
 tied_embeddings: true
 doc_reset_attn: true
 train_dataset: null

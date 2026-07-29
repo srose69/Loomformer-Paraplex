@@ -8,9 +8,60 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import loomformer as lf
+from synthetic_tokenizer import SPECIAL_TOKENS, build_synthetic_bpe
 
 
 class SFTOnTheFlyDatasetTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tokenizer_temp = None
+        if list(lf.DEFAULT_SPECIAL_TOKENS) != SPECIAL_TOKENS:
+            raise AssertionError(
+                "synthetic tokenizer special tokens drifted from LoomFormer"
+            )
+        tokenizer = os.environ.get("LOOM_TEST_TOKENIZER")
+        vocab = os.environ.get("LOOM_TEST_VOCAB")
+        if bool(tokenizer) != bool(vocab):
+            raise RuntimeError(
+                "LOOM_TEST_TOKENIZER and LOOM_TEST_VOCAB must be set together"
+            )
+        if tokenizer and vocab:
+            if not os.path.isfile(tokenizer):
+                raise RuntimeError(
+                    f"LOOM_TEST_TOKENIZER does not exist: {tokenizer}"
+                )
+            cls.tokenizer = tokenizer
+            cls.vocab = int(vocab)
+        else:
+            # Keep direct unittest discovery self-contained as well. The
+            # complete matrix supplies the same tokenizer it builds before
+            # launching the suite, so all subsequent PT/SFT cases share it.
+            cls._tokenizer_temp = tempfile.TemporaryDirectory(
+                prefix="loomformer-test-tokenizer."
+            )
+            cls.tokenizer = os.path.join(
+                cls._tokenizer_temp.name, "tokenizer.json"
+            )
+            cls.vocab = build_synthetic_bpe(cls.tokenizer, vocab_size=256)
+
+        from tokenizers import Tokenizer
+
+        stored = Tokenizer.from_file(cls.tokenizer)
+        if stored.get_vocab_size() != cls.vocab:
+            raise AssertionError(
+                f"synthetic tokenizer/config vocab mismatch: "
+                f"{stored.get_vocab_size()} != {cls.vocab}"
+            )
+        if len(stored.encode("q" * 256).ids) <= 16:
+            raise AssertionError(
+                "synthetic BPE no longer exercises the overlength rejection"
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._tokenizer_temp is not None:
+            cls._tokenizer_temp.cleanup()
+
     def test_directory_split_is_destructive_idempotent_and_parquet_only(self):
         rows = [
             {
@@ -37,8 +88,8 @@ class SFTOnTheFlyDatasetTests(unittest.TestCase):
                 train_dataset=dataset,
                 auto_val_split_pct=20.0,
                 dataset_cache="otf",
-                tokenizer="./tokenizers/tokenizer32768.json",
-                vocab=32768,
+                tokenizer=self.tokenizer,
+                vocab=self.vocab,
                 seq_len=64,
                 batch_size=1,
                 prefetch_batches=1,
@@ -101,8 +152,8 @@ class SFTOnTheFlyDatasetTests(unittest.TestCase):
                 dataset_format="sft",
                 train_dataset=dataset,
                 dataset_cache="otf",
-                tokenizer="./tokenizers/tokenizer32768.json",
-                vocab=32768,
+                tokenizer=self.tokenizer,
+                vocab=self.vocab,
                 seq_len=16,
                 batch_size=1,
                 prefetch_batches=1,

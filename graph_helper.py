@@ -192,6 +192,7 @@ _CONDITIONALLY_REQUIRED: Dict[str, bool] = {
     "temporal_carry": False,
 }
 _RUNTIME_NOT_REQUIRED: set = set()
+_SHADOWED_BY_FUSED: set = set()
 
 
 def set_conditionally_required(op_name: str, required: bool) -> None:
@@ -203,10 +204,9 @@ def set_conditionally_required(op_name: str, required: bool) -> None:
 def set_runtime_not_required(op_names: Sequence[str]) -> None:
     """Mark ops hidden behind an intentional Dynamo-disabled region.
 
-    LoomFormer's temporal chunk stack is such a region in both checkpointed
-    and non-checkpointed training. These CUDA ops still execute and receive
-    gradients eagerly; requiring torch.library registration for the outer
-    compiled graph would be a false coverage failure.
+    LoomFormer's non-reentrant activation-checkpoint stack is such a region.
+    The ordinary non-checkpointed temporal stack remains visible to Dynamo
+    and its active CUDA ops are required to register.
     """
     global _RUNTIME_NOT_REQUIRED
     known = {op_name for op_name, _, _, _ in _KERNELS}
@@ -216,6 +216,19 @@ def set_runtime_not_required(op_names: Sequence[str]) -> None:
         raise ValueError(
             f"unknown graph-helper op(s): {', '.join(sorted(unknown))}")
     _RUNTIME_NOT_REQUIRED = set(op_names)
+
+
+def set_shadowed_by_fused(op_names: Sequence[str]) -> None:
+    """Declare decomposed kernels replaced by a production fused operator."""
+    global _SHADOWED_BY_FUSED
+    known = {op_name for op_name, _, _, _ in _KERNELS}
+    known.add(_BETA_SPACE_TARGET[0])
+    unknown = set(op_names) - known
+    if unknown:
+        raise ValueError(
+            f"unknown graph-helper op(s): {', '.join(sorted(unknown))}"
+        )
+    _SHADOWED_BY_FUSED = set(op_names)
 
 # beta_space needs its own capture target (same _wrap_forward_for_capture
 # mechanism as _KERNELS) but a HAND-WRITTEN registrar (_register_beta_space
@@ -325,7 +338,12 @@ def is_finalized() -> bool:
     finalize_registration's docstring)."""
     all_names = [op_name for op_name, _, _, _ in _KERNELS] + [_BETA_SPACE_TARGET[0]]
     inactive_conditional = {n for n, active in _CONDITIONALLY_REQUIRED.items() if not active}
-    not_required = _KNOWN_FALLBACK_ONLY | inactive_conditional | _RUNTIME_NOT_REQUIRED
+    not_required = (
+        _KNOWN_FALLBACK_ONLY
+        | inactive_conditional
+        | _RUNTIME_NOT_REQUIRED
+        | _SHADOWED_BY_FUSED
+    )
     required = [n for n in all_names if n not in not_required]
     return all(n in _registered_ops for n in required)
 
@@ -345,7 +363,11 @@ def registration_summary() -> Tuple[List[str], List[str], List[str]]:
     all_names = [op_name for op_name, _, _, _ in _KERNELS] + [_BETA_SPACE_TARGET[0]]
     inactive_conditional = {n for n, active in _CONDITIONALLY_REQUIRED.items() if not active}
     fallback_set = (
-        _KNOWN_FALLBACK_ONLY | inactive_conditional | _RUNTIME_NOT_REQUIRED)
+        _KNOWN_FALLBACK_ONLY
+        | inactive_conditional
+        | _RUNTIME_NOT_REQUIRED
+        | _SHADOWED_BY_FUSED
+    )
     registered = [n for n in all_names if n in _registered_ops]
     missing = [n for n in all_names if n not in _registered_ops and n not in fallback_set]
     fallback_only = [n for n in all_names if n not in _registered_ops and n in fallback_set]

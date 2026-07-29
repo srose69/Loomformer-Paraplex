@@ -63,7 +63,9 @@ n_kv_heads: 2
 gqa_group_size: null
 hidden: 64
 hidden_mult: null
-layers: 2
+# Four blocks are the minimum that exercises init+gate, repeated step+gate,
+# terminal step, all three Tria axes, and a genuinely growing depth history.
+layers: 4
 final_norm: true
 paraplex_gate_proj: true
 

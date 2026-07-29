@@ -63,7 +63,9 @@ n_kv_heads: 2
 gqa_group_size: null
 hidden: 64
 hidden_mult: null
-layers: 2
+# Match PT and cover init+gate, repeated step+gate, terminal step, every Tria
+# axis, and depth-attention histories beyond the two-block smoke-test case.
+layers: 4
 final_norm: true
 paraplex_gate_proj: true
 

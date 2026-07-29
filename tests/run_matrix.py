@@ -175,6 +175,9 @@ def _run(
     env["PATH"] = interpreter_bin + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("NO_COLOR", "1")
+    # Installation validation is fail-closed: an active graph kernel that was
+    # not actually reached and registered is a failed matrix cell.
+    env.setdefault("LOOM_STRICT_GRAPH_COVERAGE", "1")
     if extra_env:
         env.update(extra_env)
 

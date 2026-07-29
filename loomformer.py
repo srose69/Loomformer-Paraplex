@@ -151,6 +151,18 @@ def ddp_unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tuple[torch.device, bool, int, int, int]:
+    # Calling a venv interpreter by absolute path does not activate the venv
+    # and therefore does not put sibling console tools (notably ninja) on
+    # PATH. PyTorch's extension loader still resolves ninja through PATH even
+    # when the compiled module is already cached. Make direct single-process
+    # and self-launched torchrun invocations equivalent to an activated venv.
+    interpreter_bin = os.path.dirname(os.path.abspath(sys.executable))
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if interpreter_bin not in path_entries:
+        os.environ["PATH"] = os.pathsep.join(
+            [interpreter_bin, *path_entries]
+        )
+
     pref = str(device_pref or "").strip().lower()
     cuda_subset = _parse_cuda_device_list(pref)
     wants_ddp_launch = pref == "cudas" or cuda_subset is not None
@@ -1235,9 +1247,33 @@ def apply_config(cfg: Config) -> None:
         import graph_helper
         graph_helper.set_conditionally_required("phase_sin_secant", PHASE_GRAD_MODE == "secant")
         graph_helper.set_conditionally_required("phase_sin", PHASE_GRAD_MODE == "floor")
-        graph_helper.set_conditionally_required("temporal_carry", TRIA_CARRY_ENABLED and tria.cuda_tria_enabled())
-        temporal_stack_is_eager = bool(
+        # Chunked PT/SFT uses temporal_carry_endpoint(), not the full
+        # temporal_carry() scan (the latter belongs to the flat/calibration
+        # path). Do not claim that the active chunked graph should capture a
+        # kernel it never calls.
+        graph_helper.set_conditionally_required("temporal_carry", False)
+        shadowed_by_fused = {"depth_attn"}
+        if (
+            ACTIVATION == "pvpowlu"
+            and USE_CUDA_BETA_SPACE
+            and USE_CUDA_PHASE_SIN
+            and USE_CUDA_PVPOWLU
+            and _try_load_cuda_beta_space() is not None
+            and _try_load_cuda_paraplex() is not None
+        ):
+            # _ParaplexFused is the production PT/SFT path and subsumes these
+            # decomposed fallback kernels in one forward/backward pair.
+            shadowed_by_fused.update(
+                {"phase_sin", "phase_sin_secant", "pvpowlu", "beta_space"}
+            )
+        graph_helper.set_shadowed_by_fused(shadowed_by_fused)
+        # Only the non-reentrant activation-checkpoint region is deliberately
+        # opaque to Dynamo. A normal PT/SFT forward must capture and register
+        # every active fused op; treating the whole temporal stack as
+        # "not required" hid shallow-test coverage holes.
+        checkpoint_stack_is_eager = bool(
             getattr(cfg, "compile", False)
+            and bool(getattr(cfg, "grad_checkpointing", False))
             and TRIA_CARRY_ENABLED
             and TRIA_TEMPORAL_ENABLED
         )
@@ -1247,7 +1283,7 @@ def apply_config(cfg: Config) -> None:
                 "gate_slot_mix", "temporal_carry", "phase_sin",
                 "phase_sin_secant", "pvpowlu", "depth_attn", "beta_space",
             }
-            if temporal_stack_is_eager
+            if checkpoint_stack_is_eager
             else set()
         )
         graph_helper.install_capture_hooks(sys.modules[__name__], tria)
@@ -5432,12 +5468,20 @@ class Model(nn.Module):
         return (h, endpoint, tail, *k_new_out, *v_new_out, *phase_out)
 
     @torch._dynamo.disable
-    def _run_chunk_stack(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
-                          attention_layout: Optional[PackedAttentionLayout],
-                          packed_chunk: PackedChunkLayout, layer_states: list,
-                          accT_seed: Optional[torch.Tensor], seed_valid: Optional[torch.Tensor],
-                          endpoint_reset: torch.Tensor, want_endpoint: bool, want_tail: bool):
-        """Checkpointed Tria stack is an intentional Dynamo boundary.
+    def _run_chunk_stack_checkpointed(
+        self,
+        h_emb_chunk: torch.Tensor,
+        position_ids_chunk: torch.Tensor,
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
+        layer_states: list,
+        accT_seed: Optional[torch.Tensor],
+        seed_valid: Optional[torch.Tensor],
+        endpoint_reset: torch.Tensor,
+        want_endpoint: bool,
+        want_tail: bool,
+    ):
+        """Run only the activation-checkpointed stack behind a Dynamo boundary.
 
         Its non-reentrant checkpoint uses a per-call mutable replay tape plus
         different original/recompute Python contexts. PyTorch 2.5 Dynamo tries
@@ -5447,22 +5491,63 @@ class Model(nn.Module):
         sensitive region eager; torch.compile resumes on the tensor-only
         regions around it.
         """
-        n_blocks = len(self.blocks)
         # Custom autograd ctx objects are created in the original forward,
         # while r/i/o are regenerated later. Keep the tape identity stable
         # across both passes so those ctx objects see the refilled entries.
         replay_tape = tria.new_depth_replay_tape()
+        holder: dict = {}
+
+        def context_fn():
+            return (
+                contextlib.nullcontext(),
+                _activation_checkpoint_recompute_context(holder),
+            )
+
+        flat = torch.utils.checkpoint.checkpoint(
+            self._run_chunk_stack_impl,
+            h_emb_chunk,
+            position_ids_chunk,
+            attention_layout,
+            packed_chunk,
+            layer_states,
+            accT_seed,
+            seed_valid,
+            endpoint_reset,
+            want_endpoint,
+            want_tail,
+            replay_tape,
+            use_reentrant=False,
+            context_fn=context_fn,
+        )
+        # The original pass populated the stable tape identity, but its
+        # tensors must not outlive the checkpointed region. Recompute resets
+        # and refills the same tape before Tria backward uses it.
+        replay_tape.release_inputs()
+        # Forward updates the secant EMA once. Recompute must use exactly that
+        # per-layer snapshot without updating the persistent buffer again.
+        holder["anchor_overrides"] = {
+            id(block.ffn): block.ffn.beta_anchor.detach().clone()
+            for block in self.blocks
+        }
+        return flat
+
+    def _run_chunk_stack(
+        self,
+        h_emb_chunk: torch.Tensor,
+        position_ids_chunk: torch.Tensor,
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
+        layer_states: list,
+        accT_seed: Optional[torch.Tensor],
+        seed_valid: Optional[torch.Tensor],
+        endpoint_reset: torch.Tensor,
+        want_endpoint: bool,
+        want_tail: bool,
+    ):
+        """Run one temporal stack, compiling the non-checkpointed tensor path."""
+        n_blocks = len(self.blocks)
         if GRAD_CHECKPOINTING and self.training:
-            holder: dict = {}
-
-            def context_fn():
-                return (
-                    contextlib.nullcontext(),
-                    _activation_checkpoint_recompute_context(holder),
-                )
-
-            flat = torch.utils.checkpoint.checkpoint(
-                self._run_chunk_stack_impl,
+            flat = self._run_chunk_stack_checkpointed(
                 h_emb_chunk,
                 position_ids_chunk,
                 attention_layout,
@@ -5473,21 +5558,9 @@ class Model(nn.Module):
                 endpoint_reset,
                 want_endpoint,
                 want_tail,
-                replay_tape,
-                use_reentrant=False,
-                context_fn=context_fn,
             )
-            # The original pass populated the stable tape identity, but its
-            # tensors must not outlive the checkpointed region. Recompute
-            # resets and refills the same tape before Tria backward uses it.
-            replay_tape.release_inputs()
-            # Forward updates the secant EMA once. Recompute must use exactly
-            # that per-layer snapshot without updating the persistent buffer again.
-            holder["anchor_overrides"] = {
-                id(block.ffn): block.ffn.beta_anchor.detach().clone()
-                for block in self.blocks
-            }
         else:
+            replay_tape = tria.new_depth_replay_tape()
             flat = self._run_chunk_stack_impl(
                 h_emb_chunk, position_ids_chunk, attention_layout, packed_chunk, layer_states,
                 accT_seed, seed_valid, endpoint_reset, want_endpoint, want_tail,
@@ -6784,14 +6857,18 @@ async def train_one_async(
         )
         if _fallback_only:
             ddp_print(
-                "[custom-ops] not required in active compiled path: "
+                "[custom-ops] inactive, fused-shadowed, or checkpoint-eager "
+                "in this config: "
                 f"{', '.join(_fallback_only)}"
             )
         if _missing:
-            ddp_print(
-                f"[custom-ops] NOT registered after {_attempt} attempt(s) "
-                f"(worth investigating): {', '.join(_missing)}"
+            message = (
+                f"[custom-ops] NOT registered after {_attempt} attempt(s): "
+                f"{', '.join(_missing)}"
             )
+            if os.environ.get("LOOM_STRICT_GRAPH_COVERAGE") == "1":
+                raise RuntimeError(message)
+            ddp_print(f"{message} (worth investigating)")
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
 
@@ -6800,6 +6877,64 @@ async def train_one_async(
     ddp_barrier(device)
     model_compiled = maybe_compile(
         model_base, device, enabled=bool(getattr(cfg, "compile", False)))
+
+    # Materialize lazy Dynamo/Inductor graphs on the inner model before DDP
+    # installs reducer hooks. A synthetic backward through DDP would become
+    # the reducer's first static-graph iteration; packed layouts from real
+    # data are allowed to differ from this synthetic layout and can otherwise
+    # leave ranks waiting on different reducer hook sequences.
+    if (
+        bool(getattr(cfg, "compile", False))
+        and hasattr(torch, "compile")
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device)[0] >= 7
+    ):
+        checkpoint_note = (
+            "; checkpointed Tria stack stays eager"
+            if GRAD_CHECKPOINTING and TRIA_CARRY_ENABLED
+            and TRIA_TEMPORAL_ENABLED
+            else ""
+        )
+        ddp_print(
+            "[compile] torch.compile warmup -- tracing tensor regions + "
+            f"Inductor codegen{checkpoint_note} (this may take a while)..."
+        )
+        _warm_batch2 = torch.randint(
+            0,
+            VOCAB,
+            (int(cfg.batch_size), SEQ_LEN + 1),
+            device=device,
+            dtype=torch.long,
+        )
+        _wx2, _wy2 = _warm_batch2[:, :-1], _warm_batch2[:, 1:]
+        _warm_pos2, _warm_mask2 = build_doc_reset_state(
+            _wx2, train_eos_id
+        )
+        _compile_t0 = time.time()
+        with amp_autocast(device):
+            _wloss2 = model_compiled(
+                _wx2,
+                attn_mask=_warm_mask2,
+                position_ids=_warm_pos2,
+                labels=_wy2,
+            )
+        _wloss2.backward()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        _compile_s = time.time() - _compile_t0
+        ddp_print(
+            f"[compile] warmup done in {_compile_s:.1f}s -- "
+            "compiled graph cached for subsequent steps"
+        )
+        model_base.zero_grad(set_to_none=True)
+        del _warm_batch2, _wx2, _wy2, _warm_pos2, _warm_mask2, _wloss2
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Do not let a faster rank enter DDP's constructor collectives while
+    # another rank is still compiling its local forward/backward graphs.
+    ddp_barrier(device)
     if ddp_is_distributed() and bool(getattr(cfg, "fsdp_full_shard", False)):
         if bool(getattr(cfg, "optimizer_zero_shard", False)):
             raise ValueError(
@@ -6908,39 +7043,6 @@ async def train_one_async(
         )
         ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
     n_params = count_params(ddp_unwrap_model(model))
-
-    if (
-        bool(getattr(cfg, "compile", False))
-        and hasattr(torch, "compile")
-        and device.type == "cuda"
-        and torch.cuda.get_device_capability(device)[0] >= 7
-    ):
-        checkpoint_note = (
-            "; checkpointed Tria stack stays eager"
-            if GRAD_CHECKPOINTING and TRIA_CARRY_ENABLED and TRIA_TEMPORAL_ENABLED
-            else ""
-        )
-        ddp_print(
-            "[compile] torch.compile warmup -- tracing tensor regions + "
-            f"Inductor codegen{checkpoint_note} (this may take a while)...")
-        _warm_batch2 = torch.randint(0, VOCAB, (int(cfg.batch_size), SEQ_LEN + 1), device=device, dtype=torch.long)
-        _wx2, _wy2 = _warm_batch2[:, :-1], _warm_batch2[:, 1:]
-        _warm_pos2, _warm_mask2 = build_doc_reset_state(_wx2, train_eos_id)
-        _compile_t0 = time.time()
-        with amp_autocast(device):
-            _wloss2 = model(
-                _wx2, attn_mask=_warm_mask2, position_ids=_warm_pos2,
-                labels=_wy2)
-        _wloss2.backward()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        _compile_s = time.time() - _compile_t0
-        ddp_print(f"[compile] warmup done in {_compile_s:.1f}s -- compiled graph cached for subsequent steps")
-        opt.zero_grad(set_to_none=True)
-        del _warm_batch2, _wx2, _wy2, _warm_pos2, _warm_mask2, _wloss2
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     if os.path.abspath(eval_dataset) == os.path.abspath(dataset):
         data_note = f"{train_bpt:.3f} bytes/token"

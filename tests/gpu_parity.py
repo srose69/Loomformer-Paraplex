@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import loomformer as lf
+import tria
 
 
 def _config(
@@ -40,7 +41,9 @@ def _config(
         head_dim=8,
         n_kv_heads=2,
         hidden=64,
-        layers=2,
+        # Two blocks miss the middle step+gate path entirely. Four cover
+        # init+gate, repeated step+gate, terminal step and all Tria axes.
+        layers=4,
         device=device,
         amp_dtype="bf16",
         attn_impl=attn_impl,
@@ -335,6 +338,66 @@ def _compare_model_runs(
         )
 
 
+def _run_with_production_kernel_coverage(run, *, modern: bool):
+    """Require the real chunked PT fused paths to execute fwd and bwd."""
+    classes = {
+        "paraplex": lf._ParaplexFused,
+        "depth_attn_list": lf._DepthAttnListFused,
+        "tria_init_gate": tria._TriaInitAndGateFused,
+        "tria_init_seed_gate": tria._TriaInitSeedAndGateFused,
+        "tria_step_gate": tria._TriaStepAndGateFused,
+        "tria_terminal_step": tria._TriaStepFused,
+        "temporal_endpoint": tria._TemporalCarryEndpointFused,
+        "slot_attention_pool": tria._SlotAttentionPoolFused,
+        "final_ca_sparse": tria._FinalCASparseFused,
+    }
+    if modern:
+        classes["packed_gather_pair"] = lf._PackedGatherPair
+    counts = {
+        name: {"forward": 0, "backward": 0}
+        for name in classes
+    }
+    originals = {}
+    for name, cls in classes.items():
+        original_forward = cls.forward
+        original_backward = cls.backward
+        originals[cls] = (original_forward, original_backward)
+
+        def forward(*args, _name=name, _original=original_forward):
+            counts[_name]["forward"] += 1
+            return _original(*args)
+
+        def backward(*args, _name=name, _original=original_backward):
+            counts[_name]["backward"] += 1
+            return _original(*args)
+
+        cls.forward = staticmethod(forward)
+        cls.backward = staticmethod(backward)
+    try:
+        result = run()
+    finally:
+        for cls, (forward, backward) in originals.items():
+            cls.forward = staticmethod(forward)
+            cls.backward = staticmethod(backward)
+    missing = [
+        f"{name}.{direction}"
+        for name, directions in counts.items()
+        for direction, count in directions.items()
+        if count == 0
+    ]
+    if missing:
+        raise AssertionError(
+            "production fused-kernel coverage missing: "
+            + ", ".join(missing)
+        )
+    print(
+        "[gpu-parity] PASS production fused-kernel fwd/bwd coverage: "
+        + ", ".join(classes),
+        flush=True,
+    )
+    return result
+
+
 def _checkpoint_matrix(
     device: torch.device,
     modern: bool,
@@ -361,8 +424,12 @@ def _checkpoint_matrix(
     layout, positions = _layout(device)
     del seed_model
 
-    eager = _model_run(
-        base_cfg, state, tokens, labels, layout, positions)
+    eager = _run_with_production_kernel_coverage(
+        lambda: _model_run(
+            base_cfg, state, tokens, labels, layout, positions
+        ),
+        modern=modern,
+    )
     checkpointed = _model_run(
         replace(base_cfg, grad_checkpointing=True),
         state,

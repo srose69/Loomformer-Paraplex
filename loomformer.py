@@ -4940,7 +4940,8 @@ class DepthAttn(nn.Module):
             # Match the expected initialization RMS, rather than forcing K/V to
             # unit scale and silently sharpening depth softmax at step zero.
             k = fixed_rms(k, FANIN_GAIN)
-            v = fixed_rms(v, FANIN_GAIN * DEEPNORM_BETA)
+            v_beta = DEEPNORM_BETA if RESIDUAL_INIT == "beta" else 1.0
+            v = fixed_rms(v, FANIN_GAIN * v_beta)
         return k, v
 
     def forward(self, sub_idx: int, hist_k, hist_v) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -5818,6 +5819,9 @@ class Model(nn.Module):
             attn_out, q_h, k_ctx_h, c_h, k_all, v_all = block.attn.step(
                 h, pos_t, cache.k, cache.v, cache.cache_len, kv_runtime=kv_runtime)
             skip, _ = self.depth_attn(sub_idx, hist_k[:, :, :sub_idx + 1], hist_v[:, :, :sub_idx + 1])
+            if RESIDUAL_BRANCH_RMS_CAP is not None:
+                skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
+                attn_out = capped_rms(attn_out, RESIDUAL_BRANCH_RMS_CAP)
             h = block.ln_attn(skip + attn_out)
             k_i, v_i = self.depth_attn.project(h)
             sub_idx += 1
@@ -5863,6 +5867,9 @@ class Model(nn.Module):
                 ffn_out, next_phase_trace = block.ffn(
                     h, q_h, k_ctx_h, c_h, d_h, phase_trace=cache.phase_trace)
                 carry = None
+            if RESIDUAL_BRANCH_RMS_CAP is not None:
+                skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
+                ffn_out = capped_rms(ffn_out, RESIDUAL_BRANCH_RMS_CAP)
             h = block.ln_ffn(skip + ffn_out)
             if not is_last_block:
                 k_i, v_i = self.depth_attn.project(h)

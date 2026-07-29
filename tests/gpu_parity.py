@@ -366,6 +366,35 @@ def _checkpoint_matrix(device: torch.device, modern: bool) -> None:
         print("[gpu-parity] PASS full-model SDPA/varlen parity", flush=True)
 
 
+@torch.no_grad()
+def _incremental_model_parity(device: torch.device) -> None:
+    cfg = replace(
+        _config(device=str(device), attn_impl="sdpa", value_fusion=True),
+        # Force the cap to engage on random-init branches; cap=1 can be a
+        # numerical no-op here and would not detect a missing step() call.
+        residual_branch_rms_cap=0.05,
+    )
+    lf.apply_config(cfg)
+    torch.manual_seed(707)
+    model = lf.Model(cfg).to(device).eval()
+    tokens = torch.randint(0, cfg.vocab, (2, 7), device=device)
+    positions = torch.arange(tokens.shape[1], device=device).view(1, -1).expand_as(tokens)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        full = model(tokens, position_ids=positions)
+        states = None
+        pieces = []
+        for pos in range(tokens.shape[1]):
+            logits, states = model.step(tokens[:, pos:pos + 1], pos, states)
+            pieces.append(logits[:, None, :])
+        incremental = torch.cat(pieces, dim=1)
+    _assert_close(
+        incremental.float(), full.float(),
+        label="full/incremental model with residual RMS cap",
+        atol=5e-2, rtol=8e-2,
+    )
+    print("[gpu-parity] PASS full/incremental model with residual RMS cap", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", required=True, help="one CUDA device, e.g. cuda:0")
@@ -384,6 +413,7 @@ def main() -> None:
     )
     _attention_matrix(device, major >= 8)
     _checkpoint_matrix(device, major >= 8)
+    _incremental_model_parity(device)
     torch.cuda.synchronize(device)
     print(f"[gpu-parity] ALL CASES PASSED on {device}", flush=True)
 

@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Supervised fine-tuning for LoomFormer with pretokenized example packing."""
+"""Supervised fine-tuning for LoomFormer.
+
+This module owns exactly three SFT-specific things:
+
+  1. the sft_format.json schema check (validate_example),
+  2. a one-time tokenized cache of the dataset (SFTCache: flat ids / loss mask /
+     example offsets on disk, mmap- or RAM-backed),
+  3. a stream (SFTStream) that packs cached examples into fixed-length rows and
+     exposes the SAME interface loomformer.py's ShardStream/TokenStream do.
+
+Everything else -- DDP, torch.compile, custom-op graph capture, prefetching,
+LR schedule, eval, checkpoints/runpoints/resume -- is loomformer.py's training
+loop, reached through lf.train_async(). Nothing is reimplemented here.
+
+Packing uses <eos> as the per-example separator, which makes loomformer's
+existing build_doc_reset_state() produce exactly the per-example position reset
+and block-diagonal attention SFT needs (the chat template itself never emits
+<eos>, only <|im_start|>/<|im_end|>), so no attention/position code is
+duplicated either. The only SFT-specific tensor is the per-token loss mask.
+"""
 
 from __future__ import annotations
 
-import argparse
+import asyncio
+import hashlib
 import json
 import os
 import queue
-import random
+import sys
 import threading
 import time
-from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 import loomformer as lf
 
-IGNORE_INDEX = -100
+IGNORE_INDEX = lf.IGNORE_INDEX
 
 # ============================================================================
 # schema validation (sft_format.json, enforced here rather than just documented)
@@ -114,65 +132,169 @@ def _iter_examples(path: str):
 
 
 # ============================================================================
-# preprocessing cache: render + tokenize once, hold pre-tokenized examples in
-# memory. This is the whole fix -- everything downstream of this function is
-# plain array bookkeeping, no per-example Python work left in the hot path.
+# tokenized cache
+#
+# Render + tokenize the dataset exactly ONCE into three flat arrays on disk
+# (ids, per-token loss mask, per-example offsets), keyed by dataset + tokenizer
+# + seq_len. Later runs mmap it: no re-tokenization, no Jinja, and -- with
+# dataset_cache: mmap -- no multi-GB resident pool either. Everything the hot
+# path touches from here on is vectorized numpy over these arrays.
 # ============================================================================
 
-class TokenizedExample:
-    __slots__ = ("ids", "mask")
+CACHE_VERSION = 1
 
-    def __init__(self, ids: np.ndarray, mask: np.ndarray):
+
+def _cache_key(dataset: str, cfg: "lf.Config") -> str:
+    st = os.stat(dataset)
+    parts = [f"v{CACHE_VERSION}", os.path.abspath(dataset), str(st.st_size),
+             str(st.st_mtime_ns), str(cfg.tokenizer), str(int(cfg.vocab)), str(int(cfg.seq_len))]
+    for dep in (str(cfg.tokenizer or ""), "chat_template.jinja"):
+        if dep and os.path.exists(dep):
+            parts.append(f"{dep}:{os.stat(dep).st_mtime_ns}")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+class SFTCache:
+    """Flat (ids, loss_mask, offsets) view of a tokenized SFT dataset."""
+
+    __slots__ = ("ids", "mask", "off", "path")
+
+    _FLUSH_TOKENS = 1 << 22  # write-out granularity while building (~4M tokens)
+
+    def __init__(self, ids: np.ndarray, mask: np.ndarray, off: np.ndarray, path: str):
         self.ids = ids
         self.mask = mask
+        self.off = off
+        self.path = path
 
+    @property
+    def n_examples(self) -> int:
+        return int(len(self.off) - 1)
 
-def preprocess_dataset(
-    path: str, chat: "lf.ChatTemplate", seq_len: int, verbose: bool = True,
-) -> List[TokenizedExample]:
-    t0 = time.time()
-    out: List[TokenizedExample] = []
-    n_seen = 0
-    n_dropped = 0
-    n_no_loss = 0
-    for line_ctx, ex in _iter_examples(path):
-        n_seen += 1
-        validate_example(ex, line_ctx=f"{path}:{line_ctx}: ")
-        ids, mask = chat.render_training_ids(ex["messages"], tools=ex.get("tools"))
-        # A packed row needs room for at least one more token after this example
-        # (the next segment, or the final target shift) -- same "> seq_len"
-        # boundary the old code used, just checked once here instead of per draw.
-        if len(ids) > seq_len - 1:
-            n_dropped += 1
-            continue
-        if not any(mask):
-            n_no_loss += 1
-            continue  # an example with zero loss-carrying tokens teaches nothing
-        out.append(TokenizedExample(np.asarray(ids, dtype=np.int32), np.asarray(mask, dtype=np.int8)))
-        if verbose and n_seen % 20000 == 0:
-            print(f"[loomsft] preprocessing {path}: {n_seen} read, {len(out)} kept "
-                  f"({time.time() - t0:.0f}s)", flush=True)
-    if not out:
-        raise ValueError(f"{path}: no examples fit within seq_len={seq_len} after validation/rendering")
-    if verbose:
-        print(f"[loomsft] preprocessed {path}: {len(out)} kept, {n_dropped} dropped "
-              f"(> seq_len-1={seq_len - 1} tokens), {n_no_loss} dropped (no loss-carrying "
-              f"tokens) -- {time.time() - t0:.0f}s total", flush=True)
-    return out
+    @property
+    def lengths(self) -> np.ndarray:
+        return (self.off[1:] - self.off[:-1]).astype(np.int64)
+
+    @staticmethod
+    def build_or_load(dataset: str, cfg: "lf.Config", tok, device: torch.device) -> "SFTCache":
+        cache_dir = f"{dataset}.sftcache-{_cache_key(dataset, cfg)}"
+        meta_path = os.path.join(cache_dir, "meta.json")
+        if not os.path.exists(meta_path) and lf.ddp_is_main():
+            SFTCache._build(dataset, cfg, tok, cache_dir)
+        lf.ddp_barrier(device)
+        if not os.path.exists(meta_path):
+            raise RuntimeError(f"{cache_dir}: cache build did not complete on the main rank")
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        mode = str(getattr(cfg, "dataset_cache", None) or "mmap").lower()
+        if mode not in ("mmap", "ram"):
+            raise ValueError(f"dataset_cache must be 'mmap' or 'ram', got {mode!r}")
+        n_tok, n_ex = int(meta["tokens"]), int(meta["examples"])
+
+        def _open(name: str, dtype, count: int) -> np.ndarray:
+            p = os.path.join(cache_dir, name)
+            if mode == "ram":
+                return np.fromfile(p, dtype=dtype, count=count)
+            return np.memmap(p, dtype=dtype, mode="r", shape=(count,))
+
+        cache = SFTCache(_open("ids.i32", np.int32, n_tok), _open("mask.u8", np.int8, n_tok),
+                         _open("off.i64", np.int64, n_ex + 1), cache_dir)
+        lf.ddp_print(f"[sft-cache] {mode} {cache_dir}: {n_ex:,} examples, {n_tok:,} tokens, "
+                     f"{int(meta['loss_tokens']):,} loss-carrying "
+                     f"({int(meta['loss_tokens']) / max(1, n_tok):.1%})")
+        return cache
+
+    @staticmethod
+    def _build(dataset: str, cfg: "lf.Config", tok, cache_dir: str) -> None:
+        chat = lf.ChatTemplate(tok)
+        seq_len = int(cfg.seq_len)
+        tmp_dir = cache_dir + ".partial"
+        os.makedirs(tmp_dir, exist_ok=True)
+        ids_path = os.path.join(tmp_dir, "ids.i32")
+        mask_path = os.path.join(tmp_dir, "mask.u8")
+        t0 = time.time()
+        n_seen = n_kept = n_long = n_no_loss = 0
+        n_tok = n_loss_tok = 0
+        offsets = [0]
+        buf_ids: List[np.ndarray] = []
+        buf_mask: List[np.ndarray] = []
+        buffered = 0
+        print(f"[sft-cache] building {cache_dir} (one-time tokenization of {dataset})", flush=True)
+        with open(ids_path, "wb") as f_ids, open(mask_path, "wb") as f_mask:
+            def _flush() -> None:
+                nonlocal buffered
+                if not buf_ids:
+                    return
+                np.concatenate(buf_ids).astype(np.int32, copy=False).tofile(f_ids)
+                np.concatenate(buf_mask).astype(np.int8, copy=False).tofile(f_mask)
+                buf_ids.clear()
+                buf_mask.clear()
+                buffered = 0
+
+            for line_ctx, ex in _iter_examples(dataset):
+                n_seen += 1
+                validate_example(ex, line_ctx=f"{dataset}:{line_ctx}: ")
+                ids, mask = chat.render_training_ids(ex["messages"], tools=ex.get("tools"))
+                # A packed row is seq_len+1 tokens wide and every example is
+                # followed by one <eos> separator, so seq_len is the hard cap.
+                if len(ids) > seq_len:
+                    n_long += 1
+                    continue
+                if not any(mask):
+                    n_no_loss += 1
+                    continue  # zero loss-carrying tokens teaches nothing
+                buf_ids.append(np.asarray(ids, dtype=np.int32))
+                buf_mask.append(np.asarray(mask, dtype=np.int8))
+                buffered += len(ids)
+                n_tok += len(ids)
+                n_loss_tok += int(sum(mask))
+                n_kept += 1
+                offsets.append(n_tok)
+                if buffered >= SFTCache._FLUSH_TOKENS:
+                    _flush()
+                if n_seen % 50000 == 0:
+                    print(f"[sft-cache] {n_seen:,} read, {n_kept:,} kept, {n_tok:,} tokens "
+                          f"({time.time() - t0:.0f}s)", flush=True)
+            _flush()
+        if n_kept == 0:
+            raise ValueError(f"{dataset}: no examples survived validation/rendering at seq_len={seq_len}")
+        np.asarray(offsets, dtype=np.int64).tofile(os.path.join(tmp_dir, "off.i64"))
+        with open(os.path.join(tmp_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": CACHE_VERSION, "dataset": os.path.abspath(dataset),
+                       "seq_len": seq_len, "examples": n_kept, "tokens": n_tok,
+                       "loss_tokens": n_loss_tok, "read": n_seen,
+                       "dropped_too_long": n_long, "dropped_no_loss": n_no_loss}, f)
+        os.replace(tmp_dir, cache_dir)  # atomic: a cache dir exists only when complete
+        print(f"[sft-cache] done in {time.time() - t0:.0f}s: {n_kept:,} kept, {n_long:,} dropped "
+              f"(> seq_len={seq_len}), {n_no_loss:,} dropped (no loss tokens)", flush=True)
 
 
 # ============================================================================
-# packing
+# vectorized packing
+#
+# All of this is ragged-array arithmetic (cumsum/repeat/searchsorted). There is
+# no per-token or per-example Python iteration on the batch path: one batch is
+# two gathers plus a handful of index computations.
 # ============================================================================
 
-class PackedRow:
-    __slots__ = ("ids", "loss_mask", "position_ids", "seg_id")
+def _ragged_arange(counts: np.ndarray) -> np.ndarray:
+    """Concatenated [0..counts[0]-1, 0..counts[1]-1, ...] without a Python loop."""
+    total = int(counts.sum())
+    ends = np.cumsum(counts)
+    return np.arange(total, dtype=np.int64) - np.repeat(ends - counts, counts)
 
-    def __init__(self, T: int, pad_id: int):
-        self.ids = np.full(T, pad_id, dtype=np.int64)
-        self.loss_mask = np.zeros(T, dtype=np.int64)
-        self.position_ids = np.zeros(T, dtype=np.int64)
-        self.seg_id = np.full(T, -1, dtype=np.int64)  # -1 = padding, never attended across
+
+def _ragged_slice(starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Concatenation of ranges [starts[i], starts[i]+counts[i])."""
+    return np.repeat(starts, counts) + _ragged_arange(counts)
+
+
+def _group_exclusive_cumsum(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Exclusive cumsum of ``values`` restarted at every group boundary."""
+    incl = np.cumsum(values)
+    group_ends = np.cumsum(counts) - 1
+    group_base = np.concatenate(([0], incl[group_ends[:-1]])) if len(counts) > 1 else np.zeros(1, np.int64)
+    return incl - values - np.repeat(group_base, counts)
 
 
 def _need_pad_id(tok) -> int:
@@ -185,338 +307,292 @@ def _need_pad_id(tok) -> int:
     return tid
 
 
-class Packer:
-    """Greedily pack a reusable pool of tokenized examples into fixed-length rows."""
+def cached_token_count(path: str, cfg: "lf.Config") -> int:
+    """Exact token count of a split, read from the cache metadata.
 
-    def __init__(self, pool: List[TokenizedExample], seq_len: int, pad_id: int,
-                 shuffle: bool, seed: int = 0):
-        if not pool:
-            raise ValueError("empty example pool")
-        self.pool = pool
-        self.T = seq_len
-        self.pad_id = pad_id
-        self.shuffle = shuffle
-        self._rng = random.Random(seed)
-        self._order = list(range(len(pool)))
-        if shuffle:
-            self._rng.shuffle(self._order)
-        self._cursor = 0
-
-    def _next_example(self) -> TokenizedExample:
-        if self._cursor >= len(self._order):
-            self._cursor = 0
-            if self.shuffle:
-                self._rng.shuffle(self._order)
-        ex = self.pool[self._order[self._cursor]]
-        self._cursor += 1
-        return ex
-
-    def fast_forward(self, n_rows: int) -> None:
-        """Advance packing order by ``n_rows`` without constructing rows."""
-        T = self.T
-        for _ in range(n_rows):
-            cursor = 0
-            while cursor < T:
-                ex = self._next_example()
-                L = len(ex.ids)
-                if cursor + L > T:
-                    break
-                cursor += L
-
-    def pack_one_row(self) -> PackedRow:
-        T = self.T
-        row = PackedRow(T, self.pad_id)
-        cursor = 0
-        seg = 0
-        # A single dataset pass already guarantees every example is <= T-1 tokens
-        # (preprocess_dataset dropped anything longer), so this can never spin:
-        # each iteration either places >=1 example or the row is full.
-        while cursor < T:
-            ex = self._next_example()
-            L = len(ex.ids)
-            if cursor + L > T:
-                if cursor == 0:
-                    break  # unreachable given the preprocessing guarantee; defensive only
-                break
-            row.ids[cursor:cursor + L] = ex.ids
-            row.loss_mask[cursor:cursor + L] = ex.mask
-            row.position_ids[cursor:cursor + L] = np.arange(L)
-            row.seg_id[cursor:cursor + L] = seg
-            cursor += L
-            seg += 1
-        return row
-
-    def sample_batch(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
-        rows = [self.pack_one_row() for _ in range(batch_size)]
-        ids = np.stack([r.ids for r in rows])
-        loss_mask = np.stack([r.loss_mask for r in rows])
-        pos = np.stack([r.position_ids for r in rows])
-        seg = np.stack([r.seg_id for r in rows])
-
-        x = torch.from_numpy(ids[:, :-1]).to(device)
-        y = torch.from_numpy(ids[:, 1:]).to(device)
-        pos_ids = torch.from_numpy(pos[:, :-1]).to(device)
-        seg_t = torch.from_numpy(seg).to(device)
-        same_seg = (seg_t[:, :-1] == seg_t[:, 1:])
-        loss_valid = torch.from_numpy(loss_mask[:, 1:]).to(device).bool() & same_seg
-        y_masked = torch.where(loss_valid, y, torch.full_like(y, IGNORE_INDEX))
-
-        seg_x = seg_t[:, :-1]
-        allowed = (seg_x[:, None, :, None] == seg_x[:, None, None, :])
-        causal = torch.tril(torch.ones(seg_x.shape[1], seg_x.shape[1], dtype=torch.bool, device=device))
-        attn_mask = allowed & causal[None, None]
-        return {"x": x, "y": y_masked, "position_ids": pos_ids, "attn_mask": attn_mask, "seg_id": seg_x}
+    Used by loomformer's budget report instead of re-reading the dataset.
+    """
+    base, _, frag = str(path).partition("#")
+    meta_path = os.path.join(f"{base}.sftcache-{_cache_key(base, cfg)}", "meta.json")
+    if not os.path.exists(meta_path):
+        return 0  # first run: the cache is built by the stream a moment later
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    tokens = int(meta["tokens"])
+    pct = float(getattr(cfg, "auto_val_split_pct", 0.0) or 0.0)
+    if pct <= 0.0 or not frag:
+        return tokens
+    # Example counts are exact; the token split is proportional to them.
+    n = int(meta["examples"])
+    n_val = lf._split_count(n, pct)
+    share = (n_val if frag.lower() == "val" else n - n_val) / max(1, n)
+    return int(tokens * share)
 
 
-def print_sft_header(cfg: "lf.Config", device: torch.device, init_checkpoint: str,
-                     train_path: str, val_path: Optional[str]) -> None:
-    """Print the model architecture and SFT dataset paths."""
-    width = 64
-    rule = "=" * width
-    print(rule)
-    print(f" LoomSFT  ·  {device}  ·  amp={lf.AMP_DTYPE}  ·  init={init_checkpoint}")
-    print(rule)
-    grp = f"x{lf.GQA_GROUP_SIZE}" if lf.GQA_GROUP_SIZE else "x1"
-    print(f"  shape    d_model={lf.N}  heads={lf.N_Q_HEADS}q/{lf.N_KV_HEADS}kv({grp})  "
-          f"head_dim={lf.HEAD_DIM}  layers={lf.LAYERS}")
-    print(f"  ffn      hidden={lf.HIDDEN}  phase={lf.PHASE_SECTORS}  attn={lf.ATTN_IMPL}")
-    print(f"  rope     yarn  theta={lf.ROPE_THETA:g}  factor={lf.ROPE_FACTOR:g}x  "
-          f"orig_len={lf.ROPE_ORIGINAL_SEQ_LEN}")
-    if lf.HEAD_DIM < 8:
-        print(f"  WARNING: head_dim={lf.HEAD_DIM} is extremely small for LM attention.")
-    print(f"  train    {train_path}")
-    print(f"  val      {val_path}" if val_path else "  val      (none -- training loss only)")
+class SFTStream:
+    """Packed SFT batches behind loomformer's stream interface.
 
+    Yields ``(ids, loss_mask)`` pairs of shape ``[B, seq_len+1]``; everything
+    else (positions, block-diagonal attention, LR, DDP, compile, graph, eval,
+    checkpoints) is loomformer's training loop, unchanged. Examples are joined
+    by a single <eos>, which is exactly the boundary token
+    ``build_doc_reset_state`` splits on, so packed examples cannot attend across
+    each other and every example restarts at position 0.
 
-def print_sft_training_budget(cfg: "lf.Config", model, train_pool: List[TokenizedExample]) -> None:
-    """Print token and parameter statistics for the preprocessed training pool."""
-    pool_tokens = int(sum(len(ex.ids) for ex in train_pool))
-    pool_loss_tokens = int(sum(int(ex.mask.sum()) for ex in train_pool))
-    accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
-    tokens_per_step = int(cfg.batch_size) * int(cfg.seq_len) * accum_steps
-    run_tokens = int(cfg.steps) * tokens_per_step
-    run_epochs = run_tokens / max(1, pool_tokens)
-    print(f"  budget   {run_tokens:,} tokens over {cfg.steps:,} steps "
-          f"({run_epochs:.3f} epochs of {pool_tokens:,} pool tokens, "
-          f"{len(train_pool):,} examples)")
-    params = lf.count_params(model)
-    tpp = run_tokens / max(1, params)
-    epoch_tokens_per_param = pool_tokens / max(1, params)
-    print(f"           loomformer: {params:,} params  ·  {tpp:.1f} tok/param  ·  "
-          f"{epoch_tokens_per_param:.1f} data-tok/param")
-    loss_frac = pool_loss_tokens / max(1, pool_tokens)
-    avg_ex_len = pool_tokens / max(1, len(train_pool))
-    packing_eff = avg_ex_len / max(1, int(cfg.seq_len))
-    print(f"           pool: {pool_loss_tokens:,} loss-carrying tokens ({loss_frac:.1%} of pool)  ·  "
-          f"avg example {avg_ex_len:.0f} tok  ·  ~{packing_eff:.1%} of a bare row before packing gains")
+    Path syntax: ``<dataset>`` or ``<dataset>#val`` / ``<dataset>#train`` --
+    the fragment selects one side of the ``auto_val_split_pct`` example split
+    over one shared tokenized cache (non-destructive; the dataset file is never
+    rewritten, unlike the pretraining shard split).
+    """
 
-
-class BatchPrefetcher:
-    """Prepare packed batches in a background thread and bounded queue."""
-
-    def __init__(self, packer: Packer, batch_size: int, device: torch.device, depth: int = 2):
-        self.packer = packer
-        self.batch_size = batch_size
+    def __init__(self, path: str, cfg: "lf.Config", device: torch.device, tokenizer=None):
+        base, _, frag = str(path).partition("#")
+        frag = frag.lower()
+        if frag not in ("", "train", "val"):
+            raise ValueError(f"unknown SFT split fragment {frag!r} in {path!r} (use #train or #val)")
+        self.cfg = cfg
         self.device = device
-        self._q: "queue.Queue" = queue.Queue(maxsize=max(1, depth))
-        self._stop = threading.Event()
-        self._err: Optional[BaseException] = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self.tok = tokenizer if tokenizer is not None else lf.build_tokenizer(cfg)
+        self._eos_id = lf._tok_special_id(self.tok, "<eos>")
+        if self._eos_id is None:
+            raise ValueError(
+                "SFT packing needs <eos> as the example separator, but the tokenizer has none. "
+                "Retrain it with loomformer.train_tokenizer(..., "
+                "special_tokens=loomformer.DEFAULT_SPECIAL_TOKENS)."
+            )
+        self._pad_id = _need_pad_id(self.tok)
+        self.cache = SFTCache.build_or_load(base, cfg, self.tok, device)
+        self._lengths = self.cache.lengths
+        self.T1 = int(cfg.seq_len) + 1
+        self.is_val = frag == "val"
 
-    def _run(self) -> None:
+        n = self.cache.n_examples
+        pct = float(getattr(cfg, "auto_val_split_pct", 0.0) or 0.0)
+        n_val = lf._split_count(n, pct) if pct > 0.0 else 0
+        lo, hi = (n - n_val, n) if self.is_val else (0, n - n_val)
+        if hi <= lo:
+            raise ValueError(f"{path}: empty split (examples={n}, auto_val_split_pct={pct})")
+        # DDP: contiguous, disjoint example ranges -- same partitioning idea as
+        # ShardStream's row plan, without any cross-rank duplication.
+        rank = lf.ddp_rank() if lf.ddp_is_distributed() else 0
+        world = lf.ddp_world_size() if lf.ddp_is_distributed() else 1
+        span = hi - lo
+        r_lo = lo + span * rank // world
+        r_hi = lo + span * (rank + 1) // world
+        if r_hi <= r_lo:
+            raise ValueError(f"rank {rank} received no SFT examples from {path!r}")
+        self._examples = np.arange(r_lo, r_hi, dtype=np.int64)
+        self._rng = np.random.default_rng(int(cfg.seed) + 7919 * rank)
+        self._row_cursor = 0
+        self._plan_epoch()
+        lf.ddp_print(f"[sft-data] rank={rank} split={frag or 'train'} examples={len(self._examples):,} "
+                     f"rows/epoch={self.n_rows:,} pack_fill={self._fill:.1%}")
+
+        self._ram_queue: "queue.Queue" = queue.Queue(maxsize=max(1, int(cfg.prefetch_batches)))
+        self._stop = threading.Event()
+        self._producer_error: Optional[BaseException] = None
+        self._gpu_ids = None
+        self._gpu_mask = None
+        self._gpu_pos = 0
+        self._rank = rank
+        # The producer starts on first use, not here: resume fast-forward and the
+        # full-split eval drive the packing plan directly from the calling thread,
+        # and a background producer racing them would silently reorder data.
+        self._producer: Optional[threading.Thread] = None
+
+    # -- packing plan ------------------------------------------------------
+
+    def _plan_epoch(self) -> None:
+        """Greedy first-fit-in-order packing plan for one pass over the split.
+
+        Computed once per epoch, not per batch: row boundaries are found with
+        O(rows) C-level searchsorted calls over one cumsum, so the per-batch
+        path below only does index arithmetic and two gathers.
+        """
+        order = self._rng.permutation(self._examples) if not self.is_val else self._examples
+        # +1 per example for its <eos> separator; the cache guarantees len <= seq_len,
+        # so every example fits in a row of T1 = seq_len + 1 tokens.
+        costs = self._lengths[order] + 1
+        incl = np.cumsum(costs)
+        starts = [0]
+        pos = 0
+        n = len(order)
+        while pos < n:
+            budget = (incl[pos - 1] if pos else 0) + self.T1
+            nxt = int(np.searchsorted(incl, budget, side="right"))
+            pos = nxt if nxt > pos else pos + 1
+            starts.append(pos)
+        self._order = order
+        self._row_ptr = np.asarray(starts, dtype=np.int64)
+        self.n_rows = len(self._row_ptr) - 1
+        self._row_cursor = 0
+        used = int(costs.sum())
+        self._fill = used / float(max(1, self.n_rows * self.T1))
+
+    def _take_rows(self, count: int) -> np.ndarray:
+        """Next ``count`` row indices, re-planning (reshuffling) at epoch end."""
+        out = np.empty(count, dtype=np.int64)
+        filled = 0
+        while filled < count:
+            take = min(count - filled, self.n_rows - self._row_cursor)
+            out[filled:filled + take] = np.arange(self._row_cursor, self._row_cursor + take)
+            self._row_cursor += take
+            filled += take
+            if self._row_cursor >= self.n_rows:
+                if self.is_val:
+                    self._row_cursor = 0  # deterministic cycle, no reshuffle
+                else:
+                    self._plan_epoch()
+        return out
+
+    def fast_forward(self, n_batches: int) -> None:
+        """Skip ``n_batches`` already-seen batches without packing any of them.
+
+        Epoch plans are a pure function of the seed, so replaying the cursor
+        (and the reshuffles it crosses) reproduces the original data order.
+        """
+        if self._producer is not None:
+            raise RuntimeError("fast_forward must run before the data producer starts")
+        rows = int(n_batches) * int(self.cfg.batch_size)
+        while rows > 0:
+            take = min(rows, self.n_rows - self._row_cursor)
+            self._row_cursor += take
+            rows -= take
+            if self._row_cursor >= self.n_rows:
+                if self.is_val:
+                    self._row_cursor = 0
+                else:
+                    self._plan_epoch()
+
+    # -- batch materialization (vectorized) --------------------------------
+
+    def _pack_batch_np(self, rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        B = len(rows)
+        ids = np.full((B, self.T1), self._pad_id, dtype=np.int64)
+        mask = np.zeros((B, self.T1), dtype=np.int8)
+
+        ex_start = self._row_ptr[rows]
+        ex_count = self._row_ptr[rows + 1] - ex_start
+        ex = self._order[_ragged_slice(ex_start, ex_count)]
+        row_of_ex = np.repeat(np.arange(B, dtype=np.int64), ex_count)
+        ex_len = self._lengths[ex]
+        # column where each example starts inside its row (its <eos> costs 1)
+        col0 = _group_exclusive_cumsum(ex_len + 1, ex_count)
+
+        local = _ragged_arange(ex_len)
+        dst_row = np.repeat(row_of_ex, ex_len)
+        dst_col = np.repeat(col0, ex_len) + local
+        src = np.repeat(self.cache.off[ex], ex_len) + local
+        ids[dst_row, dst_col] = self.cache.ids[src]
+        mask[dst_row, dst_col] = self.cache.mask[src]
+
+        ids[row_of_ex, col0 + ex_len] = self._eos_id  # separator: never a target
+        mask[row_of_ex, col0] = 0  # never predict an example's first token from the previous <eos>
+        return ids, mask
+
+    # -- loomformer stream interface ---------------------------------------
+
+    def _sample_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        ids, mask = self._pack_batch_np(self._take_rows(int(self.cfg.batch_size)))
+        t_ids = torch.from_numpy(ids)
+        t_mask = torch.from_numpy(mask)
+        if self.device.type == "cuda":
+            t_ids, t_mask = t_ids.pin_memory(), t_mask.pin_memory()
+        return t_ids, t_mask
+
+    def _produce_cpu_batches(self) -> None:
         try:
             while not self._stop.is_set():
-                batch = self.packer.sample_batch(self.batch_size, self.device)
-                self._q.put(batch)
-        except BaseException as e:  # noqa: BLE001 -- must reach the consumer, not vanish in the thread
-            self._err = e
+                self._ram_queue.put(self._sample_batch())
+        except BaseException as exc:  # noqa: BLE001 -- must reach the consumer
+            self._producer_error = exc
             try:
-                self._q.put_nowait(None)
+                self._ram_queue.put_nowait(None)
             except queue.Full:
                 pass
 
-    def next(self) -> Dict[str, torch.Tensor]:
-        batch = self._q.get()
-        if batch is None and self._err is not None:
-            raise RuntimeError("BatchPrefetcher background thread failed") from self._err
+    def _ensure_producer(self) -> None:
+        if self._producer is None:
+            self._producer = threading.Thread(target=self._produce_cpu_batches, daemon=True,
+                                              name=f"sft-data-rank-{self._rank}")
+            self._producer.start()
+
+    def _get_cpu_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_producer()
+        batch = self._ram_queue.get()
+        if batch is None:
+            raise RuntimeError("SFT data producer failed") from self._producer_error
         return batch
 
-    def stop(self) -> None:
+    def sample_device_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        ids, mask = self._get_cpu_batch()
+        return (ids.to(self.device, non_blocking=True), mask.to(self.device, non_blocking=True))
+
+    def _gpu_chunk_size(self) -> int:
+        return max(1, min(int(self.cfg.gpu_prefetch_batches), int(self.cfg.prefetch_batches)))
+
+    async def _load_gpu_chunk(self, count: int) -> None:
+        loop = asyncio.get_running_loop()
+        ids_l, mask_l = [], []
+        for _ in range(count):
+            ids, mask = await loop.run_in_executor(None, self._get_cpu_batch)
+            ids_l.append(ids)
+            mask_l.append(mask)
+        self._gpu_ids = torch.stack(ids_l).to(self.device, non_blocking=True)
+        self._gpu_mask = torch.stack(mask_l).to(self.device, non_blocking=True)
+        self._gpu_pos = 0
+
+    async def prime(self) -> None:
+        count = self._gpu_chunk_size()
+        await self._load_gpu_chunk(count)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        lf.ddp_print(f"[sft-data] ready: RAM={int(self.cfg.prefetch_batches)} batches, GPU={count} batches")
+
+    async def batches(self, n: int):
+        chunk = self._gpu_chunk_size()
+        yielded = 0
+        while yielded < n:
+            if self._gpu_ids is None or self._gpu_pos >= self._gpu_ids.shape[0]:
+                await self._load_gpu_chunk(min(chunk, n - yielded))
+            while self._gpu_pos < self._gpu_ids.shape[0] and yielded < n:
+                out = (self._gpu_ids[self._gpu_pos], self._gpu_mask[self._gpu_pos])
+                self._gpu_pos += 1
+                yielded += 1
+                yield out
+
+    def close(self) -> None:
         self._stop.set()
-
-
-# ============================================================================
-# train / eval
-# ============================================================================
-
-@torch.no_grad()
-def eval_sft(model: torch.nn.Module, packer: Packer, batch_size: int,
-             device: torch.device, n_batches: int = 8) -> float:
-    model.eval()
-    tot_loss, tot_tok = 0.0, 0
-    for _ in range(n_batches):
-        b = packer.sample_batch(batch_size, device)
-        ntok = int((b["y"] != IGNORE_INDEX).sum().item())
-        if ntok == 0:
-            continue
-        with lf.amp_autocast(device):
-            loss = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"],
-                         labels=b["y"], ignore_index=IGNORE_INDEX)
-        model.last_tria_depth_carry = None
-        model.last_tria_fire_mask = None
-        model.last_tria_document_carry_stats = None
-        tot_loss += float(loss.item()) * ntok
-        tot_tok += ntok
-    model.train()
-    return tot_loss / max(1, tot_tok)
 
 
 def train_sft(
     cfg: "lf.Config",
     train_path: str,
     val_path: Optional[str],
-    init_checkpoint: str,
+    init_checkpoint: Optional[str],
     device: torch.device,
     ckpt_out: str,
     resume: Optional[str] = None,
     resume_step: Optional[int] = None,
 ) -> None:
-    lf.set_seed(cfg.seed)
-    tok = lf.build_tokenizer(cfg)
-    weight_source = resume or init_checkpoint
-    # Checkpoint geometry is diagnostic only: the active Config is the SSOT for
-    # W/alpha/beta on both initialization and resume.
-    lf.restore_temporal_tria_from_checkpoint(cfg, weight_source)
-    lf.apply_config(cfg)
-    chat = lf.ChatTemplate(tok)
-    pad_id = _need_pad_id(tok)
+    """Run SFT on loomformer's training loop.
 
-    start_step = 0
-    if resume:
-        if resume_step is not None:
-            start_step = int(resume_step)
-        else:
-            _ckpt_step = torch.load(resume, map_location="cpu", weights_only=True).get("step", None)
-            if _ckpt_step is None:
-                print(f"[resume] WARNING: {resume!r} has no saved 'step' (older checkpoint) -- "
-                      f"defaulting to start_step=0. Pass --resume-step N to hard-set it.")
-            start_step = int(_ckpt_step or 0)
-        if start_step >= int(cfg.steps):
-            print(f"[resume] start_step={start_step} >= cfg.steps={cfg.steps} -- nothing to do, exiting.")
-            return
-        # Checkpoints and runpoints both store the number of completed updates,
-        # i.e. the next loop index to execute (same convention as pretraining).
-
-    model = lf.Model(cfg).to(device)
-    lf.load_model_checkpoint(model, weight_source, ablation=False, device=device)
-
-    train_pool = preprocess_dataset(train_path, chat, cfg.seq_len)
-    train_packer = Packer(train_pool, cfg.seq_len, pad_id, shuffle=True, seed=cfg.seed)
-    val_packer = None
+    The only SFT-specific setup is selecting the SFT stream (dataset_format) and
+    pointing the loop at a pretrained checkpoint for weight initialization; DDP,
+    compile, graph capture, prefetching, eval, checkpoints, runpoints and resume
+    are the pretraining implementations, used as-is.
+    """
+    cfg.dataset_format = "sft"
     if val_path:
-        val_pool = preprocess_dataset(val_path, chat, cfg.seq_len)
-        val_packer = Packer(val_pool, cfg.seq_len, pad_id, shuffle=False, seed=cfg.seed)
-
-    print_sft_header(cfg, device, weight_source, train_path, val_path)
-    print_sft_training_budget(cfg, model, train_pool)
-    print("=" * 64)
-
-    accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
-
-    if resume and start_step > 0:
-        _n_replay = start_step * accum_steps * int(cfg.batch_size)
-        print(f"[resume] fast-forwarding Packer RNG by {_n_replay} row draws "
-              f"(start_step={start_step} * grad_accum_steps={accum_steps} * "
-              f"batch_size={cfg.batch_size}) to skip already-seen data...", flush=True)
-        train_packer.fast_forward(_n_replay)
-        print("[resume] fast-forward done.", flush=True)
-        print(f"[resume] continuing from step {start_step}/{cfg.steps} -- "
-              f"LR schedule/log step numbering continue.", flush=True)
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt_cls, opt_name = lf.optimizer_class_from_name(getattr(cfg, "optimizer", "adamw"))
-    opt = opt_cls(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    if resume:
-        lf.load_optimizer_checkpoint(opt, resume, opt_name, device)
-
-    def _save_checkpoint(path_override: Optional[str] = None, at_step: int = 0) -> None:
-        save_path = path_override or ckpt_out
-        saved_cfg = asdict(cfg)
-        if saved_cfg.get("tria_temporal_window") is not None:
-            saved_cfg["tria_temporal_auto"] = False
-        torch.save(
-            {"cfg": saved_cfg, "model_kind": "loomformer", "ffn_type": "paraplex",
-             "ablation": False, "model": model.state_dict(),
-             "optimizer_name": opt_name, "optimizer": opt.state_dict(),
-             "step": at_step},
-            save_path,
-        )
-        print(f"[loomsft] saved -> {save_path}")
-
-    def _save_runpoint(at_step: int) -> None:
-        root, ext = os.path.splitext(ckpt_out)
-        ext = ext or ".pt"
-        fname = f"{os.path.basename(root)}.runpoint_step{at_step}{ext}"
-        if cfg.runpoints_path:
-            os.makedirs(cfg.runpoints_path, exist_ok=True)
-            runpoint_path = os.path.join(cfg.runpoints_path, fname)
-        else:
-            runpoint_path = f"{root}.runpoint_step{at_step}{ext}"
-        print(f"\n[runpoint] step {at_step}/{cfg.steps} -- saving, training continues.", flush=True)
-        _save_checkpoint(path_override=runpoint_path, at_step=at_step)
-
-    prefetcher = BatchPrefetcher(train_packer, cfg.batch_size, device, depth=max(2, accum_steps // 4 + 1))
-    step = start_step
-    trias_since_log = torch.zeros((), dtype=torch.long, device=device)
-    t0 = time.time()
-    opt.zero_grad(set_to_none=True)
-    try:
-        with lf._GracefulInterrupt() as interrupt, lf._RunpointWatcher() as runpoint:
-            while step < int(cfg.steps):
-                loss_sum = 0.0
-                for micro in range(accum_steps):
-                    batch = prefetcher.next()
-                    with lf.amp_autocast(device):
-                        loss = model(batch["x"], attn_mask=batch["attn_mask"], position_ids=batch["position_ids"],
-                                     labels=batch["y"], ignore_index=IGNORE_INDEX)
-                    if model.last_tria_fire_mask is not None:
-                        with torch.no_grad():
-                            trias_since_log.add_(model.last_tria_fire_mask.detach().sum())
-                    (loss / accum_steps).backward()
-                    model.last_tria_depth_carry = None
-                    model.last_tria_fire_mask = None
-                    model.last_tria_document_carry_stats = None
-                    loss_sum += float(loss.item())
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-                lr = lf.lr_at(cfg, step)
-                for g in opt.param_groups:
-                    g["lr"] = lr
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-                train_loss = loss_sum / accum_steps
-                if step % cfg.log_every == 0:
-                    trias_log = int(trias_since_log.item())
-                    trias_since_log.zero_()
-                    msg = f"[loomsft] step {step:6d}  train_loss {train_loss:.4f}  trias: {trias_log:d}  lr {lr:.2e}  ({time.time()-t0:.0f}s)"
-                    if val_packer is not None and step % (cfg.log_every * 5) == 0:
-                        msg += f"  eval_loss {eval_sft(model, val_packer, cfg.batch_size, device):.4f}"
-                    print(msg, flush=True)
-                if runpoint.consume() or (
-                    cfg.save_every and (step + 1) % int(cfg.save_every) == 0
-                ):
-                    _save_runpoint(step + 1)
-                if interrupt.requested:
-                    print(f"\n[interrupt] Ctrl-C at step {step}/{cfg.steps} -- saving a runpoint and stopping.",
-                          flush=True)
-                    _save_runpoint(step + 1)
-                    step += 1
-                    break
-                step += 1
-    finally:
-        prefetcher.stop()
-
-    _save_checkpoint(at_step=step)
+        cfg.val_dataset = val_path
+    elif float(getattr(cfg, "auto_val_split_pct", 0.0) or 0.0) > 0.0:
+        # Non-destructive example-level split over the shared tokenized cache.
+        cfg.val_dataset = f"{train_path}#val"
+        train_path = f"{train_path}#train"
+    asyncio.run(lf.train_async(
+        cfg, train_path, device, ckpt_out, ablation=False,
+        resume=resume, resume_step=resume_step, init_weights=init_checkpoint,
+    ))
 
 
 # ============================================================================
@@ -567,47 +643,57 @@ def smoke_test() -> None:
     assert parsed and parsed[0]["function"]["name"] == "f"
     print(f"[smoke] ChatTemplate.parse_tool_calls OK: {parsed}")
 
-    pool = preprocess_dataset(sft_path, chat, cfg.seq_len, verbose=False)
-    assert len(pool) == 2
-    print(f"[smoke] preprocess_dataset OK: {len(pool)} examples cached")
-
     dev = lf.device_auto("cpu")
-    pad_id = _need_pad_id(tok)
-    packer = Packer(pool, cfg.seq_len, pad_id, shuffle=True, seed=0)
-    b = packer.sample_batch(2, dev)
-    assert b["x"].shape == (2, cfg.seq_len - 1) and b["y"].shape == (2, cfg.seq_len - 1)
-    assert b["attn_mask"].shape == (2, 1, cfg.seq_len - 1, cfg.seq_len - 1)
-    print(f"[smoke] packing OK: x={tuple(b['x'].shape)} attn_mask={tuple(b['attn_mask'].shape)} "
-          f"loss_tokens={(b['y'] != IGNORE_INDEX).sum().item()}")
+    cfg.dataset_format = "sft"
+    stream = lf.make_stream(sft_path, cfg, dev)
+    assert stream.cache.n_examples == 2, stream.cache.n_examples
+    print(f"[smoke] SFTCache OK: {stream.cache.n_examples} examples, "
+          f"{int(stream.cache.lengths.sum())} tokens")
+
+    ids, loss_mask = stream._sample_batch()
+    assert ids.shape == (cfg.batch_size, cfg.seq_len + 1), ids.shape
+    assert loss_mask.shape == ids.shape
+
+    x, y, position_ids, attn_mask = lf.split_train_batch((ids.to(dev), loss_mask.to(dev)), stream._eos_id)
+    assert x.shape == (cfg.batch_size, cfg.seq_len)
+    assert attn_mask.shape == (cfg.batch_size, 1, cfg.seq_len, cfg.seq_len)
+    n_loss = int((y != IGNORE_INDEX).sum().item())
+    assert n_loss > 0, "packed batch carries no loss tokens"
+    # Only assistant tokens may be targets: everything the renderer masked out
+    # (prompt, padding, separators) must be IGNORE_INDEX.
+    assert torch.equal((y != IGNORE_INDEX), loss_mask.to(dev)[:, 1:].bool())
+    print(f"[smoke] packing + loss mask OK: x={tuple(x.shape)} attn_mask={tuple(attn_mask.shape)} "
+          f"loss_tokens={n_loss}")
+
+    # Segment ids exactly as build_doc_reset_state derives them: the exclusive
+    # cumsum keeps each <eos> separator inside the example it terminates.
+    boundary = (x[0] == stream._eos_id).long()
+    seg = torch.cumsum(boundary, 0) - boundary
+    assert int(position_ids[0].max().item()) < cfg.seq_len
+    assert bool((position_ids[0][seg == 0] == torch.arange(int((seg == 0).sum()))).all())
+    print(f"[smoke] per-example position reset OK: {int(seg.max().item()) + 1} segments in row 0")
 
     model = lf.Model(cfg).to(dev)
-    with torch.no_grad():
-        logits = model(b["x"], attn_mask=b["attn_mask"], position_ids=b["position_ids"])
-    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), b["y"].reshape(-1), ignore_index=IGNORE_INDEX)
+    with torch.no_grad(), lf.amp_autocast(dev):
+        loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y,
+                     ignore_index=IGNORE_INDEX)
     assert torch.isfinite(loss)
-    print(f"[smoke] forward with packed attn_mask/position_ids OK, loss={loss.item():.4f}")
+    print(f"[smoke] masked forward OK, loss={loss.item():.4f}")
 
-    # cross-segment isolation, empirically: perturbing segment 0's tokens must not
-    # change segment 1's logits AT ALL under the block-diagonal mask.
-    seg_row = packer.pack_one_row()
-    ids_t = torch.from_numpy(seg_row.ids[None, :-1]).to(dev)
-    pos_t = torch.from_numpy(seg_row.position_ids[None, :-1]).to(dev)
-    seg_t = torch.from_numpy(seg_row.seg_id[None, :-1])
-    same = seg_t[:, None, :, None] == seg_t[:, None, None, :]
-    causal = torch.tril(torch.ones(ids_t.shape[1], ids_t.shape[1], dtype=torch.bool))
-    amask = (same & causal[None, None]).to(dev)
-    with torch.no_grad():
-        base = model(ids_t, attn_mask=amask, position_ids=pos_t)
-        ids2 = ids_t.clone()
-        first_seg_len = int((seg_row.seg_id == 0).sum())
-        if first_seg_len > 0:
-            ids2[0, :first_seg_len] = (ids2[0, :first_seg_len] + 1) % lf.VOCAB
-            other = model(ids2, attn_mask=amask, position_ids=pos_t)
-            later = seg_row.seg_id[:-1] != 0
-            if later.any():
-                delta = (base[0, later] - other[0, later]).abs().max().item()
-                assert delta < 1e-4, f"packed segments are NOT isolated: max delta {delta}"
-                print(f"[smoke] cross-segment isolation OK (max delta {delta:.2e})")
+    # Cross-example isolation, empirically: perturbing the first packed example
+    # (its <eos> included) must not move a single logit of the later ones.
+    first_len = int((seg == 0).sum())
+    later = (seg > 0)
+    if first_len > 0 and bool(later.any()):
+        with torch.no_grad():
+            base = model(x[:1], attn_mask=attn_mask[:1], position_ids=position_ids[:1])
+            x2 = x[:1].clone()
+            x2[0, :first_len] = (x2[0, :first_len] + 1) % int(cfg.vocab)
+            other = model(x2, attn_mask=attn_mask[:1], position_ids=position_ids[:1])
+        delta = (base[0, later] - other[0, later]).abs().max().item()
+        assert delta < 1e-4, f"packed examples are NOT isolated: max delta {delta}"
+        print(f"[smoke] cross-example isolation OK (max delta {delta:.2e})")
+    stream.close()
     print("[smoke] ALL OK")
 
 
@@ -616,40 +702,18 @@ def smoke_test() -> None:
 # ============================================================================
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="loomsft: SFT training for LoomFormer")
-    ap.add_argument("--config", type=str, default=None)
-    ap.add_argument("--sft-dataset", type=str, default=None)
-    ap.add_argument("--val-dataset", type=str, default=None)
-    ap.add_argument("--init-checkpoint", type=str, default=None, help="pretrained LoomFormer checkpoint to start SFT from")
-    ap.add_argument("--checkpoint", type=str, default="loomsft.pt")
-    ap.add_argument("--resume", type=str, default=None,
-                    help="smart resume: load model and optimizer state from an SFT runpoint, "
-                         "continue step count/LR schedule, and skip already-seen data")
-    ap.add_argument("--resume-step", type=int, default=None,
-                    help="override/hard-set the step to resume from, for runpoints saved before "
-                         "'step' was recorded (or to force a specific value)")
-    ap.add_argument("--steps", type=int, default=None)
-    ap.add_argument("--device", type=str, default=None)
-    ap.add_argument("--smoke-test", action="store_true")
-    args = ap.parse_args()
+    """Thin front-end for `loomformer.py --sft-dataset ...`.
 
-    if args.smoke_test:
+    Every flag is forwarded verbatim, so SFT runs go through the same CLI as
+    pretraining: same config loading, same multi-GPU self-launch, same
+    checkpoint/resume handling. `--smoke-test` is the only local action.
+    """
+    if "--smoke-test" in sys.argv[1:]:
         smoke_test()
         return
-
-    cfg = lf.Config.from_yaml(args.config) if args.config else lf.Config()
-    if args.steps is not None:
-        cfg.steps = args.steps
-    device_pref = args.device if args.device is not None else cfg.device
-    dev = lf.device_auto(device_pref)
-
-    assert args.sft_dataset, "--sft-dataset is required"
-    assert args.init_checkpoint or args.resume, (
-        "--init-checkpoint is required (SFT starts from a pretrained LoomFormer checkpoint), "
-        "unless --resume points at an existing SFT runpoint to continue instead"
-    )
-    train_sft(cfg, args.sft_dataset, args.val_dataset, args.init_checkpoint, dev, args.checkpoint,
-              resume=args.resume, resume_step=args.resume_step)
+    if not any(a == "--sft-dataset" or a.startswith("--sft-dataset=") for a in sys.argv[1:]):
+        raise SystemExit("loomsft: --sft-dataset is required (see loomformer.py --help)")
+    lf.main()
 
 
 if __name__ == "__main__":

@@ -921,11 +921,14 @@ ATTN_SDPA_RECOMPUTE_BACKWARD = True
 _sdpa_bf16_efficient_cache: Dict[Tuple[int, int, int], bool] = {}
 _flash_varlen_func = None
 _flash_varlen_import_tried = False
+_flash_varlen_import_error: Optional[str] = None
 _flash_deterministic_kw_supported: Optional[bool] = None
 _flash_backend_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
 _flash_value_fusion_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_flash_probe_errors: Dict[Tuple[int, torch.dtype, int], str] = {}
 _te_backend_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
 _te_value_fusion_cache: Dict[Tuple[int, torch.dtype, int], bool] = {}
+_te_probe_errors: Dict[Tuple[int, torch.dtype, int], str] = {}
 _te_dpa_modules: Dict[Tuple[int, int, int, int, int], nn.Module] = {}
 _attention_backend_reported: set = set()
 _REAL_STDOUT = sys.stdout
@@ -1267,6 +1270,16 @@ def warmup_cuda_kernels() -> None:
     # final "16/16" line appears later in the startup log.
     if USE_CUDA_BETA_SPACE:
         _try_load_cuda_paraplex()
+    # Temporal packed attention needs this one-launch history packer before
+    # calling the external varlen FA/TE backend. Build it during startup so
+    # kernel progress reaches N/N and any compiler error is reported before
+    # model/torch.compile warmup rather than lazily in the first train step.
+    if (
+        torch.cuda.is_available()
+        and TRIA_CARRY_ENABLED
+        and TRIA_TEMPORAL_ENABLED
+    ):
+        _try_load_cuda_packed_gather()
 
 class ByteTokenizer:
     vocab_size = 256
@@ -3648,16 +3661,18 @@ def _bf16_efficient_sdpa_supported(device: torch.device) -> bool:
 
 
 def _get_flash_varlen_func():
-    global _flash_varlen_func, _flash_varlen_import_tried
+    global _flash_varlen_func, _flash_varlen_import_tried, _flash_varlen_import_error
     if _flash_varlen_import_tried:
         return _flash_varlen_func
     _flash_varlen_import_tried = True
     try:
         from flash_attn import flash_attn_varlen_func
-    except (ImportError, OSError):
+    except (ImportError, OSError) as error:
         _flash_varlen_func = None
+        _flash_varlen_import_error = f"{type(error).__name__}: {error}"
     else:
         _flash_varlen_func = flash_attn_varlen_func
+        _flash_varlen_import_error = None
     return _flash_varlen_func
 
 
@@ -3745,9 +3760,10 @@ def _probe_flash_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
             torch.cuda.synchronize(device)
         _flash_backend_cache[key] = True
         del q, k, v_base, base_out
-    except Exception:
+    except Exception as error:
         _flash_backend_cache[key] = False
         _flash_value_fusion_cache[key] = False
+        _flash_probe_errors[key] = f"{type(error).__name__}: {error}"
         return False
     if 2 * HEAD_DIM > 256:
         _flash_value_fusion_cache[key] = False
@@ -3771,8 +3787,11 @@ def _probe_flash_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
             torch.cuda.synchronize(device)
         ok = out.shape[-1] == 2 * HEAD_DIM
         del q, k, fused_kv, cu, out
-    except Exception:
+    except Exception as error:
         ok = False
+        _flash_probe_errors[key] = (
+            "fused-value probe only (base varlen works): "
+            f"{type(error).__name__}: {error}")
     _flash_value_fusion_cache[key] = ok
     return ok
 
@@ -3882,9 +3901,10 @@ def _probe_te_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
             torch.cuda.synchronize(device)
         _te_backend_cache[key] = True
         del q, k, v, out
-    except Exception:
+    except Exception as error:
         _te_backend_cache[key] = False
         _te_value_fusion_cache[key] = False
+        _te_probe_errors[key] = f"{type(error).__name__}: {error}"
         return False
     if 2 * HEAD_DIM > 256:
         _te_value_fusion_cache[key] = False
@@ -3903,8 +3923,11 @@ def _probe_te_value_fusion(device: torch.device, dtype: torch.dtype) -> bool:
             torch.cuda.synchronize(device)
         ok = out.shape[-1] == 2 * HEAD_DIM
         del q, k, fused_kv, out
-    except Exception:
+    except Exception as error:
         ok = False
+        _te_probe_errors[key] = (
+            "fused-value probe only (base varlen works): "
+            f"{type(error).__name__}: {error}")
     del cu
     _te_value_fusion_cache[key] = ok
     return ok
@@ -3951,6 +3974,31 @@ def _varlen_backend(tensor: torch.Tensor) -> Optional[str]:
                 f"[attention] packed varlen backend={backend} device=cuda:{idx} "
                 f"dtype={tensor.dtype} head_dim={HEAD_DIM}")
     return backend
+
+
+def _varlen_backend_failure_detail(
+    device: torch.device, dtype: torch.dtype
+) -> str:
+    idx = torch.cuda.current_device() if device.index is None else int(device.index)
+    key = (idx, dtype, HEAD_DIM)
+    if _flash_varlen_func is None:
+        flash = (
+            f"FlashAttention import failed ({_flash_varlen_import_error})"
+            if _flash_varlen_import_error
+            else "FlashAttention varlen API is unavailable"
+        )
+    else:
+        flash = (
+            f"FlashAttention probe failed ({_flash_probe_errors[key]})"
+            if key in _flash_probe_errors
+            else "FlashAttention is ineligible for this device/dtype/head_dim"
+        )
+    te = (
+        f"Transformer Engine probe failed ({_te_probe_errors[key]})"
+        if key in _te_probe_errors
+        else "Transformer Engine varlen DPA is unavailable or ineligible"
+    )
+    return f"{flash}; {te}"
 
 
 def _varlen_value_fusion_enabled(backend: str, tensor: torch.Tensor) -> bool:
@@ -4764,7 +4812,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         k_new = k_new_q.view(B, 1, N_KV_HEADS, GQA_GROUP_SIZE, HEAD_DIM)[:, :, :, 0, :]
         v_new = self._split_kv_heads(v_p)
         storage = z.device if kv_runtime is None else kv_runtime.storage_device
-        if storage.type == "cpu":
+        if storage.type == "cpu" and z.device.type == "cuda":
             c_g, kctx_g, k_cache, v_cache = self._step_cpu_kv(
                 q, k_new, v_new, k_cache, v_cache, cache_len, kv_runtime)
         elif storage != z.device:
@@ -5505,6 +5553,7 @@ class Model(nn.Module):
                 raise RuntimeError(
                     "attn_impl='auto' found no validated varlen forward+backward "
                     f"backend on cuda:{idx_cuda} (SM{major}x, {compute_dtype}). "
+                    f"{_varlen_backend_failure_detail(idx.device, compute_dtype)}. "
                     "Install a compatible flash-attn or Transformer Engine build; "
                     "set attn_impl='sdpa' explicitly only if the slow fallback is intentional.")
         if (
@@ -7368,12 +7417,26 @@ def _eval_full_sft(model: nn.Module, cfg: Config, dataset: str, device: torch.de
     try:
         B = max(1, int(eval_batch_size if eval_batch_size is not None else cfg.batch_size))
         total_nll, total_tokens = 0.0, 0
-        remaining = int(stream.n_rows)
-        while remaining > 0:
-            rows = stream._take_rows(min(B, remaining))
-            remaining -= len(rows)
-            ids, mask = stream._pack_batch_np(rows)
-            batch = (torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device))
+        if hasattr(stream, "iter_eval_batches"):
+            batches = stream.iter_eval_batches(B)
+        else:
+            def cached_batches():
+                remaining = int(stream.n_rows)
+                while remaining > 0:
+                    rows = stream._take_rows(min(B, remaining))
+                    remaining -= len(rows)
+                    ids, mask = stream._pack_batch_np(rows)
+                    yield torch.from_numpy(ids), torch.from_numpy(mask), None
+            batches = cached_batches()
+        for ids, mask, packed_layout in batches:
+            ids = ids.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            metadata = (
+                packed_layout.to(device, non_blocking=True)
+                if packed_layout is not None
+                else None
+            )
+            batch = (ids, mask, metadata) if metadata is not None else (ids, mask)
             x, y, position_ids, attn_mask = split_train_batch(batch, stream._eos_id)
             ntok = int((y != IGNORE_INDEX).sum().item())
             if ntok == 0:
@@ -7770,4 +7833,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Every torchrun rank owns its process group. Explicit teardown avoids
+        # relying on interpreter destruction, which can strand pending NCCL
+        # work or let one rank exit before its peers.
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()

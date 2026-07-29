@@ -835,6 +835,79 @@ class SFTOnTheFlyStream(SFTStream):
             layout = layout.pin_memory()
         return ids, mask, layout
 
+    def iter_eval_batches(self, batch_size: int):
+        """Yield one bounded-memory, deterministic pass over this OTF split."""
+        batch_size = max(1, int(batch_size))
+        open_ids = [
+            np.full(self.T1, self._pad_id, dtype=np.int64)
+            for _ in range(batch_size)
+        ]
+        open_mask = [
+            np.zeros(self.T1, dtype=np.int8)
+            for _ in range(batch_size)
+        ]
+        cursors = np.zeros(batch_size, dtype=np.int64)
+        ready = []
+        valid_examples = 0
+
+        def emit(bin_index: int):
+            if cursors[bin_index] <= 0:
+                return None
+            ready.append((
+                open_ids[bin_index].copy(),
+                open_mask[bin_index].copy(),
+            ))
+            open_ids[bin_index].fill(self._pad_id)
+            open_mask[bin_index].fill(0)
+            cursors[bin_index] = 0
+            if len(ready) < batch_size:
+                return None
+            batch = self._materialize_batch(ready)
+            ready.clear()
+            return batch
+
+        def place(tokenized):
+            nonlocal valid_examples
+            for ids, mask in tokenized:
+                valid_examples += 1
+                need = len(ids) + 1
+                fits = np.flatnonzero(cursors + need <= self.T1)
+                if fits.size == 0:
+                    batch = emit(int(np.argmax(cursors)))
+                    if batch is not None:
+                        yield batch
+                    fits = np.flatnonzero(cursors + need <= self.T1)
+                remaining = self.T1 - (cursors[fits] + need)
+                target = int(fits[int(np.argmin(remaining))])
+                begin = int(cursors[target])
+                open_ids[target][begin:begin + len(ids)] = ids
+                local_mask = mask.copy()
+                local_mask[0] = 0
+                open_mask[target][begin:begin + len(ids)] = local_mask
+                open_ids[target][begin + len(ids)] = self._eos_id
+                cursors[target] += need
+
+        pending = []
+        for row, ex in self._iter_epoch_examples(epoch=0):
+            pending.append((row, ex))
+            if len(pending) < self._TOKENIZE_BATCH:
+                continue
+            yield from place(self._tokenize_examples(pending))
+            pending.clear()
+        if pending:
+            yield from place(self._tokenize_examples(pending))
+        for target in np.argsort(-cursors):
+            batch = emit(int(target))
+            if batch is not None:
+                yield batch
+        if ready:
+            yield self._materialize_batch(ready)
+        if valid_examples == 0:
+            raise ValueError(
+                "SFT OTF evaluation produced zero trainable examples: every "
+                "record was invalid, had no assistant-supervised tokens, "
+                f"or exceeded seq_len={int(self.cfg.seq_len)}")
+
     def _produce_cpu_batches(self) -> None:
         batch_size = int(self.cfg.batch_size)
         open_ids = [
@@ -869,11 +942,13 @@ class SFTOnTheFlyStream(SFTStream):
         try:
             while not self._stop.is_set():
                 pending = []
+                valid_examples = 0
                 for row, ex in self._iter_epoch_examples(epoch):
                     pending.append((row, ex))
                     if len(pending) < self._TOKENIZE_BATCH:
                         continue
                     for ids, mask in self._tokenize_examples(pending):
+                        valid_examples += 1
                         need = len(ids) + 1
                         fits = np.flatnonzero(cursors + need <= self.T1)
                         if fits.size == 0:
@@ -893,6 +968,7 @@ class SFTOnTheFlyStream(SFTStream):
                     pending.clear()
                 if pending:
                     for ids, mask in self._tokenize_examples(pending):
+                        valid_examples += 1
                         need = len(ids) + 1
                         fits = np.flatnonzero(cursors + need <= self.T1)
                         if fits.size == 0:
@@ -909,6 +985,11 @@ class SFTOnTheFlyStream(SFTStream):
                         cursors[target] += need
                 for target in np.argsort(-cursors):
                     emit(int(target))
+                if valid_examples == 0:
+                    raise ValueError(
+                        "SFT OTF epoch produced zero trainable examples: every "
+                        "record was invalid, had no assistant-supervised tokens, "
+                        f"or exceeded seq_len={int(self.cfg.seq_len)}")
                 epoch += 1
         except BaseException as exc:
             self._producer_error = exc

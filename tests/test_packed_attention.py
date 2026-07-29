@@ -33,7 +33,7 @@ class PackedAttentionTests(unittest.TestCase):
         cpu_plan = lf.build_packed_chunk_layout(
             layout, 4, 8, ((0, 4), (4, 8)))
         cuda_plan = cpu_plan.to(torch.device("cuda"))
-        for dtype in (torch.float32, torch.float16):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
             source = [
                 torch.randn(2, 4, 2, 3, device="cuda", dtype=dtype)
                 for _ in range(2)

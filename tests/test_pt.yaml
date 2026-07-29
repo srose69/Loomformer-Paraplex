@@ -1,0 +1,110 @@
+# Self-contained pretraining integration-test template.
+# tests/run_matrix.py supplies temporary tokenizer/dataset/checkpoint paths and
+# chooses CPU/CUDA/DDP according to the host. Keep model geometry identical to
+# test_sft.yaml: the PT checkpoint is used to initialize the SFT cases.
+
+optimizer: adamw
+steps: 2
+lr: 0.001
+weight_decay: 0.01
+grad_clip: 1.0
+warmup_steps: 1
+min_lr_frac: 0.1
+seed: 17
+log_every: 1
+eval_every: 1
+eval_batches: 1
+device: cpu
+grad_accum_steps: 2
+grad_checkpointing: false
+fsdp_full_shard: false
+optimizer_zero_shard: false
+fused_linear_ce: true
+fused_linear_ce_chunk_size: 16
+amp_dtype: fp32
+save_every: 1
+save_initial_checkpoint: true
+save_final_checkpoint: true
+runpoints_path: null
+checkpoint: null
+resume: null
+resume_data_stream: auto
+compile: false
+graph: false
+save_graph: false
+
+seq_len: 64
+batch_size: 2
+prefetch_batches: 2
+gpu_prefetch_batches: 1
+
+tokenizer: null
+vocab: 320
+tied_embeddings: true
+doc_reset_attn: true
+train_dataset: null
+val_dataset: null
+auto_val_split_pct: 0.0
+dataset_format: bin
+text_field: text
+dataset_cache: mmap
+
+rope_theta: 10000.0
+rope_original_seq_len: 64
+rope_factor: 2.0
+rope_beta_fast: 32.0
+rope_beta_slow: 1.0
+rope_attention_factor: null
+
+model_dim: 32
+n_q_heads: 4
+head_dim: 8
+n_kv_heads: 2
+gqa_group_size: null
+hidden: 64
+hidden_mult: null
+layers: 2
+final_norm: true
+paraplex_gate_proj: true
+
+phase_sectors: open
+residual_init: beta
+depth_attn_readout: per-sublayer
+depth_attn_qkv_rms: true
+residual_branch_rms_cap: 1.0
+activation: pvpowlu
+powlu_m: 3.0
+phase_grad_floor: 0.05
+phase_grad_mode: secant
+attn_impl: sdpa
+attn_sdpa_compute_dtype: auto
+attn_sdpa_value_fusion: true
+attn_sdpa_recompute_backward: false
+
+tria_carry_enabled: true
+use_cuda_tria: true
+tria_temporal_enabled: true
+tria_temporal_auto: false
+tria_temporal_window: 32
+tria_temporal_window_min: 16
+tria_temporal_window_max: 32
+tria_target_refeeds_per_sequence: 2
+tria_min_refeeds_per_sequence: 1
+tria_carrier_alpha: 0.05
+tria_carrier_alpha_candidates: [0.025, 0.05]
+tria_polarm_beta: 0.1
+tria_gamma_max: 0.25
+tria_raw_gamma_init: 0.0
+tria_temporal_calib_tokens: 64
+tria_temporal_calib_seeds: 1
+tria_temporal_calib_batch: 1
+tria_temporal_calib_device: cpu
+tria_temporal_calib_parallel_sweep: 1
+tria_temporal_max_condition: 3.0
+tria_temporal_min_effective_rank: 2.0
+tria_temporal_population_pass_fraction: 0.5
+
+use_cuda_beta_space: true
+use_cuda_phase_sin: true
+use_cuda_pvpowlu: true
+use_cuda_depth_attn: true

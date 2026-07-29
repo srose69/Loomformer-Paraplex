@@ -10,19 +10,41 @@ Causal GQA remains the token mixer. Paraplex changes the FFN. DepthAttn changes 
 
 by **srose69** (SimpleRose)
 
+**Author mechanisms · Авторские механизмы**
+
+[![Architecture LoomFormer](https://img.shields.io/badge/architecture-LoomFormer-111827)](#architecture-at-a-glance)
+[![Neuron Paraplex](https://img.shields.io/badge/neuron-Paraplex-7c3aed)](#paraplex)
+[![Weight pseudo-complex](https://img.shields.io/badge/weight-pseudo--complex-8b5cf6)](#the-effective-pseudo-complex-weight)
+[![Imaginary pseudo-paravector](https://img.shields.io/badge/imaginary-pseudo--paravector-9333ea)](#the-effective-pseudo-complex-weight)
+[![Activation PvPowLU](https://img.shields.io/badge/activation-PvPowLU-db2777)](#pvpowlu)
+[![Residual DepthAttn](https://img.shields.io/badge/residual-DepthAttn-0891b2)](#depthattn)
+[![Operator Tria 3x3](https://img.shields.io/badge/operator-Tria%203%C3%973-f97316)](#tria)
+[![Carrier joint RMS](https://img.shields.io/badge/carrier-joint--RMS-f97316)](#tria)
+[![Stabilizer PolARM](https://img.shields.io/badge/stabilizer-PolARM-eab308)](#polarm)
+[![Temporal boundary refeed](https://img.shields.io/badge/temporal-boundary%20refeed-f59e0b)](#boundary-to-boundary-temporal-carry)
+[![Gate identity anchored](https://img.shields.io/badge/gate-identity--anchored-14b8a6)](#paraplex)
+[![Phase bounded trace](https://img.shields.io/badge/phase-bounded%20trace-a855f7)](#paraplex)
+[![Memory carrier replay](https://img.shields.io/badge/memory-carrier%20replay-0f766e)](#recompute-and-depth-replay)
+[![Readout sparse final CA](https://img.shields.io/badge/readout-sparse%20final--CA-0369a1)](#final-tria-readout)
+
+**Runtime and compatibility · Runtime и совместимость**
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-red)](https://pytorch.org/)
-[![CUDA fused paths](https://img.shields.io/badge/CUDA-fused%20paths-green)](https://developer.nvidia.com/cuda-toolkit)
+[![Release pre-release](https://img.shields.io/badge/release-pre--release-f59e0b)](#status)
+[![CUDA 12.x / 13.x](https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-76b900)](https://developer.nvidia.com/cuda-toolkit)
+[![GPU Pascal to Blackwell](https://img.shields.io/badge/GPU-Pascal%20%E2%86%92%20Blackwell-76b900)](#requirements)
+[![Precision FP32 FP16 BF16](https://img.shields.io/badge/precision-FP32%20%7C%20FP16%20%7C%20BF16-2563eb)](#configuration)
 [![Attention GQA](https://img.shields.io/badge/attention-causal%20GQA-black)](#causal-gqa)
-[![FFN Paraplex](https://img.shields.io/badge/FFN-Paraplex-blueviolet)](#paraplex)
-[![Residual DepthAttn](https://img.shields.io/badge/residual-DepthAttn-cyan)](#depthattn)
-[![Operator carry Tria](https://img.shields.io/badge/operator%20carry-Tria-orange)](#tria)
-[![Activation PvPowLU](https://img.shields.io/badge/activation-PvPowLU-ff69b4)](#pvpowlu)
+[![Attention backends](https://img.shields.io/badge/backends-FlashAttention%20%7C%20TE%20%7C%20SDPA-0ea5e9)](#cuda-kernels-and-replay)
 [![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/srs6901/LoomFormer-Paraplex/)
-[![SFT supported](https://img.shields.io/badge/SFT-supported-purple)](#training-sft-and-inference)
-[![Status experimental](https://img.shields.io/badge/status-experimental-orange)](#status)
+[![Training PT + SFT](https://img.shields.io/badge/training-PT%20%2B%20SFT-9333ea)](#training-sft-and-inference)
+[![Distributed DDP](https://img.shields.io/badge/distributed-DDP-7c3aed)](#training-sft-and-inference)
+[![Data packed + OTF](https://img.shields.io/badge/data-packed%20%2B%20OTF-0891b2)](#training-sft-and-inference)
+[![Tests GPU matrix](https://img.shields.io/badge/tests-GPU%20matrix-16a34a)](#status)
+[![Docs EN / RU](https://img.shields.io/badge/docs-EN%20%7C%20RU-475569)](#en)
 
-> Some badges are clickable.
+> Badges link to the corresponding architecture, runtime and project sections.
 
 <a href="#en">English</a> · <a href="#ru">Русский</a>
 
@@ -30,9 +52,9 @@ by **srose69** (SimpleRose)
 
 ---
 
-> **Note:** LoomFormer is active research code. The equations below describe the current implementation, but checkpoint compatibility, configuration names and fused CUDA paths may still change.
+> **Note:** LoomFormer is pre-release research code. The equations below describe the current implementation, but checkpoint compatibility, configuration names and fused CUDA paths may still change.
 >
-> **Примечание:** LoomFormer — активно развивающийся исследовательский код. Формулы ниже описывают текущую реализацию, но совместимость чекпойнтов, имена параметров и fused CUDA-пути ещё могут меняться.
+> **Примечание:** LoomFormer — исследовательский код в статусе pre-release. Формулы ниже описывают текущую реализацию, но совместимость чекпойнтов, имена параметров и fused CUDA-пути ещё могут меняться.
 
 <a name="en"></a>
 
@@ -50,6 +72,7 @@ by **srose69** (SimpleRose)
   - [Tria](#tria)
   - [One Tria step from L1 to L2](#one-tria-step-from-l1-to-l2)
   - [Boundary-to-boundary temporal carry](#boundary-to-boundary-temporal-carry)
+    - [PolARM](#polarm)
   - [Final Tria readout](#final-tria-readout)
 - [Runtime state and VRAM](#runtime-state-and-vram)
 - [CUDA kernels and replay](#cuda-kernels-and-replay)
@@ -222,13 +245,13 @@ The refeed seed is consumed once at the next segment start. Temporal accumulatio
 | `m_s` | pooled DepthAttn read at sublayer `s` |
 | `R`, `I`, `O` | Paraplex real, phase and output coordinates |
 | `A` | positive PvPowLU amplitude `softplus(g)` |
-| `a`, `b`, `c` | bounded pairwise relations `tanh(RI)`, `tanh(RO)`, `tanh(IO)` |
+| `a`, `b`, `c` | jointly RMS-scaled and bounded pairwise relations derived from `RI`, `RO`, `IO` |
 | `K(a,b,c)` | skew-symmetric Tria generator (distinct from attention keys `K`) |
 | `T_{l,t,h}` | local Tria operator |
 | `C_l` | depth carrier after layer `l`; `D_t = C_{L,t}` is the finished depth carrier |
 | `accT_t` | temporal Tria accumulator (code name `accT`) |
 | `b_k` | token position of a fired temporal boundary |
-| `I_3`, `𝒩(·)` | identity matrix; max-absolute normalization |
+| `I_3`, `𝒩(·)` | identity matrix; per-matrix RMS normalization over all nine entries |
 
 ### Causal GQA
 
@@ -246,7 +269,7 @@ K^{\mathrm{ctx}}_t = A_tK_{\le t}.
 
 LoomFormer keeps both the attention context `Vctx` and the attended key context `Kctx`. The ordinary attention output is projected back into the residual stream, while `Q`, `Kctx` and `Vctx` are also passed into Paraplex.
 
-The causal-attention implementation supports flat, chunked and token-by-token execution. Packed SFT rows use explicit block-diagonal masks so examples packed into one tensor cannot attend across their boundaries.
+The causal-attention implementation supports flat, chunked and token-by-token execution. Packed SFT rows carry a linear `segment_ids`/`cu_seqlens` layout. With `attn_impl: auto`, Ampere-and-newer training sends that layout to a validated FlashAttention or Transformer Engine varlen backend. The compact SDPA path processes each document independently on Pascal and in reference execution. Temporal chunks use precomputed gather plans for the K/V history. Document-layout metadata remains `O(BT)` and preserves isolation across packed examples.
 
 ### DepthAttn
 
@@ -268,7 +291,37 @@ The softmax axis is **depth**, not token position. There are two reads per block
 - one read supplies the skip used around causal attention;
 - the second supplies both the FFN skip and the depth context given to Paraplex.
 
-The readout projection may be shared by all sublayers or separated per sublayer. Optional RMS fixing is available for the depth Q/K/V inputs, and an optional RMS cap can limit unusually large residual branches without amplifying quiet ones.
+The readout projection may be shared by all sublayers or separated per sublayer. With `depth_attn_qkv_rms: true`, the code applies, independently to every last-dimension vector,
+
+```math
+\mathrm{FixRMS}_{\rho}(x)
+=
+x\frac{\rho}{\sqrt{\mathrm{mean}_i(x_i^2)+\varepsilon}}.
+```
+
+The targets match the initialization scales:
+
+```math
+q_s\leftarrow\mathrm{FixRMS}_{0.88/\sqrt{d_h}}(q_s),
+\qquad
+k_j\leftarrow\mathrm{FixRMS}_{0.88}(k_j),
+\qquad
+v_j\leftarrow\mathrm{FixRMS}_{0.88\beta_{\mathrm{init}}}(v_j),
+```
+
+where `βinit=(8L)^(-1/4)` for `residual_init: beta` and `βinit=1` for `fanin`. The attention formula above is evaluated after these transforms.
+
+`residual_branch_rms_cap: c` applies
+
+```math
+\mathrm{CapRMS}_{c}(x)
+=
+x\min\!\left(
+1,\frac{c}{\sqrt{\mathrm{mean}_i(x_i^2)+\varepsilon}}
+\right)
+```
+
+to the depth skip and the attention/FFN branch separately, immediately before each sum and `LayerNorm`. Quiet branches retain their scale. Flat, chunked and token-by-token paths use the same order.
 
 ### Paraplex
 
@@ -300,7 +353,7 @@ R_t=
 W_{\mathrm{real},l}u_t+b_l.
 ```
 
-The stored matrix `W_real` is not rewritten by Tria. The carrier creates a token-dependent diagonal gain on its output rows. Because every carrier is max-absolute normalized and the nine-slot selector is a softmax mixture, `|p_{t,h}|≤1`; therefore the multiplicative factor stays between `0.75` and `1.25`. The bias remains an untranslated origin rather than being scaled together with the input-dependent response.
+The stored matrix `W_real` is not rewritten by Tria. The carrier creates a token-dependent diagonal gain on its output rows. A carrier has RMS approximately one over its nine entries, so `|vec(C)[j]| ≤ 3`; the softmax slot mixture therefore gives `|p[t,h]| ≤ 3`. With the fixed local limit `|γ[l]| ≤ 0.25`, the multiplicative factor stays in `[0.25, 1.75]`. The bias remains an untranslated origin rather than being scaled together with the input-dependent response.
 
 For the gate itself,
 
@@ -327,7 +380,7 @@ d_t
 +b^{\mathrm{imag}}_h.
 ```
 
-The phase weights are sector-constrained. In `head` mode, a hidden group reads the Q/Kctx/Vctx/Depth channels associated with its own query head while retaining the full model-state source `u`. In `open` mode, selected context sectors may cross head boundaries. The compact `w1_imag` parameter stores only live sector weights; the dense matrix used by the GEMM is a transient scatter result, not a second trainable matrix.
+The phase weights are sector-constrained. In `head` mode, a hidden group reads the Q/Kctx/Vctx/Depth channels associated with its own query head and the full model-state source `u`. In `open` mode, Q remains head-local while Kctx, Vctx, `u` and Depth are full-width sources shared across head boundaries. The compact `w1_imag` parameter stores only live sector weights; the dense matrix used by the reference GEMM is a transient expansion, not a second trainable matrix.
 
 The current phase is bounded by a saturating sinusoidal map:
 
@@ -547,17 +600,25 @@ The immediate Tria gate preserves the hidden-channel index. Cross-channel mixing
 
 The equations below define Tria exactly, but they do not by themselves identify its learned semantic role. In trained checkpoints, the carrier is causally active: disabling it changes downstream computation and autoregressive logits. However, its states have not yielded a stable token-level dictionary or a straightforward human-readable interpretation. Tria may encode its useful function through distributed population geometry, operator composition and trajectories across depth and time rather than through individually decodable coordinates.
 
-Tria takes the three Paraplex coordinates `R`, `I` and `O` for every token and hidden channel. The implementation materializes three unique pairwise relations:
+Tria takes the three Paraplex coordinates `R`, enriched phase `I` and pre-`W2` activated output `O` for every token and hidden channel. It first forms
 
 ```math
-a=\tanh(RI),
+x=(RI,RO,IO),
 \qquad
-b=\tanh(RO),
-\qquad
-c=\tanh(IO).
+\sigma_x=\sqrt{\frac{x_1^2+x_2^2+x_3^2}{3}+\varepsilon},
 ```
 
-Before the `tanh` bound, the products obey
+and then jointly RMS-scales the three relations before bounding them:
+
+```math
+a=\tanh\!\left(\frac{RI}{\sigma_x}\right),
+\qquad
+b=\tanh\!\left(\frac{RO}{\sigma_x}\right),
+\qquad
+c=\tanh\!\left(\frac{IO}{\sigma_x}\right).
+```
+
+The shared positive divisor preserves their relative magnitudes and signs. Away from the epsilon floor, this map is invariant to a common rescaling of `R`, `I` and `O`. Before the joint RMS and `tanh`, the products obey
 
 ```math
 (RI)(RO)(IO)=R^2I^2O^2\ge 0.
@@ -565,7 +626,7 @@ Before the `tanh` bound, the products obey
 
 They are invariant to a simultaneous sign flip `(R,I,O)→(-R,-I,-O)`. Tria therefore reacts to relative sign and magnitude relations, not to an arbitrary global sign convention.
 
-The code does **not** store a separate raw `3×3` outer-product matrix. It stores the three bounded relations above, inserts them into a skew-symmetric generator, multiplies by a fixed axis rotation, and then composes the resulting carrier. The nine slots read by selectors are the nine entries of that carrier after rotation and composition.
+The implementation inserts these three bounded relations into a skew-symmetric generator, multiplies by a fixed axis rotation, and composes the resulting carrier. The nine slots read by selectors are the nine entries of that carrier after rotation and composition.
 
 The generator is
 
@@ -587,11 +648,23 @@ T_{l,t,h}=\left(I_3+\alpha K_{l,t,h}\right)R_{\mathrm{axis}(l)},
 
 where `Raxis` is a fixed `+90°` rotation around one coordinate axis. The axis cycles with layer depth. `α` is a small carrier coefficient, configured directly or selected by the startup calibration path.
 
-Each matrix composition is normalized by its largest absolute entry:
+The joint bound gives
+
+```math
+\kappa_2(I_3+\alpha K)
+\le
+\sqrt{1+3\alpha^2},
+```
+
+and the fixed rotation leaves the singular values unchanged.
+
+Every normalization is local to one `[batch, token, hidden]` matrix and uses the RMS of all nine entries:
 
 ```math
 \mathcal N(M)=
-\frac{M}{\max\!\left(\max_{i,j}|M_{ij}|,\varepsilon\right)}.
+\frac{M}{
+\sqrt{\frac{1}{9}\sum_{i=1}^{3}\sum_{j=1}^{3}M_{ij}^{2}+\varepsilon}
+}.
 ```
 
 A useful invariant follows directly from this construction. If `R=I=O=0`, then `a=b=c=0`, but
@@ -679,12 +752,33 @@ D_{b_k}D_{b_k-1}\cdots D_{s_k}
 
 contains the depth carriers accumulated since the current segment start `s_k`, with local normalization after each implemented multiplication.
 
+#### PolARM
+
+At the fired boundary, PolARM applies one Gram correction before the carrier is stored as a final-CA key and reused as the next segment's seed:
+
+```math
+G_b=\mathrm{accT}_{b_k}^{\top}\mathrm{accT}_{b_k},
+\qquad
+s_b=\frac{\mathrm{tr}(G_b)}{3},
+```
+
+```math
+\widetilde{\mathrm{accT}}_{b_k}
+=
+\mathrm{accT}_{b_k}
+\left[
+I_3-\frac{\beta_{\mathrm{P}}}{2}
+\left(\frac{G_b}{\max(s_b,\varepsilon)}-I_3\right)
+\right],
+\qquad 0\le\beta_{\mathrm{P}}<1.
+```
+
 For the first token of the next segment, `t_0=b_k+1`, the boundary endpoint is injected into Tria layer 1:
 
 ```math
 C_{1,t_0}^{\mathrm{seed}}
 =
-\mathcal N\!\left(T_{1,t_0}\,\mathrm{accT}_{b_k}\right).
+\mathcal N\!\left(T_{1,t_0}\,\widetilde{\mathrm{accT}}_{b_k}\right).
 ```
 
 The remaining layers then run normally:
@@ -710,17 +804,17 @@ For later tokens before the next boundary,
 \qquad t_0<t\le b_{k+1}.
 ```
 
-This reset is intentional. `accT_{b_k}` already participates inside `D_{t_0}^{seed}` through the first-layer composition; multiplying the old endpoint into the temporal recurrence again would count it twice.
+This reset is intentional. `accT̃_{b_k}` already participates inside `D_{t_0}^{seed}` through the first-layer composition; multiplying the old endpoint into the temporal recurrence again would count it twice.
 
 The complete boundary route is therefore
 
 ```text
 last-block carriers D_s ... D_b
           │
-          └── streaming temporal composition ──► boundary endpoint accT_b
+          └── streaming temporal composition ──► accT_b ──► PolARM ──► accT̃_b
                                                    │
                                                    ├── final-CA key/value
-                                                   └── T_1,next @ accT_b
+                                                   └── T_1,next @ accT̃_b
                                                          │
                                                          ├── compose through all layers
                                                          └── restart temporal state from D_next^seed
@@ -732,7 +826,16 @@ The full-sequence PyTorch reference also contains an associative segmented scan 
 
 A fired temporal endpoint has shape `[H,3,3]`. The reader does not first allocate one `k`-dimensional representation per hidden neuron. It scores the nine raw slots, pools them over the hidden population, and only then applies the shared value projection.
 
-Let `x_{b,h}=vec(accT_{b,h})`. A learned query and an independent slot-key projection define one normalized score direction `s` in the nine-slot space. The population weights are
+Let `x_{b,h}=vec(accT̃_{b,h})`. A learned query `qpool`, an independent slot-key projection and a learned positive logit scale define
+
+```math
+s_b=
+\mathrm{softplus}(\widehat\tau)\,
+\frac{W_{\mathrm{key}}^{\top}q_{\mathrm{pool}}}
+{\max\!\left(\left\|W_{\mathrm{key}}^{\top}q_{\mathrm{pool}}\right\|_2,\varepsilon\right)}.
+```
+
+The population weights are
 
 ```math
 \rho_{b,h}
@@ -873,11 +976,25 @@ for the two length-dependent K/V cache families at `B=1` and bf16. Adding fixed 
 
 The current chat implementation has no rolling-cache wraparound. A 10k conversation therefore requires a checkpoint/configuration whose `seq_len` is at least `10,000`; the published `seq_len=1024` configuration cannot hold that conversation without rebuilding or changing the context policy.
 
+### KV placement and calibration
+
+`loomchat.py` stores exact-prefix snapshots, so a new turn prefills only the suffix added after the longest cached prefix. `--kvstorage` controls where the persistent layer K/V lives:
+
+| Value | Execution |
+| --- | --- |
+| `same` | K/V and attention stay on the model GPU. |
+| `cpu` | K/V stays in pinned RAM and is streamed through a CUDA staging ring while online softmax consumes earlier chunks. |
+| `cuda:N` | K/V stays on GPU `N`; the complete parameter-free attention reduction runs there and returns the attention and attended-key contexts to the model GPU. |
+
+At startup, the chat runtime measures a real model forward over up to `2048` tokens, incremental `Model.step` throughput, transport time and online-attention consumption. It benchmarks candidate chunks from `128` tokens up to the calibrated context length, selects the fastest measured pipeline and derives a dynamic preload. The no-starvation estimate receives a two-chunk safety margin. CPU storage uses pinned buffers and separate copy/compute streams. Remote CUDA storage records whether peer access exists; ordinary CUDA transfers supply a host-staged route on non-peer topologies.
+
+The same placement can be changed inside a session with `/kvstorage same`, `/kvstorage cpu` or `/kvstorage cuda:N`. Changing the compute device, dtype or KV placement invalidates the old snapshots and recalibrates transport.
+
 ## CUDA kernels and replay
 
 LoomFormer does not train the Paraplex and Tria paths as a long chain of generic PyTorch elementwise operations. The repository contains real CUDA sources under `kernels/`: device code lives in `*_kernel.cuh`, standalone translation units for PTX inspection live in `*_kernel.cu`, and ATen/PyBind launchers live in `*_launcher.cu`.
 
-The current tree contains 16 kernel groups built into six extensions:
+The current tree reports 17 kernel groups built into seven extensions:
 
 | Extension | Fused work |
 | --- | --- |
@@ -887,8 +1004,9 @@ The current tree contains 16 kernel groups built into six extensions:
 | `loomformer_pvpowlu` | Standalone PvPowLU forward and backward. |
 | `loomformer_depth_attn_online` | Online-softmax DepthAttn forward and backward over the fixed depth history. |
 | `loomformer_tria_carry` | Eleven Tria groups: initialization, seeded initialization, gated variants, depth steps, depth replay, slot mixing, population pooling, temporal carry, endpoint-only temporal carry and sparse final cross-attention. |
+| `loomformer_packed_gather` | One-launch document-major packing of temporal K/V history for varlen attention, including scatter-backward into source chunks. |
 
-The fused Paraplex path computes `beta_space` and then performs phase construction, temporal phase trace, amplitude, `P=R+AI`, PvPowLU and the required backward terms without materializing each algebraic subexpression as a separate Python-level tensor. Tria kernels keep the nine entries of a local `3x3` operator, its matrix product and max-absolute normalization in registers or local kernel state; intermediate local matrices are not persisted as separate model states.
+The fused Paraplex path computes `beta_space` and then performs phase construction, temporal phase trace, amplitude, `P=R+AI`, PvPowLU and the required backward terms without materializing each algebraic subexpression as a separate Python-level tensor. Tria kernels keep the three jointly RMS-scaled relations, the nine entries of a local `3x3` operator, its matrix product and per-matrix RMS normalization in registers or local kernel state; intermediate local matrices are not persisted as separate model states.
 
 ### Recompute and depth replay
 
@@ -917,9 +1035,9 @@ Chunked training usually needs the final temporal state of a segment, not every 
 
 and a small FP32 endpoint copy used by backward. It does not store a second full trajectory of temporal accumulators. Backward walks the input depth carriers in reverse and reconstructs each preceding normalized accumulator analytically from the invertible local factor and the current accumulator. This is the temporal counterpart of replay: the input depth carriers remain available, while the additional `[B,T,H,3,3]` prefix history is avoided.
 
-Other fused Tria kernels cover the nine-slot selector, population pooling and sparse final cross-attention, so those paths do not require constructing dense Python-side operator graphs. Every extension has a PyTorch fallback when compilation or a supported CUDA dtype/device is unavailable; the fast path is selected automatically when its runtime checks pass.
+Other fused Tria kernels cover the nine-slot selector, population pooling and sparse final cross-attention inside compact CUDA operator graphs. Algebraic kernels keep their checked PyTorch reference paths. Packed `attn_impl: auto` on Ampere and newer requires a validated varlen forward/backward backend and the packed-gather extension. Pascal training selects compact SDPA explicitly.
 
-Kernel extensions are built lazily with `torch.utils.cpp_extension.load` and Ninja. Source and included-header hashes are recorded in `kernels/.hashes.json`; unchanged modules are loaded from `kernels/build/` instead of being rebuilt. `TORCH_CUDA_ARCH_LIST` may be supplied explicitly, `KERNELS_VERBOSE=1` exposes the extension build log, and `KERNELS_DUMP_PTX=1` emits standalone PTX dumps for inspection after a changed build.
+Kernel extensions are built with `torch.utils.cpp_extension.load` and Ninja. Startup warms every extension required by the active graph, including `packed_gather`, before the architecture report. Source and included-header hashes are recorded in `kernels/.hashes.json`; unchanged modules are loaded from `kernels/build/`. `TORCH_CUDA_ARCH_LIST` may be supplied explicitly, `KERNELS_VERBOSE=1` exposes the extension build log, and `KERNELS_DUMP_PTX=1` emits standalone PTX dumps for inspection after a changed build.
 
 ## Depth and connectivity
 
@@ -949,7 +1067,8 @@ The repository contains complete paths for:
 - full sequential evaluation with loss, bits/token and bits/byte reporting;
 - smart resume of weights, step, schedule and data position;
 - AdamW or ATOM optimization;
-- supervised fine-tuning with packed examples, loss masks and tool-call templates;
+- supervised fine-tuning with compact packed layouts, assistant-only loss masks and tool-call templates;
+- bounded-memory Parquet SFT rendering/tokenization, destructive validation splitting and deterministic full-split evaluation;
 - donor checkpoint inspection and structural transplantation;
 - portable `.aio` packaging and interactive terminal chat;
 - AOTInductor export for a self-contained inference package.
@@ -967,23 +1086,47 @@ loomsft.py      supervised fine-tuning
 loomcloner.py   donor inspection and checkpoint transplantation
 loompack.py     portable .aio pack / inspect / extract utility
 loomchat.py     interactive terminal chat for .aio packages
+setup.sh        CUDA/PyTorch environment installation, repository update and validation
+tests/          synthetic PT/SFT integration matrix and numerical backend parity
 ```
 
 ## Quick start
 
 ### Install
 
-Create an environment and install the Python dependencies used by the selected workflow:
+Clone the repository and run the installer:
+
+```bash
+git clone https://github.com/srose69/Loomformer-Paraplex.git
+cd Loomformer-Paraplex
+./setup.sh
+```
+
+The installer probes every visible GPU. A machine containing Pascal or Volta selects the CUDA `12.6` / PyTorch `cu126` profile. A Turing-or-newer machine selects CUDA `13.0` / PyTorch `cu130`. The toolkit and venv are installed under `~/loom` by default. The menu also provides read-only environment inspection, package reinstall and repository update.
+
+The current installer defaults to PyTorch `2.12.1`. `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR` and `LOOM_BUILD_JOBS` provide explicit profile and location overrides.
+
+Repository update uses `git pull --ff-only` for a Git checkout. Tarball installations receive an upstream-file overlay. Checkpoints, datasets, logs, environments and local-only paths remain in place.
+
+The manual Python environment remains useful when the CUDA toolchain is already managed externally:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install torch numpy pyyaml tokenizers pyarrow safetensors transformers jinja2
+pip install torch numpy pyyaml tokenizers pyarrow safetensors transformers jinja2 einops
 ```
 
-ATOM and the custom C++/CUDA extensions are optional execution paths. They require their corresponding repository modules and a working CUDA build toolchain.
+Custom C++/CUDA extensions require Ninja, a matching CUDA toolkit and a C++ compiler. `flash-attn` is required by `attn_impl: auto` for bf16/fp16 packed training on Ampere and newer; a validated Transformer Engine varlen backend also satisfies this path.
 
-### Smoke tests
+### Validation
+
+```bash
+python tests/run_matrix.py --setup
+```
+
+The matrix creates its tokenizer, PT streams and Parquet chat datasets in a temporary directory. It runs unit invariants, loads every fused extension, checks forward/backward parity on each visible GPU, performs PT and SFT optimizer steps, resumes both checkpoints, evaluates complete validation splits and launches PT/SFT DDP across all visible GPUs. Ampere-and-newer runs also compare the validated varlen backend with the compact reference path.
+
+Small component smoke tests remain available:
 
 ```bash
 python loomformer.py --smoke-test
@@ -1062,6 +1205,14 @@ python loomformer.py \
 
 ### Supervised fine-tuning
 
+`cfg/alt6_sft.yaml` contains the dataset directory, pretrained initialization checkpoint, output checkpoint and DDP device list:
+
+```bash
+python loomformer.py --train --config cfg/alt6_sft.yaml
+```
+
+The generic CLI form is:
+
 ```bash
 python loomsft.py \
   --config cfg/sft.yaml \
@@ -1080,6 +1231,18 @@ python loompack.py pack ./loomformer-sft.pt \
   -o loomformer.aio
 
 python loomchat.py loomformer.aio --device cuda:0
+```
+
+Store persistent KV snapshots in pinned RAM:
+
+```bash
+python loomchat.py loomformer.aio --device cuda:0 --kvstorage cpu
+```
+
+Run attention beside K/V stored on another GPU:
+
+```bash
+python loomchat.py loomformer.aio --device cuda:0 --kvstorage cuda:1
 ```
 
 ### Inspect a donor model
@@ -1103,9 +1266,10 @@ The model is configured from YAML. The main groups are:
 | DepthAttn | `depth_attn_readout`, `depth_attn_qkv_rms`, `residual_branch_rms_cap` |
 | Paraplex | `phase_sectors`, `activation`, `powlu_m`, `phase_grad_mode`, `phase_grad_floor`, `paraplex_gate_proj` |
 | Tria | `tria_carry_enabled`, `tria_temporal_enabled`, `tria_temporal_window`, `tria_carrier_alpha`, calibration fields |
-| Data | `dataset_format`, `text_field`, `seq_len`, `batch_size`, `prefetch_batches` |
+| Data | `train_dataset`, `val_dataset`, `auto_val_split_pct`, `dataset_format`, `dataset_cache`, `text_field`, `seq_len`, `batch_size`, `prefetch_batches` |
 | Training | `steps`, `lr`, `optimizer`, `weight_decay`, `grad_clip`, `grad_accum_steps`, `warmup_steps` |
-| Runtime | `device`, `amp_dtype`, `grad_checkpointing`, `graph`, `save_graph`, CUDA fast-path flags |
+| Checkpoints | `init_checkpoint`, `checkpoint`, `resume`, `resume_data_stream`, `runpoints_path` |
+| Runtime | `device`, `amp_dtype`, `grad_checkpointing`, `compile`, `graph`, `save_graph`, CUDA fast-path flags |
 
 Important shape invariants are checked when the configuration is applied:
 
@@ -1116,6 +1280,8 @@ Important shape invariants are checked when the configuration is applied:
 - the configured input length cannot exceed `seq_len`.
 
 The startup Tria calibration path can select a temporal window and carrier coefficient from a candidate population using condition number, effective rank and population-pass thresholds.
+
+For SFT, `dataset_cache: otf` accepts a Parquet file or a directory of top-level Parquet shards. Rows are partitioned by DDP rank, rendered and tokenized in bounded batches, then packed with compact document metadata. `auto_val_split_pct` cuts a validation tail into `<train_dataset>/val/val_split.parquet` once and reuses its manifest on subsequent runs. An epoch with zero trainable examples raises an error containing the active `seq_len`.
 
 ## Requirements
 
@@ -1137,6 +1303,8 @@ Workflow-dependent packages:
 
 CPU execution is supported by the reference paths. CUDA is required for practical training of the reference-sized models and for the fused custom operators.
 
+The supported CUDA hardware floor is Pascal (`SM 6.0`). Pascal and Volta use the CUDA 12 profile and explicit compact SDPA attention. Ampere, Ada, Hopper and Blackwell use a validated FlashAttention or Transformer Engine varlen backend for `attn_impl: auto`. Backend startup probes execute forward and backward and report the captured import or kernel failure when validation fails.
+
 ## Design constraints
 
 LoomFormer deliberately keeps causal attention. Its full token-mixing path therefore remains quadratic in sequence length. Tria is not advertised as a replacement for attention; it adds an operator route across depth and selected temporal boundaries.
@@ -1153,7 +1321,9 @@ No single operational-depth or connection-count scalar is treated as an invarian
 
 LoomFormer currently trains, evaluates, fine-tunes, packages and generates text. The 113M run converged on the stated corpus and the full evaluation metrics are reported above. SFT and LoomChat are functional; LoomChat is still relatively VRAM-heavy because the current implementation prioritizes architectural equivalence and inspectability over a minimal inference runtime.
 
-The project is experimental. Configuration names, checkpoint migrations, CUDA kernels and package metadata are not yet a stable public API.
+The synthetic installation matrix has completed on a GTX 1080 and two Tesla P4 GPUs, including bf16 fallback, PT/SFT optimizer steps, packed-attention parity, checkpoint resume, full OTF evaluation and three-rank DDP. Modern-GPU runs additionally execute the FlashAttention/Transformer Engine varlen parity cases.
+
+The project is in pre-release. Configuration names, checkpoint migrations, CUDA kernels and package metadata are not yet a stable public API.
 
 ## Citation
 
@@ -1186,6 +1356,7 @@ Until there is a paper or archived release, cite the repository and checkpoint c
   - [Tria](#tria-1)
   - [Один шаг Tria от L1 к L2](#один-шаг-tria-от-l1-к-l2)
   - [Temporal carry от границы до границы](#temporal-carry-от-границы-до-границы)
+    - [PolARM](#polarm-1)
   - [Финальное чтение Tria](#финальное-чтение-tria)
 - [Runtime-состояние и VRAM](#runtime-состояние-и-vram)
 - [CUDA-кернели и replay](#cuda-кернели-и-replay)
@@ -1358,13 +1529,13 @@ Refeed-seed потребляется один раз в начале следу�
 | `m_s` | pooled-чтение DepthAttn на sublayer `s` |
 | `R`, `I`, `O` | real-, фазовая и выходная координаты Paraplex |
 | `A` | положительная амплитуда PvPowLU `softplus(g)` |
-| `a`, `b`, `c` | ограниченные попарные отношения `tanh(RI)`, `tanh(RO)`, `tanh(IO)` |
+| `a`, `b`, `c` | совместно RMS-масштабированные и ограниченные попарные отношения из `RI`, `RO`, `IO` |
 | `K(a,b,c)` | кососимметричный генератор Tria (не путать с attention keys `K`) |
 | `T_{l,t,h}` | локальный оператор Tria |
 | `C_l` | depth carrier после слоя `l`; `D_t = C_{L,t}` — законченный depth carrier |
 | `accT_t` | temporal-аккумулятор Tria (в коде `accT`) |
 | `b_k` | позиция сработавшей temporal-границы |
-| `I_3`, `𝒩(·)` | единичная матрица; max-absolute нормализация |
+| `I_3`, `𝒩(·)` | единичная матрица; локальная RMS-нормализация по всем девяти элементам |
 
 ### Каузальное GQA
 
@@ -1382,7 +1553,7 @@ K^{\mathrm{ctx}}_t = A_tK_{\le t}.
 
 LoomFormer сохраняет и attention context `Vctx`, и attended key context `Kctx`. Обычный attention-output проецируется обратно в residual stream, а `Q`, `Kctx` и `Vctx` одновременно передаются в Paraplex.
 
-Реализация causal attention поддерживает flat, chunked и token-by-token режимы. Packed-строки SFT используют явную block-diagonal mask, поэтому примеры внутри одной строки не могут видеть друг друга через границу.
+Реализация causal attention поддерживает flat, chunked и token-by-token режимы. Packed-строки SFT несут линейный layout `segment_ids`/`cu_seqlens`. При `attn_impl: auto` на Ampere и новее layout передаётся в проверенный varlen-backend FlashAttention или Transformer Engine. Компактный SDPA-путь на Pascal и в reference execution обрабатывает каждый документ отдельно. Temporal chunks используют заранее построенные gather-plans для K/V-history. Document-layout metadata имеет размер `O(BT)` и сохраняет изоляцию packed examples.
 
 ### DepthAttn
 
@@ -1404,7 +1575,37 @@ Softmax идёт по оси **глубины**, а не по токенам. В
 - первое даёт skip вокруг causal attention;
 - второе даёт FFN-skip и depth context, который поступает в Paraplex.
 
-Readout-проекция может быть общей для всех sublayers или отдельной для каждой. Для depth Q/K/V можно включить фиксацию RMS, а residual-ветви можно ограничить RMS-cap без усиления тихих ветвей.
+Readout-проекция может быть общей для всех sublayers или отдельной для каждой. При `depth_attn_qkv_rms: true` код независимо применяет к каждому вектору по последней размерности
+
+```math
+\mathrm{FixRMS}_{\rho}(x)
+=
+x\frac{\rho}{\sqrt{\mathrm{mean}_i(x_i^2)+\varepsilon}}.
+```
+
+Целевые значения совпадают с масштабами инициализации:
+
+```math
+q_s\leftarrow\mathrm{FixRMS}_{0.88/\sqrt{d_h}}(q_s),
+\qquad
+k_j\leftarrow\mathrm{FixRMS}_{0.88}(k_j),
+\qquad
+v_j\leftarrow\mathrm{FixRMS}_{0.88\beta_{\mathrm{init}}}(v_j),
+```
+
+где `βinit=(8L)^(-1/4)` для `residual_init: beta` и `βinit=1` для `fanin`. Приведённая выше формула attention вычисляется после этих преобразований.
+
+`residual_branch_rms_cap: c` применяет
+
+```math
+\mathrm{CapRMS}_{c}(x)
+=
+x\min\!\left(
+1,\frac{c}{\sqrt{\mathrm{mean}_i(x_i^2)+\varepsilon}}
+\right)
+```
+
+отдельно к depth skip и attention/FFN-ветви непосредственно перед каждым сложением и `LayerNorm`. Тихие ветви сохраняют свой масштаб. Flat-, chunked- и token-by-token пути используют одинаковый порядок.
 
 ### Paraplex
 
@@ -1436,7 +1637,7 @@ R_t=
 W_{\mathrm{real},l}u_t+b_l.
 ```
 
-Хранимая матрица `W_real` не переписывается механизмом Tria. Carrier создаёт зависимый от токена диагональный gain на выходных строках проекции. Поскольку каждая carrier-матрица max-absolute-нормализована, а selector девяти слотов является softmax-смесью, `|p_{t,h}|≤1`; множитель остаётся между `0.75` и `1.25`. Bias сохраняется как несмасштабированное начало координат, а не умножается вместе с входозависимым ответом.
+Хранимая матрица `W_real` не переписывается механизмом Tria. Carrier создаёт зависимый от токена диагональный gain на выходных строках проекции. RMS carrier по девяти элементам приблизительно равен единице, поэтому `|vec(C)[j]| ≤ 3`, а softmax-смесь слотов даёт `|p[t,h]| ≤ 3`. При фиксированном локальном ограничении `|γ[l]| ≤ 0.25` множитель остаётся в `[0.25, 1.75]`. Bias сохраняется как несмасштабированное начало координат.
 
 Для самого gate:
 
@@ -1463,7 +1664,7 @@ d_t
 +b^{\mathrm{imag}}_h.
 ```
 
-Фазовые веса ограничены секторами. В режиме `head` группа hidden-нейронов читает Q/Kctx/Vctx/Depth-каналы своего query-head и полный model-state `u`. В режиме `open` выбранные контекстные сектора могут пересекать границы heads. Компактный параметр `w1_imag` хранит только живые секторные веса; dense-матрица для GEMM является временным результатом scatter, а не второй обучаемой матрицей.
+Фазовые веса ограничены секторами. В режиме `head` группа hidden-нейронов читает Q/Kctx/Vctx/Depth-каналы своего query-head и полный model-state `u`. В режиме `open` Q остаётся head-local, а Kctx, Vctx, `u` и Depth являются полноширинными источниками с доступом через границы heads. Компактный параметр `w1_imag` хранит только живые секторные веса; dense-матрица reference GEMM является временным expansion, а не второй обучаемой матрицей.
 
 Текущая фаза ограничивается насыщаемой синусоидальной картой:
 
@@ -1683,17 +1884,25 @@ phase/output L1H1 ──► dense W2 ──► residual stream ──► attenti
 
 Приведённые ниже уравнения точно определяют механику Tria, но сами по себе не раскрывают её выученную семантическую роль. В обученных чекпойнтах carrier является каузально активным: его отключение меняет дальнейшее вычисление и авторегрессионные логиты. Однако для его состояний пока не удалось построить устойчивый токенный словарь или простую человекочитаемую интерпретацию. Возможно, полезная функция Tria выражается через распределённую геометрию популяции, композицию операторов и траектории по глубине и времени, а не через отдельно декодируемые координаты.
 
-Tria получает три координаты Paraplex `R`, `I`, `O` для каждого токена и hidden-канала. Реализация материализует три уникальных попарных отношения:
+Tria получает координаты Paraplex `R`, обогащённую фазу `I` и активированный pre-`W2` выход `O` для каждого токена и hidden-канала. Сначала строятся
 
 ```math
-a=\tanh(RI),
+x=(RI,RO,IO),
 \qquad
-b=\tanh(RO),
-\qquad
-c=\tanh(IO).
+\sigma_x=\sqrt{\frac{x_1^2+x_2^2+x_3^2}{3}+\varepsilon},
 ```
 
-До ограничения `tanh` произведения удовлетворяют
+после чего три отношения совместно RMS-масштабируются и ограничиваются:
+
+```math
+a=\tanh\!\left(\frac{RI}{\sigma_x}\right),
+\qquad
+b=\tanh\!\left(\frac{RO}{\sigma_x}\right),
+\qquad
+c=\tanh\!\left(\frac{IO}{\sigma_x}\right).
+```
+
+Общий положительный делитель сохраняет их относительные масштабы и знаки. За пределами epsilon-floor отображение инвариантно к общему масштабированию `R`, `I`, `O`. До совместного RMS и `tanh` произведения удовлетворяют
 
 ```math
 (RI)(RO)(IO)=R^2I^2O^2\ge 0.
@@ -1701,7 +1910,7 @@ c=\tanh(IO).
 
 Они инвариантны к одновременному перевороту знаков `(R,I,O)→(-R,-I,-O)`. Поэтому Tria реагирует на относительные знаки и масштабы, а не на произвольную глобальную знаковую конвенцию.
 
-Код **не** хранит отдельную сырую `3×3` матрицу внешнего произведения. Он хранит три ограниченных отношения, помещает их в кососимметричный генератор, умножает на фиксированный осевой поворот и затем композирует полученный carrier. Девять слотов selector относятся к девяти элементам carrier после поворота и композиции.
+Реализация помещает три ограниченных отношения в кососимметричный генератор, умножает на фиксированный осевой поворот и затем композирует полученный carrier. Девять слотов selector относятся к девяти элементам carrier после поворота и композиции.
 
 Генератор имеет вид
 
@@ -1723,11 +1932,23 @@ T_{l,t,h}=\left(I_3+\alpha K_{l,t,h}\right)R_{\mathrm{axis}(l)},
 
 где `Raxis` — фиксированный поворот на `+90°` вокруг одной координатной оси. Ось циклически меняется по глубине. `α` — небольшой коэффициент carrier, задаваемый конфигурацией или startup calibration.
 
-Каждая композиция матриц нормализуется по максимальному абсолютному элементу:
+Совместное ограничение даёт
+
+```math
+\kappa_2(I_3+\alpha K)
+\le
+\sqrt{1+3\alpha^2},
+```
+
+а фиксированный поворот не меняет сингулярные значения.
+
+Каждая нормализация локальна для одной матрицы `[batch, token, hidden]` и использует RMS всех девяти элементов:
 
 ```math
 \mathcal N(M)=
-\frac{M}{\max\!\left(\max_{i,j}|M_{ij}|,\varepsilon\right)}.
+\frac{M}{
+\sqrt{\frac{1}{9}\sum_{i=1}^{3}\sum_{j=1}^{3}M_{ij}^{2}+\varepsilon}
+}.
 ```
 
 Из конструкции следует полезный инвариант. Если `R=I=O=0`, то `a=b=c=0`, но
@@ -1815,12 +2036,33 @@ D_{b_k}D_{b_k-1}\cdots D_{s_k}
 
 содержит depth-carriers, накопленные от начала текущего сегмента `s_k`, с локальной нормализацией после каждой реализованной композиции.
 
+#### PolARM
+
+На сработавшей границе PolARM выполняет одну Gram-коррекцию до сохранения carrier как key для final-CA и seed следующего сегмента:
+
+```math
+G_b=\mathrm{accT}_{b_k}^{\top}\mathrm{accT}_{b_k},
+\qquad
+s_b=\frac{\mathrm{tr}(G_b)}{3},
+```
+
+```math
+\widetilde{\mathrm{accT}}_{b_k}
+=
+\mathrm{accT}_{b_k}
+\left[
+I_3-\frac{\beta_{\mathrm{P}}}{2}
+\left(\frac{G_b}{\max(s_b,\varepsilon)}-I_3\right)
+\right],
+\qquad 0\le\beta_{\mathrm{P}}<1.
+```
+
 Для первого токена следующего сегмента, `t_0=b_k+1`, boundary endpoint вводится в первый Tria-слой:
 
 ```math
 C_{1,t_0}^{\mathrm{seed}}
 =
-\mathcal N\!\left(T_{1,t_0}\,\mathrm{accT}_{b_k}\right).
+\mathcal N\!\left(T_{1,t_0}\,\widetilde{\mathrm{accT}}_{b_k}\right).
 ```
 
 Остальные слои выполняют обычную depth-рекурсию:
@@ -1846,17 +2088,17 @@ D_{t_0}^{\mathrm{seed}}=C_{L,t_0}^{\mathrm{seed}}.
 \qquad t_0<t\le b_{k+1}.
 ```
 
-Reset сделан намеренно. `accT_{b_k}` уже входит в `D_{t_0}^{seed}` через композицию первого слоя; повторное умножение старого endpoint в temporal recurrence учло бы его дважды.
+Reset сделан намеренно. `accT̃_{b_k}` уже входит в `D_{t_0}^{seed}` через композицию первого слоя; повторное умножение старого endpoint в temporal recurrence учло бы его дважды.
 
 Полный boundary-маршрут:
 
 ```text
 last-block carriers D_s ... D_b
           │
-          └── streaming temporal composition ──► boundary endpoint accT_b
+          └── streaming temporal composition ──► accT_b ──► PolARM ──► accT̃_b
                                                    │
                                                    ├── key/value final-CA
-                                                   └── T_1,next @ accT_b
+                                                   └── T_1,next @ accT̃_b
                                                          │
                                                          ├── композиция по всем слоям
                                                          └── restart temporal state от D_next^seed
@@ -1868,7 +2110,16 @@ last-block carriers D_s ... D_b
 
 Сработавший temporal endpoint имеет форму `[H,3,3]`. Reader не обязан сначала материализовать отдельное `k`-мерное представление каждого hidden-нейрона. Реализация оценивает девять сырых слотов, pooling-ует их по hidden-population и только после этого применяет общую value-проекцию.
 
-Пусть `x_{b,h}=vec(accT_{b,h})`. Обучаемый query и независимая slot-key-проекция задают одно нормированное направление `s` в девятимерном slot-space. Population weights:
+Пусть `x_{b,h}=vec(accT̃_{b,h})`. Обучаемый query `qpool`, независимая slot-key-проекция и обучаемый положительный logit scale задают
+
+```math
+s_b=
+\mathrm{softplus}(\widehat\tau)\,
+\frac{W_{\mathrm{key}}^{\top}q_{\mathrm{pool}}}
+{\max\!\left(\left\|W_{\mathrm{key}}^{\top}q_{\mathrm{pool}}\right\|_2,\varepsilon\right)}.
+```
+
+Population weights:
 
 ```math
 \rho_{b,h}
@@ -2009,11 +2260,25 @@ K_{\mathrm{CA}},V_{\mathrm{CA}}
 
 В текущем chat-path нет rolling-cache wraparound. Поэтому диалог на 10k токенов требует checkpoint/config с `seq_len` не меньше `10,000`; опубликованная конфигурация `seq_len=1024` такой диалог без смены context policy не удержит.
 
+### Размещение и калибровка KV
+
+`loomchat.py` сохраняет snapshots точных префиксов, поэтому новый ход префиллит только suffix после самого длинного закэшированного префикса. Параметр `--kvstorage` задаёт место постоянного хранения layer K/V:
+
+| Значение | Исполнение |
+| --- | --- |
+| `same` | K/V и attention остаются на GPU модели. |
+| `cpu` | K/V остаются в pinned RAM и передаются через CUDA staging ring, пока online softmax обрабатывает предыдущие chunks. |
+| `cuda:N` | K/V остаются на GPU `N`; полная attention-редукция без параметров выполняется на этой GPU, а attention context и attended-key context возвращаются на GPU модели. |
+
+При запуске chat-runtime измеряет настоящий forward модели на последовательности до `2048` токенов, throughput инкрементального `Model.step`, время транспорта и скорость потребления online attention. Калибратор проверяет chunks от `128` токенов до длины калибровочного контекста, выбирает самый быстрый измеренный pipeline и рассчитывает динамический preload. К оценке, достаточной для непрерывного потребления, добавляются два safety-chunks. CPU-storage использует pinned buffers и раздельные copy/compute streams. Для remote CUDA фиксируется наличие peer access; обычные CUDA transfers обеспечивают host-staged маршрут, когда peer access отсутствует.
+
+Размещение можно менять внутри сессии командами `/kvstorage same`, `/kvstorage cpu` и `/kvstorage cuda:N`. Смена compute device, dtype или KV placement инвалидирует старые snapshots и запускает повторную калибровку транспорта.
+
 ## CUDA-кернели и replay
 
 LoomFormer не обучает Paraplex- и Tria-пути как длинную цепочку обычных поэлементных операций PyTorch. В репозитории лежат полноценные CUDA-исходники в `kernels/`: device-код находится в `*_kernel.cuh`, отдельные translation units для просмотра PTX — в `*_kernel.cu`, а ATen/PyBind-launchers — в `*_launcher.cu`.
 
-Текущее дерево содержит 16 групп кернелей, собранных в шесть расширений:
+Текущее дерево сообщает о 17 группах кернелей, собранных в семь расширений:
 
 | Расширение | Что выполняется fused-путём |
 | --- | --- |
@@ -2023,8 +2288,9 @@ LoomFormer не обучает Paraplex- и Tria-пути как длинную 
 | `loomformer_pvpowlu` | Отдельные forward и backward для PvPowLU. |
 | `loomformer_depth_attn_online` | Online-softmax forward/backward DepthAttn по фиксированной истории глубины. |
 | `loomformer_tria_carry` | Одиннадцать групп Tria: инициализация, seeded initialization, gated-варианты, depth steps, depth replay, slot mixing, population pooling, temporal carry, endpoint-only temporal carry и sparse final cross-attention. |
+| `loomformer_packed_gather` | Document-major packing temporal K/V-history одним запуском для varlen attention и scatter-backward в исходные chunks. |
 
-Fused Paraplex-path сначала вычисляет `beta_space`, затем внутри CUDA выполняет построение фазы, temporal phase trace, amplitude, `P=R+AI`, PvPowLU и необходимые величины backward. Каждое алгебраическое подвыражение не материализуется отдельным Python-level тензором. Tria-кернели держат девять элементов локального оператора `3x3`, матричное произведение и max-absolute normalization в регистрах или локальном состоянии кернеля; промежуточные локальные матрицы не сохраняются как отдельное состояние модели.
+Fused Paraplex-path сначала вычисляет `beta_space`, затем внутри CUDA выполняет построение фазы, temporal phase trace, amplitude, `P=R+AI`, PvPowLU и необходимые величины backward. Каждое алгебраическое подвыражение не материализуется отдельным Python-level тензором. Tria-кернели держат три совместно RMS-масштабированных отношения, девять элементов локального оператора `3x3`, матричное произведение и локальную RMS-нормализацию матрицы в регистрах или локальном состоянии кернеля; промежуточные локальные матрицы не сохраняются как отдельное состояние модели.
 
 ### Recompute и depth replay
 
@@ -2053,9 +2319,9 @@ Replay не меняет forward-уравнение. Градиенты по-п�
 
 и небольшую FP32-копию endpoint для backward. Вторая полная траектория temporal accumulators не сохраняется. Backward проходит входные depth-carriers в обратном порядке и аналитически восстанавливает предыдущий нормализованный accumulator из обратимого локального фактора и текущего accumulator. Это temporal-аналог replay: входные depth-carriers остаются доступны, но дополнительная prefix-history `[B,T,H,3,3]` не создаётся.
 
-Отдельные fused Tria-кернели обслуживают девятислотовый selector, population pooling и sparse final cross-attention, поэтому эти пути также не собираются как плотные Python-side operator graphs. Для каждого расширения существует PyTorch fallback на случай ошибки компиляции, неподдерживаемого dtype или устройства; fast path выбирается автоматически после runtime-проверок.
+Отдельные fused Tria-кернели обслуживают девятислотовый selector, population pooling и sparse final cross-attention внутри компактных CUDA operator graphs. Алгебраические кернели сохраняют проверенные PyTorch reference paths. Packed `attn_impl: auto` на Ampere и новее требует проверенный varlen forward/backward backend и расширение `packed_gather`. Pascal-training явно выбирает compact SDPA.
 
-Расширения собираются лениво через `torch.utils.cpp_extension.load` и Ninja. Хэши исходников и подключённых headers записываются в `kernels/.hashes.json`; неизменившиеся модули загружаются из `kernels/build/` без повторной сборки. Архитектуру CUDA можно явно задать через `TORCH_CUDA_ARCH_LIST`, `KERNELS_VERBOSE=1` показывает build log, а `KERNELS_DUMP_PTX=1` после изменившейся сборки создаёт отдельные PTX-файлы для анализа.
+Расширения собираются через `torch.utils.cpp_extension.load` и Ninja. Startup заранее загружает все расширения активного графа, включая `packed_gather`, до вывода архитектуры. Хэши исходников и подключённых headers записываются в `kernels/.hashes.json`; неизменившиеся модули загружаются из `kernels/build/`. Архитектуру CUDA можно явно задать через `TORCH_CUDA_ARCH_LIST`, `KERNELS_VERBOSE=1` показывает build log, а `KERNELS_DUMP_PTX=1` после изменившейся сборки создаёт отдельные PTX-файлы для анализа.
 
 ## Глубина и связность
 
@@ -2085,7 +2351,8 @@ Replay не меняет forward-уравнение. Градиенты по-п�
 - полный последовательный eval с loss, bits/token и bits/byte;
 - smart resume весов, шага, schedule и позиции данных;
 - оптимизаторы AdamW и ATOM;
-- supervised fine-tuning с packed examples, loss masks и tool-call templates;
+- supervised fine-tuning с компактными packed layouts, assistant-only loss masks и tool-call templates;
+- bounded-memory render/tokenize для Parquet SFT, destructive validation split и детерминированный full-split eval;
 - анализ донорских чекпойнтов и структурный transplant;
 - переносимая упаковка `.aio` и интерактивный терминальный чат;
 - AOTInductor export в автономный inference package.
@@ -2103,23 +2370,47 @@ loomsft.py      supervised fine-tuning
 loomcloner.py   анализ донора и transplant чекпойнта
 loompack.py     pack / inspect / extract для переносимого .aio
 loomchat.py     интерактивный терминальный чат для .aio
+setup.sh        установка CUDA/PyTorch-окружения, обновление репозитория и валидация
+tests/          синтетическая PT/SFT-матрица и численный parity backend-путей
 ```
 
 ## Быстрый старт
 
 ### Установка
 
-Создайте окружение и установите Python-зависимости, нужные выбранному workflow:
+Склонируйте репозиторий и запустите установщик:
+
+```bash
+git clone https://github.com/srose69/Loomformer-Paraplex.git
+cd Loomformer-Paraplex
+./setup.sh
+```
+
+Установщик проверяет compute capability каждой видимой GPU. Машина с Pascal или Volta получает профиль CUDA `12.6` / PyTorch `cu126`. Машина только с Turing и более новыми GPU получает CUDA `13.0` / PyTorch `cu130`. По умолчанию toolkit и venv устанавливаются в `~/loom`. В меню также доступны read-only проверка окружения, переустановка пакетов и обновление репозитория.
+
+Текущая версия установщика по умолчанию использует PyTorch `2.12.1`. Переменные `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR` и `LOOM_BUILD_JOBS` задают явный профиль и пути.
+
+Для Git-checkout обновление выполняется через `git pull --ff-only`. Tarball-установка получает overlay файлов нового upstream. Чекпойнты, датасеты, логи, окружения и local-only paths остаются на месте.
+
+Ручное Python-окружение подходит для машин с уже настроенным CUDA toolchain:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install torch numpy pyyaml tokenizers pyarrow safetensors transformers jinja2
+pip install torch numpy pyyaml tokenizers pyarrow safetensors transformers jinja2 einops
 ```
 
-ATOM и custom C++/CUDA extensions являются опциональными путями исполнения. Для них нужны соответствующие модули репозитория и рабочий CUDA toolchain.
+Custom C++/CUDA extensions требуют Ninja, совпадающий CUDA toolkit и C++ compiler. `attn_impl: auto` для bf16/fp16 packed training на Ampere и новее требует `flash-attn`; проверенный varlen-backend Transformer Engine также обслуживает этот путь.
 
-### Smoke tests
+### Валидация
+
+```bash
+python tests/run_matrix.py --setup
+```
+
+Матрица создаёт tokenizer, PT-streams и Parquet chat datasets во временной папке. Она запускает unit-инварианты, загружает все fused extensions, проверяет forward/backward parity на каждой видимой GPU, выполняет optimizer steps PT и SFT, продолжает оба чекпойнта, оценивает полные validation splits и запускает PT/SFT DDP на всех видимых GPU. На Ampere и новее varlen-backend также сравнивается с компактным reference path.
+
+Малые component smoke tests доступны отдельно:
 
 ```bash
 python loomformer.py --smoke-test
@@ -2198,6 +2489,14 @@ python loomformer.py \
 
 ### Supervised fine-tuning
 
+`cfg/alt6_sft.yaml` содержит dataset directory, pretrained init-checkpoint, выходной checkpoint и список DDP-устройств:
+
+```bash
+python loomformer.py --train --config cfg/alt6_sft.yaml
+```
+
+Общая CLI-форма:
+
 ```bash
 python loomsft.py \
   --config cfg/sft.yaml \
@@ -2216,6 +2515,18 @@ python loompack.py pack ./loomformer-sft.pt \
   -o loomformer.aio
 
 python loomchat.py loomformer.aio --device cuda:0
+```
+
+Хранение persistent KV snapshots в pinned RAM:
+
+```bash
+python loomchat.py loomformer.aio --device cuda:0 --kvstorage cpu
+```
+
+Attention рядом с K/V на другой GPU:
+
+```bash
+python loomchat.py loomformer.aio --device cuda:0 --kvstorage cuda:1
 ```
 
 ### Анализ донорской модели
@@ -2239,9 +2550,10 @@ python loomcloner.py \
 | DepthAttn | `depth_attn_readout`, `depth_attn_qkv_rms`, `residual_branch_rms_cap` |
 | Paraplex | `phase_sectors`, `activation`, `powlu_m`, `phase_grad_mode`, `phase_grad_floor`, `paraplex_gate_proj` |
 | Tria | `tria_carry_enabled`, `tria_temporal_enabled`, `tria_temporal_window`, `tria_carrier_alpha`, calibration fields |
-| Данные | `dataset_format`, `text_field`, `seq_len`, `batch_size`, `prefetch_batches` |
+| Данные | `train_dataset`, `val_dataset`, `auto_val_split_pct`, `dataset_format`, `dataset_cache`, `text_field`, `seq_len`, `batch_size`, `prefetch_batches` |
 | Обучение | `steps`, `lr`, `optimizer`, `weight_decay`, `grad_clip`, `grad_accum_steps`, `warmup_steps` |
-| Runtime | `device`, `amp_dtype`, `grad_checkpointing`, `graph`, `save_graph`, CUDA fast-path flags |
+| Чекпойнты | `init_checkpoint`, `checkpoint`, `resume`, `resume_data_stream`, `runpoints_path` |
+| Runtime | `device`, `amp_dtype`, `grad_checkpointing`, `compile`, `graph`, `save_graph`, CUDA fast-path flags |
 
 Основные shape-инварианты проверяются при применении конфигурации:
 
@@ -2252,6 +2564,8 @@ python loomcloner.py \
 - входная длина не может превышать `seq_len`.
 
 Startup calibration Tria может выбрать temporal window и carrier coefficient из набора кандидатов по порогам condition number, effective rank и population pass.
+
+Для SFT режим `dataset_cache: otf` принимает Parquet-файл или папку с top-level Parquet shards. Строки разделяются между DDP-ranks, render-ятся и токенизируются bounded batches, затем упаковываются вместе с компактной document metadata. `auto_val_split_pct` один раз отрезает validation tail в `<train_dataset>/val/val_split.parquet` и использует его manifest в следующих запусках. Эпоха без trainable examples завершается ошибкой с активным значением `seq_len`.
 
 ## Требования
 
@@ -2273,6 +2587,8 @@ Startup calibration Tria может выбрать temporal window и carrier co
 
 Reference paths поддерживают CPU. CUDA необходима для практического обучения моделей референсного размера и fused custom operators.
 
+Нижняя граница поддерживаемого CUDA-железа — Pascal (`SM 6.0`). Pascal и Volta используют профиль CUDA 12 и явный compact SDPA attention. Ampere, Ada, Hopper и Blackwell используют проверенный varlen-backend FlashAttention или Transformer Engine для `attn_impl: auto`. Startup probes выполняют forward и backward; при ошибке выводится сохранённая причина импорта или запуска кернела.
+
 ## Ограничения конструкции
 
 LoomFormer намеренно сохраняет causal attention. Поэтому полный token-mixing путь остаётся квадратичным по длине последовательности. Tria не заявляется заменой attention; она добавляет operator-route по глубине и выбранным temporal boundaries.
@@ -2289,7 +2605,9 @@ LoomFormer намеренно сохраняет causal attention. Поэтом�
 
 LoomFormer обучается, оценивается, дообучается, упаковывается и генерирует текст. 113M-запуск сошёлся на указанном корпусе; результаты полного eval приведены выше. SFT и LoomChat работают. LoomChat пока относительно требователен к VRAM, потому что текущая реализация ставит эквивалентность архитектурных путей и возможность инспекции выше минимального inference-runtime.
 
-Проект остаётся экспериментальным. Имена конфигурации, миграции чекпойнтов, CUDA-kernels и metadata пакета пока не являются стабильным публичным API.
+Синтетическая installation matrix полностью прошла на GTX 1080 и двух Tesla P4: bf16 fallback, optimizer steps PT/SFT, packed-attention parity, resume чекпойнтов, полный OTF-eval и DDP на трёх ranks. На modern GPU дополнительно выполняются varlen parity-cases FlashAttention/Transformer Engine.
+
+Проект находится в статусе pre-release. Имена конфигурации, миграции чекпойнтов, CUDA-kernels и metadata пакета пока не являются стабильным публичным API.
 
 ## Цитирование
 

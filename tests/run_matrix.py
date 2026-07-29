@@ -143,6 +143,7 @@ def _failure_summary(lines: Iterable[str]) -> list[str]:
         "TypeError:",
         "ValueError:",
         "FAILED (",
+        "[ddp-trace]",
     )
     selected: list[str] = []
     for raw in lines:
@@ -222,12 +223,53 @@ def _run(
         except ProcessLookupError:
             pass
 
+    def _process_children(pid: int) -> list[int]:
+        """Read Linux child PIDs without invoking ps inside a failure path."""
+        try:
+            raw = Path(
+                f"/proc/{pid}/task/{pid}/children"
+            ).read_text(encoding="ascii")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            return []
+        return [int(value) for value in raw.split() if value.isdigit()]
+
+    def _leaf_descendants(pid: int) -> list[int]:
+        leaves: list[int] = []
+        pending = [pid]
+        seen = {pid}
+        while pending:
+            parent = pending.pop()
+            children = [
+                child for child in _process_children(parent)
+                if child not in seen
+            ]
+            seen.update(children)
+            if parent != pid and not children:
+                leaves.append(parent)
+            pending.extend(children)
+        return leaves
+
+    def _dump_rank_stacks() -> None:
+        if not hasattr(signal, "SIGUSR1"):
+            return
+        # Do not signal the self-launcher or torchrun agent: SIGUSR1 is
+        # registered only by the WORLD_SIZE rank workers.
+        for pid in _leaf_descendants(process.pid):
+            try:
+                os.kill(pid, signal.SIGUSR1)
+            except ProcessLookupError:
+                pass
+
     try:
         with log_path.open("w", encoding="utf-8") as log:
             while not reader_done or process.poll() is None:
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0 and process.poll() is None:
                     timed_out = True
+                    _dump_rank_stacks()
+                    # faulthandler writes into the already-drained pipe. Give
+                    # each rank a short window to finish its traceback.
+                    time.sleep(2)
                     _signal_group(signal.SIGTERM)
                     try:
                         process.wait(timeout=10)
@@ -966,7 +1008,13 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "--config",
                             ddp_pt_config,
                         ],
-                        timeout=300,
+                        timeout=90,
+                        extra_env={
+                            "LOOM_DDP_TRACE": "1",
+                            "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+                            "TORCH_NCCL_DESYNC_DEBUG": "1",
+                            "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+                        },
                     )
                     _check_checkpoint(
                         ddp_pt_checkpoint, step=1, optimizer="adamw"
@@ -1014,7 +1062,13 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "--config",
                             ddp_sft_config,
                         ],
-                        timeout=300,
+                        timeout=90,
+                        extra_env={
+                            "LOOM_DDP_TRACE": "1",
+                            "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+                            "TORCH_NCCL_DESYNC_DEBUG": "1",
+                            "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+                        },
                     )
                     _check_checkpoint(
                         ddp_sft_checkpoint, step=1, optimizer="atom"

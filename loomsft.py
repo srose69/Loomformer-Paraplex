@@ -551,7 +551,16 @@ class SFTStream:
         window = int(self.cfg.tria_temporal_window)
         stops = lf.temporal_chunk_stops(
             x, window, True, self._carry_id,
-            compiling=bool(getattr(self.cfg, "compile", False)))
+            compiling=False)
+        fire_positions = set(range(window - 1, int(x.shape[1]) - 1, window))
+        if self._carry_id is not None:
+            fire_positions.update(
+                x.eq(int(self._carry_id))
+                .any(dim=0)
+                .nonzero(as_tuple=False)
+                .flatten()
+                .tolist()
+            )
         ranges = []
         plans = []
         start = 0
@@ -561,7 +570,12 @@ class SFTStream:
                 continue
             ranges.append((start, end))
             plans.append(lf.build_packed_chunk_layout(
-                layout, start, end, tuple(ranges)))
+                layout,
+                start,
+                end,
+                tuple(ranges),
+                ends_with_fire=(end - 1) in fire_positions,
+            ))
             start = end
         if start != x.shape[1]:
             raise RuntimeError(

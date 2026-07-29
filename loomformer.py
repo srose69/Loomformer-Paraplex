@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import faulthandler
 import gc
 import signal
 import contextlib
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import warnings
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -118,6 +120,23 @@ def ddp_print(*args, **kwargs) -> None:
         print(*args, **kwargs)
 
 
+def ddp_trace(stage: str, *, step: Optional[int] = None,
+              micro: Optional[int] = None) -> None:
+    """Emit rank-local progress only for the installation hang diagnostic."""
+    if os.environ.get("LOOM_DDP_TRACE") != "1" or not ddp_is_distributed():
+        return
+    location = ""
+    if step is not None:
+        location += f" step={int(step)}"
+    if micro is not None:
+        location += f" micro={int(micro)}"
+    print(
+        f"[ddp-trace] rank={ddp_rank()}{location} stage={stage}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def ddp_barrier(device: Optional[torch.device] = None) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
@@ -145,9 +164,48 @@ def ddp_sum_int(value: int, device: torch.device) -> int:
 
 
 def ddp_unwrap_model(model: nn.Module) -> nn.Module:
-    is_fsdp = model.__class__.__name__ == "FullyShardedDataParallel"
-    raw = model.module if isinstance(model, DDP) or is_fsdp else model
-    return raw._orig_mod if hasattr(raw, "_orig_mod") else raw
+    raw = model
+    seen: set[int] = set()
+    while id(raw) not in seen:
+        seen.add(id(raw))
+        is_fsdp = raw.__class__.__name__ == "FullyShardedDataParallel"
+        if isinstance(raw, DDP) or is_fsdp:
+            raw = raw.module
+            continue
+        if hasattr(raw, "_orig_mod"):
+            raw = raw._orig_mod
+            continue
+        break
+    return raw
+
+
+def ddp_sync_mutable_buffers(model: nn.Module) -> None:
+    """Match DDP buffer semantics outside the compiled forward graph.
+
+    ``ParaplexFFN.beta_anchor`` is the only mutable model buffer. DDP's
+    built-in ``broadcast_buffers`` runs from its forward pre-hook; putting that
+    hook inside ``torch.compile(DDP)`` lets rank-local guard misses execute an
+    extra NCCL broadcast while a cache-hit rank has already entered gradient
+    all-reduce. One explicit coalesced broadcast before every outer forward
+    preserves rank-0 anchor semantics with a fixed collective order.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    raw = ddp_unwrap_model(model)
+    anchors = [
+        block.ffn.beta_anchor
+        for block in getattr(raw, "blocks", ())
+        if hasattr(getattr(block, "ffn", None), "beta_anchor")
+    ]
+    if not anchors:
+        return
+    with torch.no_grad():
+        packed = torch.stack(
+            [anchor.detach().reshape(()) for anchor in anchors]
+        )
+        dist.broadcast(packed, src=0)
+        for anchor, value in zip(anchors, packed.unbind()):
+            anchor.copy_(value)
 
 
 def ddp_static_graph_policy(cfg: "Config") -> Tuple[bool, str]:
@@ -219,6 +277,19 @@ def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tupl
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
         dev = torch.device(f"cuda:{local_rank}")
+        if (
+            os.environ.get("LOOM_DDP_TRACE") == "1"
+            and hasattr(signal, "SIGUSR1")
+        ):
+            # The matrix runner sends SIGUSR1 only to rank worker processes,
+            # immediately before terminating a timed-out cell. This records
+            # every Python thread's exact blocking frame in the retained log.
+            faulthandler.register(
+                signal.SIGUSR1,
+                file=sys.stderr,
+                all_threads=True,
+                chain=False,
+            )
         ddp_print(f"[ddp] rank={rank} local_rank={local_rank} device={dev}", flush=True)
         return dev, True, world_size, rank, local_rank
     if pref == "cudas":
@@ -2308,6 +2379,9 @@ class PackedChunkLayout:
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
+    # None marks legacy/caller-built plans that did not encode fire metadata;
+    # Model then derives boundaries with the historical policy.
+    ends_with_fire: Optional[bool] = None
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "PackedChunkLayout":
         return PackedChunkLayout(
@@ -2321,6 +2395,7 @@ class PackedChunkLayout:
             cu_seqlens_k=self.cu_seqlens_k.to(device, non_blocking=non_blocking),
             max_seqlen_q=self.max_seqlen_q,
             max_seqlen_k=self.max_seqlen_k,
+            ends_with_fire=self.ends_with_fire,
         )
 
     def pin_memory(self) -> "PackedChunkLayout":
@@ -2337,6 +2412,7 @@ class PackedChunkLayout:
             cu_seqlens_k=self.cu_seqlens_k.pin_memory(),
             max_seqlen_q=self.max_seqlen_q,
             max_seqlen_k=self.max_seqlen_k,
+            ends_with_fire=self.ends_with_fire,
         )
 
 
@@ -2387,11 +2463,13 @@ def _unpacked_attention_layout(batch: int, length: int, device: torch.device) ->
         seg, positions, _cu_seqlens_from_counts(counts), int(length))
 
 
+@torch._dynamo.disable
 def build_packed_chunk_layout(
     layout: PackedAttentionLayout,
     start: int,
     end: int,
     chunk_ranges: Tuple[Tuple[int, int], ...],
+    ends_with_fire: Optional[bool] = None,
 ) -> PackedChunkLayout:
     """Build a reusable, tensor-only gather plan for one Tria temporal chunk."""
     segment_ids = layout.segment_ids
@@ -2468,6 +2546,7 @@ def build_packed_chunk_layout(
         # two GPU->CPU synchronizations per temporal chunk.
         max_seqlen_q=int(end - start),
         max_seqlen_k=int(layout.max_seqlen),
+        ends_with_fire=ends_with_fire,
     )
 
 
@@ -2495,7 +2574,84 @@ def temporal_chunk_stops(
     return boundaries
 
 
-def split_train_batch(batch, eos_id: Optional[int]):
+def ensure_temporal_chunk_plans(
+    idx: torch.Tensor,
+    layout: Optional[PackedAttentionLayout],
+    cfg: Optional[Config],
+) -> Optional[PackedAttentionLayout]:
+    """Build data-dependent gather metadata before entering compiled Model.
+
+    The output lengths of ``nonzero``/``bincount`` in the plan builder depend
+    on document boundaries. They are metadata, not model compute, and Inductor
+    cannot safely specialize them across rank-local batches. SFT streams
+    already supply these plans from their CPU prefetch path; PT and legacy
+    callers are completed here, outside ``torch.compile``.
+    """
+    if cfg is None or not (
+        bool(getattr(cfg, "tria_carry_enabled", False))
+        and bool(getattr(cfg, "tria_temporal_enabled", True))
+    ):
+        return layout
+    if layout is None:
+        layout = _unpacked_attention_layout(
+            int(idx.shape[0]), int(idx.shape[1]), idx.device
+        )
+    if layout.chunk_plans:
+        return layout
+    window = int(getattr(cfg, "tria_temporal_window", 0) or 0)
+    if window <= 0:
+        raise ValueError(
+            "tria_temporal_window must be resolved before building chunk plans"
+        )
+    # This executes before Model/torch.compile, so preserve the exact eager
+    # schedule including data-dependent <CARRY> boundaries.
+    stops = temporal_chunk_stops(
+        idx,
+        window,
+        True,
+        CARRY_TOKEN_ID,
+        compiling=False,
+    )
+    fire_positions = set(range(window - 1, int(idx.shape[1]) - 1, window))
+    if CARRY_TOKEN_ID is not None:
+        fire_positions.update(
+            idx.eq(int(CARRY_TOKEN_ID))
+            .any(dim=0)
+            .nonzero(as_tuple=False)
+            .flatten()
+            .tolist()
+        )
+    ranges: List[Tuple[int, int]] = []
+    plans: List[PackedChunkLayout] = []
+    start = 0
+    for stop in stops:
+        end = min(int(stop) + 1, int(idx.shape[1]))
+        if end <= start:
+            continue
+        ranges.append((start, end))
+        plans.append(
+            build_packed_chunk_layout(
+                layout,
+                start,
+                end,
+                tuple(ranges),
+                ends_with_fire=(end - 1) in fire_positions,
+            )
+        )
+        start = end
+    if start != int(idx.shape[1]):
+        raise RuntimeError(
+            f"temporal chunk plan stopped at {start}, "
+            f"expected {int(idx.shape[1])}"
+        )
+    return replace(layout, chunk_plans=tuple(plans))
+
+
+def split_train_batch(
+    batch,
+    eos_id: Optional[int],
+    cfg: Optional[Config] = None,
+):
     """Return (x, y, position_ids, attention_layout) from a stream batch.
 
     Pretraining streams yield a plain [B, T+1] token tensor and every next token
@@ -2538,6 +2694,7 @@ def split_train_batch(batch, eos_id: Optional[int]):
     else:
         position_ids, attn_mask = build_doc_reset_state(
             x, eos_id, max_seqlen=packed_max_seqlen)
+    attn_mask = ensure_temporal_chunk_plans(x, attn_mask, cfg)
     return x, y, position_ids, attn_mask
 
 
@@ -5714,7 +5871,18 @@ class Model(nn.Module):
         next_is_reset[:, :-1] = document_reset[:, 1:]
         hard_fire = grid_pos.view(1, T) & ~next_is_reset
         fire_mask = hard_fire | explicit_fire
-        if torch.compiler.is_compiling():
+        supplied_plans = tuple(attention_layout.chunk_plans)
+        supplied_fire_metadata = (
+            bool(supplied_plans)
+            and all(plan.ends_with_fire is not None for plan in supplied_plans)
+        )
+        if supplied_fire_metadata:
+            boundary_positions = [
+                int(plan.end) - 1
+                for plan in supplied_plans
+                if bool(plan.ends_with_fire)
+            ]
+        elif torch.compiler.is_compiling():
             boundary_positions = list(range(W - 1, T, W)) if self.tria_hard_fire_enabled else []
         else:
             boundary_positions = (grid_pos | explicit_fire.any(dim=0)).nonzero().flatten().tolist()
@@ -5728,9 +5896,13 @@ class Model(nn.Module):
         temporal_state = None
         s = 0
         chunk_ranges: List[Tuple[int, int]] = []
-        stops = temporal_chunk_stops(
-            idx, W, self.tria_hard_fire_enabled, carry_token_id,
-            compiling=torch.compiler.is_compiling())
+        stops = (
+            [int(plan.end) - 1 for plan in supplied_plans]
+            if supplied_plans
+            else temporal_chunk_stops(
+                idx, W, self.tria_hard_fire_enabled, carry_token_id,
+                compiling=torch.compiler.is_compiling())
+        )
         precomputed_plans = {
             (plan.start, plan.end): plan
             for plan in attention_layout.chunk_plans
@@ -5741,6 +5913,14 @@ class Model(nn.Module):
                 continue
             chunk_ranges.append((s, e))
             packed_chunk = precomputed_plans.get((s, e))
+            if (
+                packed_chunk is not None
+                and len(packed_chunk.piece_sizes) != len(chunk_ranges)
+            ):
+                # A plan depends on the complete history partition, not only
+                # its current (start,end) key. Reject stale/legacy metadata
+                # rather than pairing N selectors with M K/V chunks.
+                packed_chunk = None
             if packed_chunk is None:
                 packed_chunk = build_packed_chunk_layout(
                     attention_layout, s, e, tuple(chunk_ranges))
@@ -6059,7 +6239,10 @@ async def eval_loss_async(model: nn.Module, stream: TokenStream, cfg: Config, de
     losses = []
     with torch.no_grad():
         for b in raw_batches:
-            x, y, position_ids, attn_mask = split_train_batch(b, eos_id)
+            x, y, position_ids, attn_mask = split_train_batch(
+                b, eos_id, cfg
+            )
+            ddp_sync_mutable_buffers(model)
             with amp_autocast(device):
                 loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
             losses.append(float(loss.item()))
@@ -6848,6 +7031,9 @@ async def train_one_async(
             _warm_pos, _warm_mask = build_doc_reset_state(
                 _wx, train_eos_id
             )
+            _warm_mask = ensure_temporal_chunk_plans(
+                _wx, _warm_mask, cfg
+            )
             with amp_autocast(device):
                 _wloss = model_base(
                     _wx,
@@ -6903,17 +7089,70 @@ async def train_one_async(
         if bool(getattr(cfg, "save_graph", False)):
             _save_compiled_graph(cfg, model_base, device, tag)
 
-    # All ranks must finish their independent eager capture before the first
-    # DDP constructor collective and before lazy compilation starts.
+    # All ranks must finish independent eager custom-op capture before the
+    # first DDP constructor collective.
     ddp_barrier(device)
-    model_compiled = maybe_compile(
-        model_base, device, enabled=bool(getattr(cfg, "compile", False)))
+    if ddp_is_distributed() and bool(getattr(cfg, "fsdp_full_shard", False)):
+        if bool(getattr(cfg, "optimizer_zero_shard", False)):
+            raise ValueError(
+                "fsdp_full_shard and optimizer_zero_shard are mutually exclusive")
+        if bool(getattr(cfg, "compile", False)):
+            raise ValueError("fsdp_full_shard local mode requires compile=false")
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        distributed_model = FSDP(
+            model_base,
+            device_id=device,
+            use_orig_params=True,
+            limit_all_gathers=True,
+            sync_module_states=False,
+        )
+        ddp_print(
+            f"[fsdp] FULL_SHARD across {ddp_world_size()} ranks "
+            "use_orig_params=true limit_all_gathers=true")
+    elif ddp_is_distributed():
+        # static_graph reuses the first iteration's autograd trace, which is
+        # incompatible with the no_sync() windows gradient accumulation needs
+        # (the reducer asserts expect_autograd_hooks_ on the skipped backward).
+        # It is also invalid for our compiled model: the depth-replay stack is
+        # an intentional eager island inside the compiled outer model, so its
+        # reducer-hook schedule is not one static compiled autograd graph.
+        static_graph, static_graph_reason = ddp_static_graph_policy(cfg)
+        distributed_model = DDP(
+            model_base,
+            device_ids=[ddp_local_rank()],
+            output_device=ddp_local_rank(),
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+            bucket_cap_mb=64,
+            gradient_as_bucket_view=True,
+            static_graph=static_graph,
+        )
+        if static_graph:
+            static_graph_note = ""
+        else:
+            static_graph_note = f" (disabled: {static_graph_reason})"
+        ddp_print(
+            "[ddp] buckets=64MiB gradient_as_bucket_view=true "
+            "buffers=explicit-pre-forward "
+            f"static_graph={str(static_graph).lower()}"
+            f"{static_graph_note}"
+        )
+    else:
+        distributed_model = model_base
 
-    # Materialize lazy Dynamo/Inductor graphs on the inner model before DDP
-    # installs reducer hooks. A synthetic backward through DDP would become
-    # the reducer's first static-graph iteration; packed layouts from real
-    # data are allowed to differ from this synthetic layout and can otherwise
-    # leave ranks waiting on different reducer hook sequences.
+    # DDP owns the AccumulateGrad/reducer hooks. Compile the DDP wrapper, not
+    # the bare module: compiling the bare backward first and installing DDP
+    # afterwards can cache a backward that never reaches the reducer hooks,
+    # leaving the first real training iteration blocked forever.
+    model = maybe_compile(
+        distributed_model,
+        device,
+        enabled=bool(getattr(cfg, "compile", False)),
+    )
+
+    # Materialize Dynamo/Inductor through the exact wrapper used by training.
+    # For DDP this is a complete reducer iteration, so its gradient hooks and
+    # collectives are compiled/observed together on every rank.
     if (
         bool(getattr(cfg, "compile", False))
         and hasattr(torch, "compile")
@@ -6941,15 +7180,25 @@ async def train_one_async(
         _warm_pos2, _warm_mask2 = build_doc_reset_state(
             _wx2, train_eos_id
         )
+        _warm_mask2 = ensure_temporal_chunk_plans(
+            _wx2, _warm_mask2, cfg
+        )
         _compile_t0 = time.time()
+        ddp_trace("compile_warmup_buffer_sync_begin", step=0)
+        ddp_sync_mutable_buffers(model)
+        ddp_trace("compile_warmup_buffer_sync_end", step=0)
+        ddp_trace("compile_warmup_forward_begin", step=0)
         with amp_autocast(device):
-            _wloss2 = model_compiled(
+            _wloss2 = model(
                 _wx2,
                 attn_mask=_warm_mask2,
                 position_ids=_warm_pos2,
                 labels=_wy2,
             )
+        ddp_trace("compile_warmup_forward_end", step=0)
+        ddp_trace("compile_warmup_backward_begin", step=0)
         _wloss2.backward()
+        ddp_trace("compile_warmup_backward_end", step=0)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         _compile_s = time.time() - _compile_t0
@@ -6963,54 +7212,8 @@ async def train_one_async(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # Do not let a faster rank enter DDP's constructor collectives while
-    # another rank is still compiling its local forward/backward graphs.
+    # Keep ranks aligned after local Inductor work before optimizer creation.
     ddp_barrier(device)
-    if ddp_is_distributed() and bool(getattr(cfg, "fsdp_full_shard", False)):
-        if bool(getattr(cfg, "optimizer_zero_shard", False)):
-            raise ValueError(
-                "fsdp_full_shard and optimizer_zero_shard are mutually exclusive")
-        if bool(getattr(cfg, "compile", False)):
-            raise ValueError("fsdp_full_shard local mode requires compile=false")
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        model = FSDP(
-            model_compiled,
-            device_id=device,
-            use_orig_params=True,
-            limit_all_gathers=True,
-            sync_module_states=False,
-        )
-        ddp_print(
-            f"[fsdp] FULL_SHARD across {ddp_world_size()} ranks "
-            "use_orig_params=true limit_all_gathers=true")
-    elif ddp_is_distributed():
-        # static_graph reuses the first iteration's autograd trace, which is
-        # incompatible with the no_sync() windows gradient accumulation needs
-        # (the reducer asserts expect_autograd_hooks_ on the skipped backward).
-        # It is also invalid for our compiled model: the depth-replay stack is
-        # an intentional eager island inside the compiled outer model, so its
-        # reducer-hook schedule is not one static compiled autograd graph.
-        static_graph, static_graph_reason = ddp_static_graph_policy(cfg)
-        model = DDP(
-            model_compiled,
-            device_ids=[ddp_local_rank()],
-            output_device=ddp_local_rank(),
-            find_unused_parameters=False,
-            bucket_cap_mb=64,
-            gradient_as_bucket_view=True,
-            static_graph=static_graph,
-        )
-        if static_graph:
-            static_graph_note = ""
-        else:
-            static_graph_note = f" (disabled: {static_graph_reason})"
-        ddp_print(
-            "[ddp] buckets=64MiB gradient_as_bucket_view=true "
-            f"static_graph={str(static_graph).lower()}"
-            f"{static_graph_note}"
-        )
-    else:
-        model = model_compiled
 
     named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     params = [p for _, p in named_params]
@@ -7258,8 +7461,10 @@ async def train_one_async(
                                                     # doesn't proxy through DDP's
                                                     # wrapper -- same reason
                                                     # ddp_unwrap_model exists at all.
+    ddp_trace("train_loop_ready", step=start_step)
     with _GracefulInterrupt() as interrupt, _RunpointWatcher() as runpoint:
         for step in range(start_step + 1, int(cfg.steps) + 1):
+            ddp_trace("step_begin", step=step)
             if interrupt.requested:
                 _handle_interrupt()
             if runpoint.consume():
@@ -7271,18 +7476,40 @@ async def train_one_async(
             train_loss_sum = 0.0
             train_tokens_step = 0
             for micro_idx in range(accum_steps):
+                trace_micro = micro_idx + 1
+                ddp_trace(
+                    "batch_fetch_begin", step=step, micro=trace_micro
+                )
                 _wait_t0 = time.time()
                 batch = await batch_iter.__anext__()
+                ddp_trace(
+                    "batch_fetch_end", step=step, micro=trace_micro
+                )
                 data_wait_s += time.time() - _wait_t0
-                x, y, position_ids, attn_mask = split_train_batch(batch, train_eos_id)
+                x, y, position_ids, attn_mask = split_train_batch(
+                    batch, train_eos_id, cfg
+                )
                 sync_ctx = (
                     model.no_sync()
                     if ddp_is_distributed() and micro_idx + 1 < accum_steps
                     else contextlib.nullcontext()
                 )
                 with sync_ctx:
+                    ddp_trace(
+                        "buffer_sync_begin", step=step, micro=trace_micro
+                    )
+                    ddp_sync_mutable_buffers(model)
+                    ddp_trace(
+                        "buffer_sync_end", step=step, micro=trace_micro
+                    )
+                    ddp_trace(
+                        "forward_begin", step=step, micro=trace_micro
+                    )
                     with amp_autocast(device):
                         loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
+                    ddp_trace(
+                        "forward_end", step=step, micro=trace_micro
+                    )
                     total_loss = loss
                     # Read before custom CUDA backward: if the same scalar changes
                     # afterwards, a backward kernel corrupted forward storage.
@@ -7311,7 +7538,13 @@ async def train_one_async(
                     if raw_model_for_tria.last_tria_fire_mask is not None:
                         with torch.no_grad():
                             refeeds_since_log.add_(raw_model_for_tria.last_tria_fire_mask.detach().sum())
+                    ddp_trace(
+                        "backward_begin", step=step, micro=trace_micro
+                    )
                     (total_loss / float(accum_steps)).backward()
+                    ddp_trace(
+                        "backward_end", step=step, micro=trace_micro
+                    )
                     loss_after_backward = float(loss.detach().item())
                     if math.isfinite(loss_before_backward) and math.isfinite(loss_after_backward) and loss_after_backward != loss_before_backward:
                         raise RuntimeError(
@@ -7347,11 +7580,15 @@ async def train_one_async(
                     f"examples={bad_grad_list}"
                 )
             if cfg.grad_clip and cfg.grad_clip > 0:
+                ddp_trace("grad_clip_begin", step=step)
                 torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+                ddp_trace("grad_clip_end", step=step)
             lr = lr_at(cfg, step - 1)
             for g in opt.param_groups:
                 g["lr"] = lr * float(g.get("lr_mult", 1.0))
+            ddp_trace("optimizer_begin", step=step)
             opt.step()
+            ddp_trace("optimizer_end", step=step)
             bad_param = _first_nonfinite("param")
             if bad_param is not None:
                 bad_param_list = " || ".join(_collect_nonfinite("param"))
@@ -7371,8 +7608,10 @@ async def train_one_async(
                 "draws": current_dataset_draws,
             }
             train_loss_local = train_loss_sum / float(accum_steps)
+            ddp_trace("metrics_allreduce_begin", step=step)
             train_loss_log = ddp_mean_float(train_loss_local, device)
             train_tokens_global = ddp_sum_int(train_tokens_step, device)
+            ddp_trace("metrics_allreduce_end", step=step)
             tokens_seen_global += int(train_tokens_global)
             _step_seconds = max(time.time() - _step_t0, 1e-9)
             _step_tps = float(train_tokens_global) / _step_seconds
@@ -7622,7 +7861,9 @@ def _eval_full_sft(model: nn.Module, cfg: Config, dataset: str, device: torch.de
                 else None
             )
             batch = (ids, mask, metadata) if metadata is not None else (ids, mask)
-            x, y, position_ids, attn_mask = split_train_batch(batch, stream._eos_id)
+            x, y, position_ids, attn_mask = split_train_batch(
+                batch, stream._eos_id, cfg
+            )
             ntok = int((y != IGNORE_INDEX).sum().item())
             if ntok == 0:
                 continue
@@ -8020,9 +8261,21 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    finally:
+    except Exception:
+        if dist.is_available() and dist.is_initialized():
+            # A rank may fail while a peer is blocked in a different NCCL
+            # collective. Calling destroy_process_group() here waits for that
+            # peer and hides the original exception forever. Print it before
+            # any teardown and terminate this worker immediately; torchrun
+            # will then stop the remaining ranks.
+            traceback.print_exc()
+            with contextlib.suppress(Exception):
+                sys.stdout.flush()
+                sys.stderr.flush()
+            os._exit(1)
+        raise
+    else:
         # Every torchrun rank owns its process group. Explicit teardown avoids
-        # relying on interpreter destruction, which can strand pending NCCL
-        # work or let one rank exit before its peers.
+        # relying on interpreter destruction after a successful, aligned run.
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()

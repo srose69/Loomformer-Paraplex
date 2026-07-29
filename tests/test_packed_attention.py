@@ -199,6 +199,84 @@ class PackedAttentionTests(unittest.TestCase):
             loss.backward()
         self.assertTrue(torch.isfinite(loss))
 
+    def test_pt_split_builds_chunk_plans_before_compiled_model(self):
+        cfg = lf.Config(
+            vocab=32, seq_len=8, batch_size=1, model_dim=16,
+            n_q_heads=2, head_dim=8, n_kv_heads=1, hidden=32,
+            layers=1, attn_impl="sdpa", amp_dtype="fp32",
+            tria_carry_enabled=True, tria_temporal_enabled=True,
+            tria_temporal_auto=False, tria_temporal_window=4,
+            compile=True, use_cuda_tria=False,
+        )
+        lf.apply_config(cfg)
+        batch = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+        x, labels, position_ids, layout = lf.split_train_batch(
+            batch, eos_id=None, cfg=cfg
+        )
+        self.assertIsInstance(layout, lf.PackedAttentionLayout)
+        self.assertEqual(
+            [(plan.start, plan.end) for plan in layout.chunk_plans],
+            [(0, 4), (4, 8)],
+        )
+        model = lf.Model(cfg).train()
+        with mock.patch.object(
+            lf, "build_packed_chunk_layout",
+            side_effect=AssertionError("compiled Model rebuilt PT metadata"),
+        ):
+            loss = model(
+                x,
+                attn_mask=layout,
+                position_ids=position_ids,
+                labels=labels,
+            )
+            loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_precomputed_carry_schedule_survives_compiled_eager_island(self):
+        cfg = lf.Config(
+            vocab=32, seq_len=8, batch_size=1, model_dim=16,
+            n_q_heads=2, head_dim=8, n_kv_heads=1, hidden=32,
+            layers=1, attn_impl="sdpa", amp_dtype="fp32",
+            tria_carry_enabled=True, tria_temporal_enabled=True,
+            tria_temporal_auto=False, tria_temporal_window=4,
+            compile=True, use_cuda_tria=False,
+        )
+        lf.apply_config(cfg)
+        old_carry = lf.CARRY_TOKEN_ID
+        lf.CARRY_TOKEN_ID = 3
+        try:
+            # A data-dependent carry lies before the grid boundary. Its
+            # schedule and fire bit are computed outside compiled Model.
+            batch = torch.tensor([[1, 3, 2, 4, 5, 6, 7, 8, 9]])
+            x, labels, position_ids, layout = lf.split_train_batch(
+                batch, eos_id=None, cfg=cfg
+            )
+            self.assertEqual(
+                [(plan.start, plan.end) for plan in layout.chunk_plans],
+                [(0, 2), (2, 4), (4, 8)],
+            )
+            self.assertEqual(
+                [plan.ends_with_fire for plan in layout.chunk_plans],
+                [True, True, False],
+            )
+            model = lf.Model(cfg).train()
+            with mock.patch.object(
+                lf, "build_packed_chunk_layout",
+                side_effect=AssertionError(
+                    "eager-island resume changed compiled chunk schedule"
+                ),
+            ):
+                loss = model(
+                    x,
+                    attn_mask=layout,
+                    position_ids=position_ids,
+                    labels=labels,
+                )
+                loss.backward()
+            self.assertTrue(torch.isfinite(loss))
+        finally:
+            lf.CARRY_TOKEN_ID = old_carry
+
 
 if __name__ == "__main__":
     unittest.main()

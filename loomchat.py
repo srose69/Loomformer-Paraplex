@@ -552,14 +552,22 @@ def _copy_to(t: Optional[torch.Tensor], device: torch.device) -> Optional[torch.
     if t is None:
         return None
     out = t.to(device, copy=True)
-    return out.pin_memory() if device.type == "cpu" and not out.is_pinned() else out
+    # see _trim_to: only pin for CUDA DMA when a driver is present.
+    if device.type == "cpu" and torch.cuda.is_available() and not out.is_pinned():
+        return out.pin_memory()
+    return out
 
 
 def _trim_to(t: Optional[torch.Tensor], used: int, device: torch.device) -> Optional[torch.Tensor]:
     if t is None:
         return None
     out = t[:, :int(used)].to(device, copy=True)
-    return out.pin_memory() if device.type == "cpu" and not out.is_pinned() else out
+    # pin_memory() stages the tensor for CUDA DMA; it requires a working CUDA
+    # driver and is pointless without one, so only pin when CUDA is actually
+    # available (otherwise a CPU-only host raises "found no NVIDIA driver").
+    if device.type == "cpu" and torch.cuda.is_available() and not out.is_pinned():
+        return out.pin_memory()
+    return out
 
 
 def _expand_to(t: Optional[torch.Tensor], seq_len: int, device: torch.device) -> Optional[torch.Tensor]:

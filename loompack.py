@@ -169,6 +169,8 @@ def _sha256(data: bytes) -> str:
 
 
 def _load_checkpoint(path: str) -> MutableMapping[str, Any]:
+    if path.lower().endswith(".safetensors"):
+        return _load_safetensors_checkpoint(path)
     blob = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(blob, MutableMapping):
         raise TypeError("checkpoint must be a mapping")
@@ -176,6 +178,36 @@ def _load_checkpoint(path: str) -> MutableMapping[str, Any]:
         raise ValueError("checkpoint must contain a model state dict under key 'model'")
     if "cfg" not in blob or not isinstance(blob["cfg"], Mapping):
         raise ValueError("checkpoint must contain configuration under key 'cfg'")
+    return blob
+
+
+def _load_safetensors_checkpoint(path: str) -> Dict[str, Any]:
+    from safetensors.torch import load_file as _load_safetensors
+
+    base = os.path.splitext(path)[0]
+    config_path = base + ".json"
+    if not os.path.isfile(config_path):
+        config_path = os.path.join(os.path.dirname(path), "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"safetensors checkpoint needs a sibling config JSON "
+            f"(tried {base + '.json'} and config.json in the same directory)"
+        )
+    with open(config_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if "cfg" not in meta or not isinstance(meta["cfg"], Mapping):
+        raise ValueError("config JSON must contain 'cfg' mapping")
+    model_state = _load_safetensors(path)
+    blob: Dict[str, Any] = {
+        "model": model_state,
+        "cfg": meta["cfg"],
+        "model_kind": meta.get("model_kind", "loomformer"),
+        "ffn_type": meta.get("ffn_type", "paraplex"),
+        "ablation": meta.get("ablation", False),
+    }
+    for key in ("step", "tokens_seen", "train_loss", "eval_loss"):
+        if key in meta:
+            blob[key] = meta[key]
     return blob
 
 
@@ -309,6 +341,61 @@ def extract_package(path: str, directory: str) -> None:
     )
 
 
+def export_safetensors(
+    model_path: str,
+    output_path: str,
+    quant: str,
+    min_quant_elements: int,
+) -> Dict[str, Any]:
+    if min_quant_elements < 1:
+        raise ValueError("--min-quant-elements must be positive")
+
+    blob = _load_checkpoint(model_path)
+    target_dtype = _quant_dtype(quant)
+    model_state, quant_report = _convert_state_dict(
+        blob["model"], target_dtype, min_quant_elements
+    )
+
+    from safetensors.torch import save_file
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    sd = {k: v.contiguous() for k, v in model_state.items()}
+
+    shared = set()
+    seen_ptrs: Dict[int, str] = {}
+    for k, v in sd.items():
+        ptr = v.data_ptr()
+        if ptr in seen_ptrs:
+            shared.add(seen_ptrs[ptr])
+            shared.add(k)
+        else:
+            seen_ptrs[ptr] = k
+    for k in shared:
+        sd[k] = sd[k].clone()
+
+    save_file(sd, str(out))
+
+    meta = {
+        "cfg": dict(blob["cfg"]),
+        "model_kind": blob.get("model_kind", "loomformer"),
+        "ffn_type": blob.get("ffn_type", "paraplex"),
+        "ablation": bool(blob.get("ablation", False)),
+    }
+    for key in ("step", "tokens_seen", "train_loss", "eval_loss"):
+        if key in blob:
+            meta[key] = blob[key]
+
+    config_path = out.with_suffix(".json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    quant_report["archive_bytes"] = out.stat().st_size
+    quant_report["config_path"] = str(config_path)
+    return quant_report
+
+
 def _size_text(value: int) -> str:
     n = float(value)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -323,7 +410,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     pack = sub.add_parser("pack")
-    pack.add_argument("model", help="LoomFormer .pt checkpoint")
+    pack.add_argument("model", help="LoomFormer .pt or .safetensors checkpoint")
     pack.add_argument("--tokenizer", required=True, help="tokenizer JSON")
     pack.add_argument("--template", required=True, help="chat template Jinja")
     pack.add_argument("-o", "--output", required=True, help="output .aio")
@@ -342,6 +429,17 @@ def _parser() -> argparse.ArgumentParser:
     extract = sub.add_parser("extract")
     extract.add_argument("archive")
     extract.add_argument("-d", "--directory", required=True)
+
+    export = sub.add_parser("export-safetensors")
+    export.add_argument("model", help="LoomFormer .pt or .safetensors checkpoint")
+    export.add_argument("-o", "--output", required=True, help="output .safetensors")
+    export.add_argument("--quant", default="none", help="none, fp32, bf16, or fp16")
+    export.add_argument(
+        "--min-quant-elements",
+        type=int,
+        default=DEFAULT_MIN_QUANT_ELEMENTS,
+        help=f"keep smaller tensors in fp32 (default: {DEFAULT_MIN_QUANT_ELEMENTS})",
+    )
     return parser
 
 
@@ -373,6 +471,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "extract":
         extract_package(args.archive, args.directory)
         print(f"[loompack] extracted to {args.directory}")
+        return 0
+    if args.command == "export-safetensors":
+        report = export_safetensors(
+            model_path=args.model,
+            output_path=args.output,
+            quant=args.quant,
+            min_quant_elements=args.min_quant_elements,
+        )
+        print(
+            f"[loompack] {args.output}: quant={report['target_dtype']}, "
+            f"tensors={report['changed_tensors']} converted, "
+            f"archive={_size_text(report['archive_bytes'])}"
+        )
+        print(
+            f"[loompack] tensor bytes: {_size_text(report['source_bytes'])} -> "
+            f"{_size_text(report['packed_tensor_bytes'])}"
+        )
+        print(f"[loompack] config: {report['config_path']}")
         return 0
     return 2
 

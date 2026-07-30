@@ -650,31 +650,65 @@ def _checkpoint_matrix(
 
 @torch.no_grad()
 def _incremental_model_parity(device: torch.device) -> None:
-    cfg = replace(
-        _config(device=str(device), attn_impl="sdpa", value_fusion=True),
-        # Force the cap to engage on random-init branches; cap=1 can be a
-        # numerical no-op here and would not detect a missing step() call.
-        residual_branch_rms_cap=0.05,
+    base = _config(device=str(device), attn_impl="sdpa", value_fusion=True)
+    cases = (
+        ("dense", {}),
+        (
+            "sparse",
+            {
+                "attn_layers": [1, 3],
+                "attn_token_stride": 2,
+                "attn_token_schedule": "staggered",
+            },
+        ),
     )
-    lf.apply_config(cfg)
-    torch.manual_seed(707)
-    model = lf.Model(cfg).to(device).eval()
-    tokens = torch.randint(0, cfg.vocab, (2, 7), device=device)
-    positions = torch.arange(tokens.shape[1], device=device).view(1, -1).expand_as(tokens)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        full = model(tokens, position_ids=positions)
-        states = None
-        pieces = []
-        for pos in range(tokens.shape[1]):
-            logits, states = model.step(tokens[:, pos:pos + 1], pos, states)
-            pieces.append(logits[:, None, :])
-        incremental = torch.cat(pieces, dim=1)
-    _assert_close(
-        incremental.float(), full.float(),
-        label="full/incremental model with residual RMS cap",
-        atol=5e-2, rtol=8e-2,
-    )
-    print("[gpu-parity] PASS full/incremental model with residual RMS cap", flush=True)
+    for label, overrides in cases:
+        cfg = replace(
+            base,
+            residual_branch_rms_cap=0.05,
+            **overrides,
+        )
+        lf.apply_config(cfg)
+        torch.manual_seed(707)
+        model = lf.Model(cfg).to(device).eval()
+        tokens = torch.randint(0, cfg.vocab, (2, 7), device=device)
+        positions = torch.arange(
+            tokens.shape[1], device=device).view(1, -1).expand_as(tokens)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            full = model(tokens, position_ids=positions)
+            states = None
+            pieces = []
+            for pos in range(tokens.shape[1]):
+                logits, states = model.step(
+                    tokens[:, pos:pos + 1], pos, states)
+                pieces.append(logits[:, None, :])
+            incremental = torch.cat(pieces, dim=1)
+        _assert_close(
+            incremental.float(), full.float(),
+            label=f"{label} full/incremental model",
+            atol=5e-2, rtol=8e-2,
+        )
+        if label == "sparse":
+            caches = states[0]
+            expected = (4, 0, 3, 0)
+            actual = tuple(cache.cache_pos for cache in caches)
+            if actual != expected:
+                raise AssertionError(
+                    f"sparse physical KV counts {actual}, expected {expected}")
+            for index, cache in enumerate(caches):
+                if expected[index] == 0:
+                    if cache.k is not None or cache.v is not None:
+                        raise AssertionError(
+                            f"inactive layer {index + 1} allocated KV")
+                elif cache.cache_capacity != 8:
+                    raise AssertionError(
+                        f"active layer {index + 1} cache capacity "
+                        f"{cache.cache_capacity}, expected 8")
+        print(
+            f"[gpu-parity] PASS {label} full/incremental model "
+            "with residual RMS cap",
+            flush=True,
+        )
 
 
 def main() -> None:

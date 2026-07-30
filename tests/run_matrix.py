@@ -866,6 +866,7 @@ def run_matrix(args: argparse.Namespace) -> None:
 
         pt_attention_dataset = _make_pt_parquet(
             work, "pt_attention_matrix")
+        sparse_inference_case = "first_two_stride2_staggered_ckpt_off"
         for attention_case in attention_cases:
             case_name = attention_case["name"]
             overrides = attention_case["overrides"]
@@ -903,6 +904,25 @@ def run_matrix(args: argparse.Namespace) -> None:
             )
             _check_checkpoint(otf_checkpoint, step=1, optimizer="adamw")
             _assert_split(pt_attention_dataset, 30)
+            if case_name == sparse_inference_case:
+                _run(
+                    f"sparse checkpointed autoregressive inference [{case_name}]",
+                    [
+                        sys.executable,
+                        "loomformer.py",
+                        "--infer",
+                        "--config",
+                        otf_config,
+                        "--checkpoint",
+                        otf_checkpoint,
+                        "--device",
+                        profile["device"],
+                        "--prompt",
+                        "synthetic sparse inference",
+                        "--max-new",
+                        "4",
+                    ],
+                )
 
         sft_config: Optional[Path] = None
         sft_checkpoint: Optional[Path] = None

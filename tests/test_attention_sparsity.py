@@ -355,6 +355,61 @@ class AttentionSparsityTests(unittest.TestCase):
         self.assertEqual(out0[4].shape[1] + out1[4].shape[1], expected_selected)
         self.assertEqual(out0[5].shape[1] + out1[5].shape[1], expected_selected)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_staggered_chunk_backward_crosses_empty_history_piece(self):
+        cfg = _cfg(layers=2, attn_layers=[1, 2])
+        lf.apply_config(cfg)
+        mixer = lf.StridedGroupedQueryCausalSelfAttention(2, 1).cuda()
+
+        def plan(start, end):
+            empty = torch.empty(0, dtype=torch.int32, device="cuda")
+            return lf.PackedChunkLayout(
+                start=start,
+                end=end,
+                selectors=empty,
+                destinations=empty,
+                piece_sizes=(),
+                piece_offsets=torch.zeros(
+                    1, dtype=torch.int32, device="cuda"),
+                cu_seqlens_q=torch.tensor(
+                    [0, 1], dtype=torch.int32, device="cuda"),
+                cu_seqlens_k=torch.tensor(
+                    [0, 1], dtype=torch.int32, device="cuda"),
+                max_seqlen_q=1,
+                max_seqlen_k=1,
+            )
+
+        z0 = torch.randn(1, 1, 32, device="cuda", requires_grad=True)
+        z1 = torch.randn(1, 1, 32, device="cuda", requires_grad=True)
+        inherited0 = tuple(
+            torch.randn(1, 1, 4, 8, device="cuda") for _ in range(3))
+        inherited1 = tuple(
+            torch.randn(1, 1, 4, 8, device="cuda") for _ in range(3))
+        pos0 = torch.tensor([[0]], device="cuda")
+        pos1 = torch.tensor([[1]], device="cuda")
+        first_plan = plan(0, 1)
+        out0 = mixer.forward_chunk(
+            z0, (), (), pos0, None, first_plan,
+            inherited_context=inherited0)
+        meta0 = mixer._chunk_layout(pos0, None, first_plan)
+        self.assertEqual(out0[4].shape[1], 0)
+        out1 = mixer.forward_chunk(
+            z1,
+            (out0[4],),
+            (out0[5],),
+            pos1,
+            None,
+            plan(1, 2),
+            inherited_context=inherited1,
+            past_document_chunks=(meta0.documents,),
+            past_position_chunks=(meta0.positions,),
+        )
+        sum(tensor.square().sum() for tensor in out1[:4]).backward()
+        self.assertIsNotNone(z0.grad)
+        self.assertEqual(torch.count_nonzero(z0.grad).item(), 0)
+        self.assertIsNotNone(z1.grad)
+        self.assertGreater(torch.count_nonzero(z1.grad).item(), 0)
+
     def test_dense_checkpoint_conversion_is_explicit_and_strict(self):
         dense_cfg = _cfg(attn_layers=None, attn_token_stride=1)
         lf.apply_config(dense_cfg)

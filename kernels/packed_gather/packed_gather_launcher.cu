@@ -114,9 +114,11 @@ std::vector<torch::Tensor> packed_gather_backward_cuda(
 
     int64_t total_elements = 0;
     for (int64_t length : chunk_lengths) {
-        TORCH_CHECK(length > 0, "packed_gather chunk lengths must be positive");
+        TORCH_CHECK(length >= 0, "packed_gather chunk lengths must be non-negative");
         total_elements += batch * length * heads * head_dim;
     }
+    TORCH_CHECK(total_elements > 0,
+                "packed_gather cannot backpropagate into an all-empty history");
     auto storage = torch::zeros({total_elements}, grad_output.options());
     std::vector<torch::Tensor> grads;
     grads.reserve(chunk_lengths.size());
@@ -219,9 +221,12 @@ std::vector<torch::Tensor> packed_gather_pair_backward_cuda(
 
     int64_t total_elements = 0;
     for (int64_t length : chunk_lengths) {
-        TORCH_CHECK(length > 0, "packed_gather_pair chunk lengths must be positive");
+        TORCH_CHECK(length >= 0,
+                    "packed_gather_pair chunk lengths must be non-negative");
         total_elements += batch * length * heads * head_dim;
     }
+    TORCH_CHECK(total_elements > 0,
+                "packed_gather_pair cannot backpropagate into an all-empty history");
     auto grad_k_storage = torch::zeros({total_elements}, grad_output.options());
     auto grad_v_storage = torch::zeros({total_elements}, grad_output.options());
     std::vector<torch::Tensor> grad_k, grad_v;

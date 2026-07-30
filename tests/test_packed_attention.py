@@ -65,6 +65,81 @@ class PackedAttentionTests(unittest.TestCase):
             for value, ref in zip((*keys, *vals), (*key_refs, *val_refs)):
                 torch.testing.assert_close(value.grad, ref.grad.cuda())
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_packed_gather_accepts_empty_staggered_chunks(self):
+        sizes = (0, 2, 0, 2, 0)
+
+        def plan(device):
+            return lf.PackedChunkLayout(
+                start=0,
+                end=4,
+                selectors=torch.tensor(
+                    [0, 1, 0, 1], dtype=torch.int32, device=device),
+                destinations=torch.tensor(
+                    [0, 1, 2, 3], dtype=torch.int32, device=device),
+                piece_sizes=sizes,
+                piece_offsets=torch.tensor(
+                    [0, 0, 2, 2, 4, 4], dtype=torch.int32, device=device),
+                cu_seqlens_q=torch.tensor(
+                    [0, 4], dtype=torch.int32, device=device),
+                cu_seqlens_k=torch.tensor(
+                    [0, 4], dtype=torch.int32, device=device),
+                max_seqlen_q=4,
+                max_seqlen_k=4,
+            )
+
+        source = [
+            torch.randn(1, size, 2, 3)
+            for size in sizes
+        ]
+        chunks = [
+            tensor.cuda().requires_grad_() for tensor in source
+        ]
+        refs = [
+            tensor.detach().clone().requires_grad_() for tensor in source
+        ]
+        got = lf._pack_selected_chunk_history(
+            tuple(chunks), plan(torch.device("cuda")))
+        expected = lf._pack_selected_chunk_history(
+            tuple(refs), plan(torch.device("cpu")))
+        torch.testing.assert_close(got, expected.cuda())
+        grad = torch.randn_like(got)
+        got.backward(grad)
+        expected.backward(grad.cpu())
+        for chunk, ref in zip(chunks, refs):
+            self.assertIsNotNone(chunk.grad)
+            expected_grad = (
+                torch.zeros_like(ref) if ref.grad is None else ref.grad)
+            torch.testing.assert_close(chunk.grad, expected_grad.cuda())
+
+        keys = [
+            tensor.cuda().requires_grad_() for tensor in source
+        ]
+        values = [
+            (tensor + 1).cuda().requires_grad_() for tensor in source
+        ]
+        key_refs = [
+            tensor.detach().clone().requires_grad_() for tensor in source
+        ]
+        value_refs = [
+            (tensor.detach() + 1).requires_grad_() for tensor in source
+        ]
+        fused = lf._pack_selected_chunk_kv(
+            tuple(keys), tuple(values), plan(torch.device("cuda")))
+        fused_ref = lf._pack_selected_chunk_kv(
+            tuple(key_refs), tuple(value_refs), plan(torch.device("cpu")))
+        torch.testing.assert_close(fused, fused_ref.cuda())
+        fused_grad = torch.randn_like(fused)
+        fused.backward(fused_grad)
+        fused_ref.backward(fused_grad.cpu())
+        for value, ref in zip(
+            (*keys, *values), (*key_refs, *value_refs)
+        ):
+            self.assertIsNotNone(value.grad)
+            expected_grad = (
+                torch.zeros_like(ref) if ref.grad is None else ref.grad)
+            torch.testing.assert_close(value.grad, expected_grad.cuda())
+
     def test_layout_is_linear_and_chunk_gather_is_document_major(self):
         seg = torch.tensor(
             [[0, 0, 0, 1, 1, 1, 2, 2, 2, 2],

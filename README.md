@@ -37,7 +37,7 @@ by **srose69** (SimpleRose)
 [![Precision FP32 FP16 BF16](https://img.shields.io/badge/precision-FP32%20%7C%20FP16%20%7C%20BF16-2563eb)](#configuration)
 [![Attention GQA](https://img.shields.io/badge/attention-causal%20GQA-black)](#causal-gqa)
 [![Attention backends](https://img.shields.io/badge/backends-FlashAttention%20%7C%20TE%20%7C%20SDPA-0ea5e9)](#cuda-kernels-and-replay)
-[![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/srs6901/LoomFormer-Paraplex/)
+[![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/collections/srs6901/loomformer-paraplex)
 [![Training PT + SFT](https://img.shields.io/badge/training-PT%20%2B%20SFT-9333ea)](#training-sft-and-inference)
 [![Distributed DDP](https://img.shields.io/badge/distributed-DDP-7c3aed)](#training-sft-and-inference)
 [![Data packed + OTF](https://img.shields.io/badge/data-packed%20%2B%20OTF-0891b2)](#training-sft-and-inference)
@@ -159,7 +159,7 @@ The name **LoomFormer** refers to the way these paths are interwoven: ordinary c
 
 Published checkpoints are available on Hugging Face:
 
-**[Hugging Face checkpoint repository](https://huggingface.co/srs6901/LoomFormer-Paraplex/)**
+**[Hugging Face checkpoint repository](https://huggingface.co/collections/srs6901/loomformer-paraplex)**
 
 The reference run currently described in this README used:
 
@@ -1443,7 +1443,7 @@ W_{\mathrm{eff}}=\left(W_{\mathrm{real}},\left(W^{I,U},\mathbf W^{I,\mathrm{ctx}
 
 Опубликованные чекпойнты находятся на Hugging Face:
 
-**[Репозиторий чекпойнтов на Hugging Face](https://huggingface.co/srs6901/LoomFormer-Paraplex/)**
+**[Репозиторий чекпойнтов на Hugging Face](https://huggingface.co/collections/srs6901/loomformer-paraplex)**
 
 Референсный запуск, описанный в этом README, использовал:
 

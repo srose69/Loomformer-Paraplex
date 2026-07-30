@@ -190,6 +190,66 @@ def _compare_attention_runs(label: str, actual, reference) -> None:
         )
 
 
+def _head_selector_parity(device: torch.device) -> None:
+    cfg = _config(
+        device=str(device),
+        attn_impl="sdpa",
+        value_fusion=True,
+    )
+    lf.apply_config(cfg)
+    torch.manual_seed(109)
+    for dtype, atol, rtol in (
+        (torch.float32, 2e-5, 2e-5),
+        (torch.float16, 2e-2, 2e-2),
+        (torch.bfloat16, 6e-2, 6e-2),
+    ):
+        carry_base = torch.randn(
+            2, 5, lf.HIDDEN, 3, 3, device=device, dtype=dtype)
+        logits = torch.randn(
+            lf.N_Q_HEADS, 9, device=device, dtype=dtype)
+        weight_base = torch.softmax(logits, dim=-1)
+        output_grad = torch.randn(
+            2, 5, lf.HIDDEN, device=device, dtype=dtype)
+
+        carry_actual = carry_base.detach().clone().requires_grad_(True)
+        weight_actual = weight_base.detach().clone().requires_grad_(True)
+        actual = tria._GateSlotMixFused.apply(carry_actual, weight_actual)
+        actual.backward(output_grad)
+
+        carry_reference = carry_base.detach().clone().requires_grad_(True)
+        weight_reference = weight_base.detach().clone().requires_grad_(True)
+        reference = tria._gate_slot_mix_reference(
+            carry_reference, weight_reference)
+        reference.backward(output_grad)
+
+        label = str(dtype).removeprefix("torch.")
+        _assert_close(
+            actual,
+            reference,
+            label=f"head selector {label} output",
+            atol=atol,
+            rtol=rtol,
+        )
+        _assert_close(
+            carry_actual.grad,
+            carry_reference.grad,
+            label=f"head selector {label} carry gradient",
+            atol=atol,
+            rtol=rtol,
+        )
+        _assert_close(
+            weight_actual.grad,
+            weight_reference.grad,
+            label=f"head selector {label} weight gradient",
+            atol=atol,
+            rtol=rtol,
+        )
+    print(
+        "[gpu-parity] PASS head-local selector FP32/FP16/BF16 fwd/bwd",
+        flush=True,
+    )
+
+
 def _attention_matrix(device: torch.device, modern: bool) -> None:
     torch.manual_seed(101)
     base_cfg = _config(
@@ -633,6 +693,7 @@ def main() -> None:
         f"SM{major}.{minor}",
         flush=True,
     )
+    _head_selector_parity(device)
     _attention_matrix(device, major >= 8)
     _checkpoint_matrix(device, major >= 8, major >= 7)
     _incremental_model_parity(device)

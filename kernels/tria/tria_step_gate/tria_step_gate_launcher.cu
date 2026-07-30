@@ -26,7 +26,11 @@ std::vector<torch::Tensor> tria_step_gate_forward_cuda(
                 "tria_step_gate_forward_cuda: r, i, o must have the same numel");
     TORCH_CHECK(carry_prev.numel() == r.numel() * 9,
                 "tria_step_gate_forward_cuda: carry_prev must have 9 values per r/i/o element");
-    TORCH_CHECK(w.numel() == 9, "tria_step_gate_forward_cuda: w must have exactly 9 elements");
+    TORCH_CHECK(r.dim() == 3, "tria_step_gate_forward_cuda: r must be [B,T,H]");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "tria_step_gate_forward_cuda: w must be [Q,9]");
+    const int64_t hidden = r.size(2), heads = w.size(0);
+    TORCH_CHECK(hidden % heads == 0, "tria_step_gate_forward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = hidden / heads;
     c10::cuda::CUDAGuard device_guard(r.device());
 
     auto r_c = r.contiguous();
@@ -47,7 +51,7 @@ std::vector<torch::Tensor> tria_step_gate_forward_cuda(
                 r_c.data_ptr<scalar_t>(), i_c.data_ptr<scalar_t>(), o_c.data_ptr<scalar_t>(),
                 cp_c.data_ptr<scalar_t>(), w_c.data_ptr<scalar_t>(),
                 carry_new.data_ptr<scalar_t>(), p_out.data_ptr<scalar_t>(),
-                scale.data_ptr<float>(), (float)alpha, (int)axis, n);
+                scale.data_ptr<float>(), (float)alpha, (int)axis, n, hidden, hidden_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {carry_new, p_out, scale};
@@ -76,7 +80,11 @@ std::vector<torch::Tensor> tria_step_gate_backward_cuda(
                 "tria_step_gate_backward_cuda: r, i, o, scale, grad_p_out must have the same numel");
     TORCH_CHECK(carry_prev.numel() == r.numel() * 9 && grad_carry_new.numel() == r.numel() * 9,
                 "tria_step_gate_backward_cuda: carry tensors must have 9 values per r/i/o element");
-    TORCH_CHECK(w.numel() == 9, "tria_step_gate_backward_cuda: w must have exactly 9 elements");
+    TORCH_CHECK(r.dim() == 3, "tria_step_gate_backward_cuda: r must be [B,T,H]");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "tria_step_gate_backward_cuda: w must be [Q,9]");
+    const int64_t hidden = r.size(2), heads = w.size(0);
+    TORCH_CHECK(hidden % heads == 0, "tria_step_gate_backward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = hidden / heads;
     c10::cuda::CUDAGuard device_guard(grad_carry_new.device());
 
     auto go_c = grad_carry_new.contiguous();
@@ -93,9 +101,12 @@ std::vector<torch::Tensor> tria_step_gate_backward_cuda(
     auto grad_o = torch::empty_like(o_c);
     auto grad_carry_prev = torch::empty_like(cp_c);
     const int threads = GATE_MIX_THREADS;
-    const int64_t blocks = (n + threads - 1) / threads;
-    auto grad_w_partial = torch::empty({9, blocks}, r_c.options().dtype(torch::kFloat32));
-    auto grad_w_acc = torch::empty({9}, r_c.options().dtype(torch::kFloat32));
+    const int64_t chunks_per_head = (hidden_per_head + threads - 1) / threads;
+    const int64_t bt = n / hidden;
+    const int64_t partials_per_head = bt * chunks_per_head;
+    const int64_t blocks = bt * heads * chunks_per_head;
+    auto grad_w_partial = torch::empty({heads * 9, partials_per_head}, r_c.options().dtype(torch::kFloat32));
+    auto grad_w_acc = torch::empty({heads * 9}, r_c.options().dtype(torch::kFloat32));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, r_c.scalar_type(),
         "tria_step_gate_backward_cuda", ([&] {
@@ -105,15 +116,16 @@ std::vector<torch::Tensor> tria_step_gate_backward_cuda(
                 cp_c.data_ptr<scalar_t>(), w_c.data_ptr<scalar_t>(), scale_c.data_ptr<float>(),
                 grad_r.data_ptr<scalar_t>(), grad_i.data_ptr<scalar_t>(), grad_o.data_ptr<scalar_t>(),
                 grad_carry_prev.data_ptr<scalar_t>(), grad_w_partial.data_ptr<float>(),
-                (float)alpha, (int)axis, n);
+                (float)alpha, (int)axis, n, hidden, hidden_per_head, heads,
+                chunks_per_head, partials_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int reduce_threads = 256;
     const int reduce_nwarps = (reduce_threads + 31) / 32;
-    gate_mix_grad_w_reduce_kernel<<<9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), blocks);
+    gate_mix_grad_w_reduce_kernel<<<heads * 9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
+        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), partials_per_head);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grad_w = grad_w_acc.to(w_c.scalar_type());
+    auto grad_w = grad_w_acc.view_as(w_c).to(w_c.scalar_type());
     return {grad_r, grad_i, grad_o, grad_carry_prev, grad_w};
 }
 
@@ -132,7 +144,11 @@ std::vector<torch::Tensor> tria_step_gate_reverse_backward_cuda(
                 "tria_step_gate_reverse_backward_cuda: r, i, o, grad_p_out must have the same numel");
     TORCH_CHECK(current.numel() == r.numel() * 9 && grad_carry_new.numel() == r.numel() * 9,
                 "tria_step_gate_reverse_backward_cuda: carry tensors must have 9 values per r/i/o element");
-    TORCH_CHECK(w.numel() == 9, "tria_step_gate_reverse_backward_cuda: w must have exactly 9 elements");
+    TORCH_CHECK(r.dim() == 3, "tria_step_gate_reverse_backward_cuda: r must be [B,T,H]");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "tria_step_gate_reverse_backward_cuda: w must be [Q,9]");
+    const int64_t hidden = r.size(2), heads = w.size(0);
+    TORCH_CHECK(hidden % heads == 0, "tria_step_gate_reverse_backward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = hidden / heads;
     c10::cuda::CUDAGuard device_guard(grad_carry_new.device());
 
     auto go_c = grad_carry_new.contiguous();
@@ -149,9 +165,12 @@ std::vector<torch::Tensor> tria_step_gate_reverse_backward_cuda(
     auto grad_previous = torch::empty_like(cur_c);
     auto previous = torch::empty_like(cur_c);
     const int threads = GATE_MIX_THREADS;
-    const int64_t blocks = (n + threads - 1) / threads;
-    auto grad_w_partial = torch::empty({9, blocks}, r_c.options().dtype(torch::kFloat32));
-    auto grad_w_acc = torch::empty({9}, r_c.options().dtype(torch::kFloat32));
+    const int64_t chunks_per_head = (hidden_per_head + threads - 1) / threads;
+    const int64_t bt = n / hidden;
+    const int64_t partials_per_head = bt * chunks_per_head;
+    const int64_t blocks = bt * heads * chunks_per_head;
+    auto grad_w_partial = torch::empty({heads * 9, partials_per_head}, r_c.options().dtype(torch::kFloat32));
+    auto grad_w_acc = torch::empty({heads * 9}, r_c.options().dtype(torch::kFloat32));
 
     AT_DISPATCH_FLOATING_TYPES(r_c.scalar_type(),
         "tria_step_gate_reverse_backward_cuda", ([&] {
@@ -162,14 +181,15 @@ std::vector<torch::Tensor> tria_step_gate_reverse_backward_cuda(
                 grad_r.data_ptr<scalar_t>(), grad_i.data_ptr<scalar_t>(), grad_o.data_ptr<scalar_t>(),
                 grad_previous.data_ptr<scalar_t>(), previous.data_ptr<scalar_t>(),
                 grad_w_partial.data_ptr<float>(),
-                (float)alpha, (int)axis, n);
+                (float)alpha, (int)axis, n, hidden, hidden_per_head, heads,
+                chunks_per_head, partials_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int reduce_threads = 256;
     const int reduce_nwarps = (reduce_threads + 31) / 32;
-    gate_mix_grad_w_reduce_kernel<<<9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), blocks);
+    gate_mix_grad_w_reduce_kernel<<<heads * 9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
+        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), partials_per_head);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grad_w = grad_w_acc.to(w_c.scalar_type());
+    auto grad_w = grad_w_acc.view_as(w_c).to(w_c.scalar_type());
     return {grad_r, grad_i, grad_o, grad_previous, grad_w, previous};
 }

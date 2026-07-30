@@ -79,6 +79,9 @@ powlu_m: 3.0
 phase_grad_floor: 0.05
 phase_grad_mode: secant
 attn_impl: sdpa
+attn_layers: null
+attn_token_stride: 1
+attn_token_schedule: shared
 attn_sdpa_compute_dtype: auto
 attn_sdpa_value_fusion: true
 attn_sdpa_recompute_backward: false

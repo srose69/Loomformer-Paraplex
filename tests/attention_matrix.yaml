@@ -1,0 +1,23 @@
+layer_modes:
+  all: null
+  alternating: [1, 3]
+  first_two: [1, 2]
+
+token_modes:
+  dense:
+    attn_token_stride: 1
+    attn_token_schedule: shared
+  stride2_shared:
+    attn_token_stride: 2
+    attn_token_schedule: shared
+  stride2_staggered:
+    attn_token_stride: 2
+    attn_token_schedule: staggered
+  stride3_shared:
+    attn_token_stride: 3
+    attn_token_schedule: shared
+  stride3_staggered:
+    attn_token_stride: 3
+    attn_token_schedule: staggered
+
+checkpointing: [false, true]

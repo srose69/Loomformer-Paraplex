@@ -78,6 +78,57 @@ class DDPPolicyTests(unittest.TestCase):
         self.assertEqual(model.blocks[0].ffn.beta_anchor.item(), 3.0)
         self.assertEqual(model.blocks[1].ffn.beta_anchor.item(), 4.0)
 
+    def test_config_consensus_reports_differing_fields(self):
+        cfg = lf.Config(attn_layers=[1, 3], attn_token_stride=2)
+
+        def disagree(values, local):
+            values[0] = local
+            other = lf.Config(attn_layers=[1], attn_token_stride=1)
+            values[1] = __import__("json").dumps(
+                __import__("dataclasses").asdict(other),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        with (
+            mock.patch.object(lf.dist, "is_available", return_value=True),
+            mock.patch.object(lf.dist, "is_initialized", return_value=True),
+            mock.patch.object(lf.dist, "get_world_size", return_value=2),
+            mock.patch.object(lf.dist, "all_gather_object", side_effect=disagree),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "attn_layers.*attn_token_stride"
+            ):
+                lf.ddp_assert_config_consensus(cfg)
+
+    def test_resume_rejects_attention_architecture_change(self):
+        cfg = lf.Config(
+            layers=4,
+            attn_layers=[1, 3],
+            attn_token_stride=2,
+            attn_token_schedule="staggered",
+        )
+        with self.assertRaisesRegex(ValueError, "init_checkpoint"):
+            lf.assert_resume_attention_config(
+                cfg,
+                {
+                    "layers": 4,
+                    "attn_layers": [1, 2, 3, 4],
+                    "attn_token_stride": 1,
+                    "attn_token_schedule": "shared",
+                },
+            )
+
+        lf.assert_resume_attention_config(
+            lf.Config(
+                layers=4,
+                attn_layers=[1, 2, 3, 4],
+                attn_token_stride=1,
+                attn_token_schedule="staggered",
+            ),
+            {"layers": 4},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

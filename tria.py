@@ -837,6 +837,21 @@ def _cuda_slot_op_applicable(carry: torch.Tensor, small: torch.Tensor) -> bool:
     return True
 
 
+def _gate_slot_mix_reference(carry: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    slots = tria_slots(carry)
+    if w.ndim == 1:
+        return (slots * w).sum(dim=-1)
+    if w.ndim != 2 or w.shape[1] != 9:
+        raise ValueError(f"gate weights must be [9] or [Q,9], got {tuple(w.shape)}")
+    hidden = slots.shape[-2]
+    heads = w.shape[0]
+    if hidden % heads:
+        raise ValueError(f"hidden width {hidden} must be divisible by selector heads {heads}")
+    grouped = slots.unflatten(-2, (heads, hidden // heads))
+    mixed = (grouped * w.view(*((1,) * (grouped.ndim - 3)), heads, 1, 9)).sum(dim=-1)
+    return mixed.flatten(-2)
+
+
 # ============================================================================
 # public API: dispatch to CUDA when applicable, PyTorch otherwise. This is the
 # only surface loomformer.py should import from.
@@ -920,7 +935,7 @@ def tria_init_seed_and_gate(
             except RuntimeError as error:
                 _warn_cuda_fallback("tria_init_seed_gate", error)
     carry = tria_init_seed_reference(r, i, o, seed, valid, axis, alpha)
-    return _capture_depth_output(carry), (tria_slots(carry) * w).sum(dim=-1)
+    return _capture_depth_output(carry), _gate_slot_mix_reference(carry, w)
 
 
 @torch._dynamo.disable
@@ -975,9 +990,9 @@ def tria_init_and_gate(
             p_out = _GateSlotMixFused.apply(carry_1, w)
         except RuntimeError as error:
             _warn_cuda_fallback("gate_slot_mix", error)
-            p_out = (tria_slots(carry_1) * w).sum(dim=-1)
+            p_out = _gate_slot_mix_reference(carry_1, w)
     else:
-        p_out = (tria_slots(carry_1) * w).sum(dim=-1)
+        p_out = _gate_slot_mix_reference(carry_1, w)
     return _capture_depth_output(carry_1), p_out
 
 
@@ -1010,9 +1025,9 @@ def tria_step_and_gate(
             p_out = _GateSlotMixFused.apply(carry_new, w)
         except RuntimeError as error:
             _warn_cuda_fallback("gate_slot_mix", error)
-            p_out = (tria_slots(carry_new) * w).sum(dim=-1)
+            p_out = _gate_slot_mix_reference(carry_new, w)
     else:
-        p_out = (tria_slots(carry_new) * w).sum(dim=-1)
+        p_out = _gate_slot_mix_reference(carry_new, w)
     return _capture_depth_output(carry_new), p_out
 
 
@@ -1295,23 +1310,14 @@ def tria_slots(carry: torch.Tensor) -> torch.Tensor:
 
 class GateSelector(nn.Module):
 
-    def __init__(self) -> None:
+    def __init__(self, n_heads: int) -> None:
         super().__init__()
-        self.logits = nn.Parameter(torch.zeros(9))
+        if n_heads <= 0:
+            raise ValueError("n_heads must be positive")
+        self.logits = nn.Parameter(torch.zeros(n_heads, 9))
 
     def forward(self, carry: torch.Tensor) -> torch.Tensor:
-        w = torch.softmax(self.logits, dim=0)           # [9], same weights for
-                                                          # every (B,T,H) -- the
-                                                          # layer's fixed taste,
-                                                          # not input-dependent
-        # Fused CUDA path: one thread per (b,t,h), 9 FMAs, no [B,T,H,9]
-        # intermediate. torch.einsum lowers ANY contraction to aten::bmm --
-        # for this shape (contraction dim 9, batch B*T*H in the millions)
-        # cuBLAS picks the degenerate tall-skinny gemv2T/gemv2N kernels
-        # instead of a bandwidth-bound reduction, which is what turned this
-        # single-layer op into ~161ms/24 calls (see prof_tria_cuda.txt) --
-        # more expensive than either fused Tria kernel. Never route this
-        # through torch.einsum/torch.matmul again for that reason.
+        w = torch.softmax(self.logits, dim=-1)
         if _tria_cuda_op_enabled("gate_slot_mix") and _cuda_slot_op_applicable(carry, w):
             if _GRAPH_MODE_ENABLED and _graph_gate_slot_mix_op is not None:
                 return _graph_gate_slot_mix_op(carry, w)
@@ -1319,8 +1325,7 @@ class GateSelector(nn.Module):
                 return _GateSlotMixFused.apply(carry, w)
             except RuntimeError as error:
                 _warn_cuda_fallback("gate_slot_mix", error)
-        slots = tria_slots(carry)                       # [B,T,H,9] view
-        return (slots * w).sum(dim=-1)                   # [B,T,H]
+        return _gate_slot_mix_reference(carry, w)
 
 
 class IdentityAnchoredGate(nn.Module):
@@ -1774,18 +1779,18 @@ if __name__ == "__main__":
     print("OK: backward through build_tria + 3-layer carry chain gives finite gradients.")
 
     print("\n=== 5. GateSelector: fixed logits, correct shape, softmax sums to 1 ===")
-    gate = GateSelector()
-    carry_a = tria_init(torch.randn(2, 3, 5), torch.randn(2, 3, 5), torch.randn(2, 3, 5))
-    carry_b = tria_init(torch.randn(2, 3, 5) * 10, torch.randn(2, 3, 5) * 10, torch.randn(2, 3, 5) * 10)
+    gate = GateSelector(2)
+    carry_a = tria_init(torch.randn(2, 3, 6), torch.randn(2, 3, 6), torch.randn(2, 3, 6))
+    carry_b = tria_init(torch.randn(2, 3, 6) * 10, torch.randn(2, 3, 6) * 10, torch.randn(2, 3, 6) * 10)
     p_a = gate(carry_a)
     p_b = gate(carry_b)
-    assert p_a.shape == (2, 3, 5)
-    w = torch.softmax(gate.logits, dim=0)
-    assert torch.allclose(w.sum(), torch.tensor(1.0), atol=1e-6)
+    assert p_a.shape == (2, 3, 6)
+    w = torch.softmax(gate.logits, dim=-1)
+    assert torch.allclose(w.sum(dim=-1), torch.ones(2), atol=1e-6)
     # same GateSelector instance -> IDENTICAL weights regardless of which carry
-    # is fed in (fixed, input-independent logits -- the whole point of §4).
-    w_direct = torch.softmax(gate.logits.detach(), dim=0)
-    expected_a = (tria_slots(carry_a) * w_direct).sum(dim=-1)
+    # is fed in (fixed, input-independent logits).
+    w_direct = torch.softmax(gate.logits.detach(), dim=-1)
+    expected_a = _gate_slot_mix_reference(carry_a, w_direct)
     assert torch.allclose(p_a, expected_a, atol=1e-6)
     print("OK: p has shape [B,T,H], softmax weights sum to 1, weights are the "
           "same fixed distribution regardless of which carry is fed in.")

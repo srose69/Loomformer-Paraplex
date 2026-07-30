@@ -19,6 +19,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -95,6 +96,49 @@ def _auto_omp_threads(nproc: int) -> int:
     return max(1, min(8, total // nproc))
 
 
+def _linux_process_children(pid: int) -> List[int]:
+    """Return direct child PIDs for self-launched torchrun diagnostics/control."""
+    try:
+        raw = open(
+            f"/proc/{int(pid)}/task/{int(pid)}/children",
+            encoding="ascii",
+        ).read()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+    return [int(value) for value in raw.split() if value.isdigit()]
+
+
+def _torchrun_rank_workers(root_pid: int) -> List[int]:
+    """Find only LoomFormer rank processes, excluding Inductor subprocesses."""
+    pending = [int(root_pid)]
+    seen = {int(root_pid)}
+    workers: List[int] = []
+    while pending:
+        parent = pending.pop()
+        for pid in _linux_process_children(parent):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            pending.append(pid)
+            try:
+                environ = open(
+                    f"/proc/{pid}/environ", "rb"
+                ).read().split(b"\0")
+                cmdline = open(
+                    f"/proc/{pid}/cmdline", "rb"
+                ).read().split(b"\0")
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            has_rank = any(item.startswith(b"LOCAL_RANK=") for item in environ)
+            is_loomformer = any(
+                item.endswith(b"/loomformer.py") or item == b"loomformer.py"
+                for item in cmdline
+            )
+            if has_rank and is_loomformer:
+                workers.append(pid)
+    return sorted(workers)
+
+
 def ddp_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
@@ -163,6 +207,15 @@ def ddp_sum_int(value: int, device: torch.device) -> int:
     return int(t.item())
 
 
+def ddp_weighted_mean(total: float, count: int, device: torch.device) -> Tuple[float, int]:
+    values = torch.tensor(
+        [float(total), float(count)], dtype=torch.float64, device=device)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    global_count = int(values[1].item())
+    return float(values[0].item()) / max(1, global_count), global_count
+
+
 def ddp_unwrap_model(model: nn.Module) -> nn.Module:
     raw = model
     seen: set[int] = set()
@@ -206,6 +259,24 @@ def ddp_sync_mutable_buffers(model: nn.Module) -> None:
         dist.broadcast(packed, src=0)
         for anchor, value in zip(anchors, packed.unbind()):
             anchor.copy_(value)
+
+
+def ddp_assert_config_consensus(cfg: "Config") -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    local = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"))
+    gathered: List[Optional[str]] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    if any(value != gathered[0] for value in gathered[1:]):
+        decoded = [json.loads(value) for value in gathered]
+        keys = sorted({
+            key
+            for item in decoded
+            for key in item
+            if any(other.get(key) != item.get(key) for other in decoded)
+        })
+        raise RuntimeError(
+            "DDP ranks resolved different configs: " + ", ".join(keys))
 
 
 def ddp_static_graph_policy(cfg: "Config") -> Tuple[bool, str]:
@@ -263,7 +334,77 @@ def maybe_launch_or_init_ddp(device_pref: Optional[str], training: bool) -> Tupl
         print(f"[ddp] launching ({launch_note}):", " ".join(cmd), flush=True)
         if "OMP_NUM_THREADS" in env and not os.environ.get("OMP_NUM_THREADS"):
             print(f"[ddp] auto OMP_NUM_THREADS={env['OMP_NUM_THREADS']}", flush=True)
-        raise SystemExit(subprocess.call(cmd, env=env))
+        decision_path = os.path.join(
+            tempfile.gettempdir(),
+            f"loomformer-ddp-interrupt.{os.getpid()}",
+        )
+        env["LOOM_SELF_LAUNCHED_DDP"] = "1"
+        env["LOOM_DDP_INTERRUPT_DECISION_FILE"] = decision_path
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(decision_path)
+        child = subprocess.Popen(
+            cmd,
+            env=env,
+            start_new_session=True,
+        )
+        interrupted = False
+        try:
+            while True:
+                try:
+                    returncode = child.wait()
+                    break
+                except KeyboardInterrupt:
+                    if interrupted:
+                        print(
+                            "\n[interrupt] second Ctrl-C; terminating DDP job.",
+                            flush=True,
+                        )
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(child.pid, signal.SIGTERM)
+                        returncode = child.wait()
+                        break
+                    interrupted = True
+                    try:
+                        print(
+                            "\n[interrupt] save a checkpoint after the active "
+                            "optimizer step before exiting? [y/N] ",
+                            end="",
+                            flush=True,
+                        )
+                        answer = input().strip().lower()
+                    except EOFError:
+                        answer = "n"
+                    save = answer in ("y", "yes")
+                    with open(decision_path, "w", encoding="ascii") as handle:
+                        handle.write("1\n" if save else "0\n")
+                    workers: List[int] = []
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and not workers:
+                        workers = _torchrun_rank_workers(child.pid)
+                        if not workers:
+                            time.sleep(0.05)
+                    if workers:
+                        print(
+                            f"[interrupt] graceful stop requested on "
+                            f"{len(workers)} DDP rank(s); waiting for the "
+                            "active step to finish...",
+                            flush=True,
+                        )
+                        for pid in workers:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(pid, signal.SIGINT)
+                    else:
+                        print(
+                            "[interrupt] rank workers were not discoverable; "
+                            "stopping torchrun directly.",
+                            flush=True,
+                        )
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(child.pid, signal.SIGINT)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(decision_path)
+        raise SystemExit(130 if interrupted else returncode)
 
     world_size = ddp_world_size()
     rank = ddp_rank()
@@ -417,6 +558,9 @@ class Config:
     # fallback everywhere else.  "flash" is strict (fail instead of silently
     # falling back), while sdpa/manual are explicit diagnostic overrides.
     attn_impl: str = "auto"
+    attn_layers: Optional[List[int]] = None
+    attn_token_stride: int = 1
+    attn_token_schedule: str = "shared"
     # SDPA-only compute dtype: "model" keeps q/k/v dtype, "fp32"/"fp16"/"bf16"
     # force attention compute dtype, "auto" keeps BF16 only when the efficient
     # backend accepts it and otherwise promotes SDPA inputs to FP32.
@@ -536,10 +680,12 @@ class Config:
     def summary(self) -> str:
         hd = self.head_dim if self.head_dim is not None else "auto"
         grp = self.gqa_group_size if self.gqa_group_size is not None else "auto"
+        active = self.layers if self.attn_layers is None else len(self.attn_layers)
         return (
             f"LoomFormer [V={self.vocab} d_model={self.model_dim} qh={self.n_q_heads} "
             f"head_dim={hd} kvh={self.n_kv_heads} group={grp} "
-            f"H={self.hidden} D={self.layers} T={self.seq_len} B={self.batch_size}]"
+            f"H={self.hidden} D={self.layers} attn={active}/{self.layers}"
+            f"x{self.attn_token_stride} T={self.seq_len} B={self.batch_size}]"
         )
 
     @staticmethod
@@ -842,6 +988,38 @@ def restore_temporal_tria_from_checkpoint(cfg: Config, path: Optional[str]) -> b
     return True
 
 
+def assert_resume_attention_config(cfg: Config, saved_cfg: Dict[str, Any]) -> None:
+    saved_layers = saved_cfg.get("attn_layers")
+    if saved_layers is None:
+        saved_layers = list(range(1, int(saved_cfg.get("layers", cfg.layers)) + 1))
+    saved = {
+        "attn_layers": [int(layer) for layer in saved_layers],
+        "attn_token_stride": int(saved_cfg.get("attn_token_stride", 1)),
+        "attn_token_schedule": str(
+            saved_cfg.get("attn_token_schedule", "shared") or "shared").lower(),
+    }
+    active = {
+        "attn_layers": list(cfg.attn_layers),
+        "attn_token_stride": int(cfg.attn_token_stride),
+        "attn_token_schedule": str(cfg.attn_token_schedule),
+    }
+    changed = [
+        key for key in active
+        if active[key] != saved[key]
+        and not (
+            key == "attn_token_schedule"
+            and active["attn_token_stride"] == saved["attn_token_stride"] == 1
+        )
+    ]
+    if changed:
+        details = ", ".join(
+            f"{key}: checkpoint={saved[key]!r} config={active[key]!r}"
+            for key in changed)
+        raise ValueError(
+            "resume cannot change the attention architecture; use "
+            f"init_checkpoint for an intentional conversion ({details})")
+
+
 def should_replay_resume_data(
     cfg: Config, dataset: str, saved_cfg: Dict[str, Any],
 ) -> Tuple[bool, str]:
@@ -1024,6 +1202,7 @@ _graph_depth_attn_op = None
 _graph_beta_space_op = None
 AMP_DTYPE = "fp32"
 ATTN_IMPL = "auto"
+ATTN_LAYERS: Tuple[int, ...] = ()
 ATTN_SDPA_COMPUTE_DTYPE = "auto"
 ATTN_SDPA_VALUE_FUSION = True
 ATTN_SDPA_RECOMPUTE_BACKWARD = True
@@ -1114,7 +1293,7 @@ def init_embedding_fanin(m: nn.Embedding, gain: float = FANIN_GAIN) -> None:
 
 def apply_config(cfg: Config) -> None:
     global N, N_Q_HEADS, N_KV_HEADS, HIDDEN, LAYERS, VOCAB, SEQ_LEN
-    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED, FUSED_LINEAR_CE, FUSED_LINEAR_CE_CHUNK_SIZE
+    global HEAD_DIM, GQA_GROUP_SIZE, KV_DIM, HIDDEN_PER_Q_HEAD, IMAG_IN, PHASE_SECTORS, ATTN_IMPL, ATTN_LAYERS, ATTN_SDPA_COMPUTE_DTYPE, ATTN_SDPA_VALUE_FUSION, ATTN_SDPA_RECOMPUTE_BACKWARD, RESIDUAL_INIT, DEPTH_ATTN_READOUT, DEPTH_ATTN_QKV_RMS, RESIDUAL_BRANCH_RMS_CAP, ACTIVATION, POWLU_M, PHASE_GRAD_FLOOR, PHASE_GRAD_MODE, USE_CUDA_PHASE_SIN, USE_CUDA_BETA_SPACE, USE_CUDA_PVPOWLU, USE_CUDA_DEPTH_ATTN, AMP_DTYPE, GRAD_CHECKPOINTING, TRIA_CARRY_ENABLED, TRIA_GAMMA_MAX, TRIA_RAW_GAMMA_INIT, TRIA_TEMPORAL_ENABLED, TIED_EMBEDDINGS, PARAPLEX_GATE_PROJ, FINAL_NORM_ENABLED, FUSED_LINEAR_CE, FUSED_LINEAR_CE_CHUNK_SIZE
     global ROPE_THETA, ROPE_FACTOR, ROPE_ORIGINAL_SEQ_LEN, ROPE_BETA_FAST, ROPE_BETA_SLOW, ROPE_ATTENTION_FACTOR
 
     N_Q_HEADS = int(cfg.n_q_heads)
@@ -1138,6 +1317,24 @@ def apply_config(cfg: Config) -> None:
 
     if N_Q_HEADS <= 0 or LAYERS <= 0 or VOCAB <= 0 or SEQ_LEN <= 0:
         raise ValueError("model/data dimensions must be positive")
+    raw_attn_layers = getattr(cfg, "attn_layers", None)
+    if raw_attn_layers is None:
+        cfg.attn_layers = list(range(1, LAYERS + 1))
+    else:
+        layers = [int(layer) for layer in raw_attn_layers]
+        if not layers or len(set(layers)) != len(layers):
+            raise ValueError("attn_layers must be a non-empty list without duplicates")
+        if layers != sorted(layers) or layers[0] != 1 or layers[-1] > LAYERS:
+            raise ValueError(f"attn_layers must be sorted, include 1, and stay within 1..{LAYERS}")
+        cfg.attn_layers = layers
+    ATTN_LAYERS = tuple(cfg.attn_layers)
+    cfg.attn_token_stride = int(getattr(cfg, "attn_token_stride", 1))
+    if cfg.attn_token_stride <= 0:
+        raise ValueError("attn_token_stride must be positive")
+    cfg.attn_token_schedule = str(
+        getattr(cfg, "attn_token_schedule", "shared") or "shared").lower()
+    if cfg.attn_token_schedule not in ("shared", "staggered"):
+        raise ValueError("attn_token_schedule must be 'shared' or 'staggered'")
     if int(cfg.prefetch_batches) <= 0 or int(cfg.gpu_prefetch_batches) <= 0:
         raise ValueError("prefetch_batches and gpu_prefetch_batches must be positive")
 
@@ -3398,7 +3595,13 @@ class LayerCache:
     k: Optional[torch.Tensor] = None            # [B,SEQ_LEN,N_KV_HEADS,HEAD_DIM] -- preallocated
     v: Optional[torch.Tensor] = None            # [B,SEQ_LEN,N_KV_HEADS,HEAD_DIM] -- preallocated
     phase_trace: Optional[torch.Tensor] = None  # [B,HIDDEN]
-    cache_len: int = 0                          # сколько позиций реально заполнено
+    cache_pos: int = 0
+    cache_capacity: int = 0
+    attn_context: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+    @property
+    def cache_len(self) -> int:
+        return self.cache_pos
 
 
 @dataclass
@@ -3488,6 +3691,9 @@ class TrainChunkLayerState:
     k_chunks: tuple = ()                       # tuple[[B,Q,N_KV_HEADS,HEAD_DIM], ...]
     v_chunks: tuple = ()                       # tuple[[B,Q,N_KV_HEADS,HEAD_DIM], ...]
     phase_trace: Optional[torch.Tensor] = None  # [B,HIDDEN] -- ParaplexFFN continuity across chunks
+    document_chunks: tuple = ()
+    position_chunks: tuple = ()
+    attn_context: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 class ParaplexFFN(nn.Module):
@@ -3515,7 +3721,7 @@ class ParaplexFFN(nn.Module):
         # -- when tria is off, p_in is always None and identity_gate would just
         # return wx+bias, so the module is pure overhead (10 params × LAYERS).
         if TRIA_CARRY_ENABLED:
-            self.gate_selector = tria.GateSelector()
+            self.gate_selector = tria.GateSelector(N_Q_HEADS)
             self.identity_gate = tria.IdentityAnchoredGate()
         else:
             self.gate_selector = None
@@ -4725,6 +4931,9 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         nn.init.normal_(self.qkv_weight[N + KV_DIM:], mean=0.0, std=residual_std(N))
         init_linear_residual(self.o)
 
+    def _cache_capacity(self) -> int:
+        return SEQ_LEN
+
     @staticmethod
     def _split_q_heads(x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -4755,7 +4964,9 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         return torch.split(qkv, (N, KV_DIM, KV_DIM), dim=-1)
 
     def forward(self, z: torch.Tensor, attn_mask: Optional[Any] = None,
-                position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                position_ids: Optional[torch.Tensor] = None,
+                inherited_context=None, selected_layout=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del inherited_context, selected_layout
         B, T, D = z.shape
         if T > SEQ_LEN:
             raise ValueError(f"sequence length {T} exceeds configured seq_len {SEQ_LEN}")
@@ -4890,7 +5101,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
             raise ValueError("CPU KV streaming requires a CUDA compute device")
         B = q.shape[0]
         if k_cache is None:
-            shape = (B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+            shape = (B, self._cache_capacity(), N_KV_HEADS, HEAD_DIM)
             k_cache = torch.zeros(shape, dtype=k_new.dtype, device="cpu", pin_memory=True)
             v_cache = torch.zeros(shape, dtype=v_new.dtype, device="cpu", pin_memory=True)
         elif not k_cache.is_pinned() or not v_cache.is_pinned():
@@ -4997,7 +5208,7 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         k_new_remote = k_new.to(storage, non_blocking=True)
         v_new_remote = v_new.to(storage, non_blocking=True)
         if k_cache is None:
-            shape = (B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+            shape = (B, self._cache_capacity(), N_KV_HEADS, HEAD_DIM)
             k_cache = torch.zeros(shape, dtype=k_new.dtype, device=storage)
             v_cache = torch.zeros(shape, dtype=v_new.dtype, device=storage)
         k_cache[:, cache_len] = k_new_remote[:, 0]
@@ -5022,9 +5233,13 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         v_cache: Optional[torch.Tensor],
         cache_len: int,
         kv_runtime: Optional[InferenceKVRuntime] = None,
+        inherited_context=None,
+        held_context=None,
     ):
-        if cache_len >= SEQ_LEN:
-            raise ValueError(f"generation exceeded seq_len={SEQ_LEN}; no wraparound support")
+        del inherited_context, held_context
+        capacity = self._cache_capacity()
+        if cache_len >= capacity:
+            raise ValueError(f"attention cache exceeded capacity={capacity}")
         B = z.shape[0]
         q_p, k_p, v_p = self._qkv(z)
         q = self._split_q_heads(q_p)
@@ -5042,8 +5257,8 @@ class GroupedQueryCausalSelfAttention(nn.Module):
                 q, k_new, v_new, k_cache, v_cache, cache_len, storage)
         else:
             if k_cache is None:
-                k_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
-                v_cache = z.new_zeros(B, SEQ_LEN, N_KV_HEADS, HEAD_DIM)
+                k_cache = z.new_zeros(B, capacity, N_KV_HEADS, HEAD_DIM)
+                v_cache = z.new_zeros(B, capacity, N_KV_HEADS, HEAD_DIM)
             k_cache[:, cache_len] = k_new[:, 0]
             v_cache[:, cache_len] = v_new[:, 0]
             new_len = cache_len + 1
@@ -5062,7 +5277,11 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         k_ctx = kctx_g.transpose(1, 2).contiguous()
         # Возвращаем ПОЛНЫЙ буфер (не срез) -- вызывающий код хранит его в LayerCache и
         # переиспользует на следующем шаге; срез k_all был только для этого forward.
-        return self.o(self._merge_q_heads(c)), q, k_ctx, c, k_cache, v_cache
+        context = (q, k_ctx, c)
+        return (
+            self.o(self._merge_q_heads(c)), q, k_ctx, c,
+            k_cache, v_cache, cache_len + 1, context,
+        )
 
     def forward_chunk(
         self,
@@ -5072,7 +5291,12 @@ class GroupedQueryCausalSelfAttention(nn.Module):
         position_ids: torch.Tensor,
         attention_layout: Optional[PackedAttentionLayout],
         packed_chunk: PackedChunkLayout,
+        inherited_context=None,
+        held_context=None,
+        past_document_chunks=(),
+        past_position_chunks=(),
     ):
+        del inherited_context, held_context, past_document_chunks, past_position_chunks
         B, T, _ = z.shape
         q_p, k_p, v_p = self._qkv(z)
         q = self._split_q_heads(q_p)
@@ -5125,6 +5349,520 @@ class GroupedQueryCausalSelfAttention(nn.Module):
                 attention_layout, packed_chunk.start, packed_chunk.end, z.device)
             k_ctx, c = _chunk_attention_list(q.contiguous(), k_chunks, v_chunks, chunk_mask)
         return self.o(self._merge_q_heads(c)), q, k_ctx, c, k_new, v_new
+
+
+@dataclass(frozen=True)
+class SelectedTokenLayout:
+    mask: torch.Tensor
+    indices: torch.Tensor
+    positions: torch.Tensor
+    segments: torch.Tensor
+    documents: torch.Tensor
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+    row_cu_seqlens: torch.Tensor
+
+
+def _selected_token_layout(
+    position_ids: torch.Tensor,
+    packed: Optional[PackedAttentionLayout],
+    stride: int,
+    offset: int,
+) -> SelectedTokenLayout:
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    B, T = position_ids.shape
+    mask = position_ids.remainder(stride).eq(offset)
+    indices = mask.reshape(-1).nonzero().flatten()
+    positions = position_ids.reshape(-1).index_select(0, indices)
+    if packed is None:
+        segments_full = torch.zeros(B, T, dtype=torch.int32, device=position_ids.device)
+        max_document = T
+    else:
+        segments_full = packed.segment_ids
+        max_document = packed.max_seqlen
+    row_grid = torch.arange(
+        B, device=position_ids.device, dtype=torch.int64).unsqueeze(1)
+    full_documents = (
+        row_grid.bitwise_left_shift(32)
+        | segments_full.to(torch.int64).bitwise_and(0xFFFFFFFF)
+    )
+    _, full_counts = torch.unique_consecutive(
+        full_documents.reshape(-1), return_counts=True)
+    doc_cu = _cu_seqlens_from_counts(full_counts)
+    segments = segments_full.reshape(-1).index_select(0, indices)
+    documents = full_documents.reshape(-1).index_select(0, indices)
+    prefix = torch.zeros(B * T + 1, dtype=torch.int32, device=position_ids.device)
+    torch.cumsum(mask.reshape(-1).to(torch.int32), dim=0, out=prefix[1:])
+    doc_counts = prefix.index_select(0, doc_cu[1:].to(torch.int64))
+    doc_counts -= prefix.index_select(0, doc_cu[:-1].to(torch.int64))
+    doc_counts = doc_counts[doc_counts.ne(0)]
+    cu_seqlens = _cu_seqlens_from_counts(doc_counts)
+    row_ends = torch.arange(
+        T, (B + 1) * T, T, dtype=torch.int64, device=position_ids.device)
+    row_counts = prefix.index_select(0, row_ends).clone()
+    row_starts = torch.cat((prefix.new_zeros(1), row_counts[:-1]))
+    row_counts -= row_starts
+    max_selected = max(1, (max_document + stride - 1 - offset) // stride)
+    return SelectedTokenLayout(
+        mask=mask,
+        indices=indices,
+        positions=positions,
+        segments=segments,
+        documents=documents,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_selected,
+        row_cu_seqlens=_cu_seqlens_from_counts(row_counts),
+    )
+
+
+def _selected_sdpa_contexts(
+    q: torch.Tensor,
+    k_compact: torch.Tensor,
+    v_compact: torch.Tensor,
+    selected: SelectedTokenLayout,
+    batch: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    total = q.shape[0]
+    row_cu = selected.row_cu_seqlens
+    row_counts = row_cu[1:] - row_cu[:-1]
+    width = int(row_counts.max().item())
+    rows = torch.repeat_interleave(
+        torch.arange(batch, device=q.device, dtype=torch.int64),
+        row_counts.to(torch.int64),
+    )
+    ranks = torch.arange(total, device=q.device) - row_cu[:-1].to(torch.int64).index_select(0, rows)
+    destinations = rows * width + ranks
+
+    def pad(x: torch.Tensor) -> torch.Tensor:
+        shape = (batch * width, x.shape[-2], x.shape[-1])
+        return x.new_zeros(shape).index_copy(0, destinations, x).view(
+            batch, width, x.shape[-2], x.shape[-1])
+
+    q_pad = pad(q)
+    k_pad = pad(k_compact)
+    v_pad = pad(v_compact)
+    pos_pad = selected.positions.new_full((batch * width,), -1).index_copy(
+        0, destinations, selected.positions).view(batch, width)
+    seg_pad = selected.segments.new_full((batch * width,), -1).index_copy(
+        0, destinations, selected.segments).view(batch, width)
+    valid = pos_pad.ge(0)
+    allowed = (
+        valid[:, :, None]
+        & valid[:, None, :]
+        & seg_pad[:, :, None].eq(seg_pad[:, None, :])
+        & pos_pad[:, None, :].le(pos_pad[:, :, None])
+    ).unsqueeze(1)
+    qg = q_pad.transpose(1, 2)
+    kg = GroupedQueryCausalSelfAttention._kv_to_q_heads(k_pad).transpose(1, 2)
+    vg = GroupedQueryCausalSelfAttention._kv_to_q_heads(v_pad).transpose(1, 2)
+    kctx_g, c_g = _attention_contexts_sdpa(
+        qg, kg, vg, attn_mask=allowed, is_causal=False,
+        cat_label="loom.attn.cat_kv_value_sparse")
+    k_ctx = kctx_g.transpose(1, 2).reshape(
+        batch * width, N_Q_HEADS, HEAD_DIM).index_select(0, destinations)
+    c = c_g.transpose(1, 2).reshape(
+        batch * width, N_Q_HEADS, HEAD_DIM).index_select(0, destinations)
+    return k_ctx, c
+
+
+def _selected_chunk_sdpa_contexts(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_positions: torch.Tensor,
+    k_positions: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_counts = cu_q[1:] - cu_q[:-1]
+    k_counts = cu_k[1:] - cu_k[:-1]
+    documents = q_counts.numel()
+    q_width = int(q_counts.max().item())
+    k_width = int(k_counts.max().item())
+
+    def destinations(counts: torch.Tensor, width: int) -> torch.Tensor:
+        rows = torch.repeat_interleave(
+            torch.arange(documents, device=q.device, dtype=torch.int64),
+            counts.to(torch.int64),
+        )
+        cu = _cu_seqlens_from_counts(counts)
+        ranks = torch.arange(rows.numel(), device=q.device) - cu[:-1].to(
+            torch.int64).index_select(0, rows)
+        return rows * width + ranks
+
+    q_dst = destinations(q_counts, q_width)
+    k_dst = destinations(k_counts, k_width)
+
+    def pad(x: torch.Tensor, width: int, dst: torch.Tensor) -> torch.Tensor:
+        out = x.new_zeros(documents * width, x.shape[-2], x.shape[-1])
+        return out.index_copy(0, dst, x).view(
+            documents, width, x.shape[-2], x.shape[-1])
+
+    q_pad = pad(q, q_width, q_dst)
+    k_pad = pad(k, k_width, k_dst)
+    v_pad = pad(v, k_width, k_dst)
+    qp = q_positions.new_full((documents * q_width,), -1).index_copy(
+        0, q_dst, q_positions).view(documents, q_width)
+    kp = k_positions.new_full((documents * k_width,), -1).index_copy(
+        0, k_dst, k_positions).view(documents, k_width)
+    allowed = (
+        qp.ge(0)[:, :, None]
+        & kp.ge(0)[:, None, :]
+        & kp[:, None, :].le(qp[:, :, None])
+    ).unsqueeze(1)
+    qg = q_pad.transpose(1, 2)
+    kg = GroupedQueryCausalSelfAttention._kv_to_q_heads(k_pad).transpose(1, 2)
+    vg = GroupedQueryCausalSelfAttention._kv_to_q_heads(v_pad).transpose(1, 2)
+    kctx_g, c_g = _attention_contexts_sdpa(
+        qg, kg, vg, attn_mask=allowed, is_causal=False,
+        cat_label="loom.attn.cat_kv_value_sparse_chunk")
+    k_ctx = kctx_g.transpose(1, 2).reshape(
+        documents * q_width, N_Q_HEADS, HEAD_DIM).index_select(0, q_dst)
+    c = c_g.transpose(1, 2).reshape(
+        documents * q_width, N_Q_HEADS, HEAD_DIM).index_select(0, q_dst)
+    return k_ctx, c
+
+
+class StridedGroupedQueryCausalSelfAttention(GroupedQueryCausalSelfAttention):
+    def __init__(self, stride: int, offset: int) -> None:
+        self.token_stride = int(stride)
+        self.token_offset = int(offset)
+        super().__init__()
+
+    def _cache_capacity(self) -> int:
+        remaining = SEQ_LEN - self.token_offset
+        return max(1, (remaining + self.token_stride - 1) // self.token_stride)
+
+    def _chunk_layout(
+        self,
+        position_ids: torch.Tensor,
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
+    ) -> SelectedTokenLayout:
+        local_packed = None
+        if attention_layout is not None:
+            local_packed = PackedAttentionLayout(
+                segment_ids=attention_layout.segment_ids[:, packed_chunk.start:packed_chunk.end],
+                position_ids=position_ids.to(torch.int32),
+                cu_seqlens=position_ids.new_empty(0, dtype=torch.int32),
+                max_seqlen=attention_layout.max_seqlen,
+            )
+        return _selected_token_layout(
+            position_ids, local_packed, self.token_stride, self.token_offset)
+
+    def _selected_contexts(
+        self,
+        z: torch.Tensor,
+        position_ids: torch.Tensor,
+        packed: Optional[PackedAttentionLayout],
+        selected: Optional[SelectedTokenLayout] = None,
+    ):
+        B, T, _ = z.shape
+        if selected is None:
+            selected = _selected_token_layout(
+                position_ids, packed, self.token_stride, self.token_offset)
+        z_selected = z.reshape(B * T, N).index_select(0, selected.indices)
+        q_p, k_p, v_p = self._qkv(z_selected)
+        if selected.indices.numel() == 0:
+            q = q_p.view(-1, N_Q_HEADS, HEAD_DIM)
+            dependency = (k_p.sum() + v_p.sum()) * 0
+            return selected, q, q + dependency, q + dependency
+        q = q_p.view(-1, N_Q_HEADS, HEAD_DIM)
+        k = k_p.view(-1, N_KV_HEADS, HEAD_DIM)
+        v = v_p.view(-1, N_KV_HEADS, HEAD_DIM)
+        q, k = self.rope(
+            q.unsqueeze(0), k.unsqueeze(0), selected.positions.unsqueeze(0))
+        q, k = q.squeeze(0), k.squeeze(0)
+        backend = _varlen_backend(q)
+        if ATTN_IMPL == "flash" and backend is None:
+            raise RuntimeError(
+                "attn_impl='flash' requires a validated varlen forward+backward backend")
+        if backend is not None:
+            fused_value = (
+                torch.cat((k, v), dim=-1)
+                if _varlen_value_fusion_enabled(backend, q)
+                else None
+            )
+            k_ctx, c = _varlen_attention_contexts(
+                backend, q, k, v,
+                selected.cu_seqlens, selected.cu_seqlens,
+                selected.max_seqlen, selected.max_seqlen,
+                fused_value=fused_value)
+        else:
+            k_ctx, c = _selected_sdpa_contexts(q, k, v, selected, B)
+        return selected, q, k_ctx, c
+
+    def forward(
+        self, z: torch.Tensor, attn_mask=None, position_ids=None,
+        inherited_context=None, selected_layout=None,
+    ):
+        B, T, _ = z.shape
+        if position_ids is None:
+            position_ids = torch.arange(T, device=z.device).view(1, T).expand(B, T)
+        packed = attn_mask if isinstance(attn_mask, PackedAttentionLayout) else None
+        selected, q_selected, k_selected, c_selected = self._selected_contexts(
+            z, position_ids, packed, selected=selected_layout)
+        flat_size = B * T
+
+        def scatter(x: torch.Tensor) -> torch.Tensor:
+            shape = (flat_size, x.shape[-2], x.shape[-1])
+            return x.new_zeros(shape).index_copy(0, selected.indices, x).view(
+                B, T, x.shape[-2], x.shape[-1])
+
+        q_own, k_own, c_own = map(scatter, (q_selected, k_selected, c_selected))
+        if inherited_context is None:
+            columns = torch.arange(T, device=z.device).view(1, T)
+            source_columns = columns - position_ids.remainder(self.token_stride)
+            source = (
+                torch.arange(B, device=z.device).view(B, 1) * T + source_columns
+            ).reshape(-1)
+            q_full = q_own.reshape(flat_size, N_Q_HEADS, HEAD_DIM).index_select(
+                0, source).view_as(q_own)
+            k_full = k_own.reshape(flat_size, N_Q_HEADS, HEAD_DIM).index_select(
+                0, source).view_as(k_own)
+            c_full = c_own.reshape(flat_size, N_Q_HEADS, HEAD_DIM).index_select(
+                0, source).view_as(c_own)
+        else:
+            choose = selected.mask.unsqueeze(-1).unsqueeze(-1)
+            q_full = torch.where(choose, q_own, inherited_context[0])
+            k_full = torch.where(choose, k_own, inherited_context[1])
+            c_full = torch.where(choose, c_own, inherited_context[2])
+        residual_selected = self.o(c_selected.reshape(-1, N))
+        residual = residual_selected.new_zeros(flat_size, N).index_copy(
+            0, selected.indices, residual_selected).view(B, T, N)
+        return residual, q_full, k_full, c_full
+
+    def step(
+        self,
+        z: torch.Tensor,
+        position_id: int,
+        k_cache,
+        v_cache,
+        cache_len: int,
+        kv_runtime=None,
+        inherited_context=None,
+        held_context=None,
+    ):
+        selected = int(position_id) % self.token_stride == self.token_offset
+        if selected:
+            return super().step(
+                z, position_id, k_cache, v_cache, cache_len,
+                kv_runtime=kv_runtime,
+            )
+        context = inherited_context if inherited_context is not None else held_context
+        if context is None:
+            raise RuntimeError("sample-and-hold has no prior attention context")
+        q, k_ctx, c = context
+        return (
+            torch.zeros_like(z), q, k_ctx, c,
+            k_cache, v_cache, cache_len, context,
+        )
+
+    def forward_chunk(
+        self,
+        z: torch.Tensor,
+        past_k_chunks: tuple,
+        past_v_chunks: tuple,
+        position_ids: torch.Tensor,
+        attention_layout: Optional[PackedAttentionLayout],
+        packed_chunk: PackedChunkLayout,
+        inherited_context=None,
+        held_context=None,
+        past_document_chunks=(),
+        past_position_chunks=(),
+    ):
+        B, T, _ = z.shape
+        selected = self._chunk_layout(
+            position_ids, attention_layout, packed_chunk)
+        z_selected = z.reshape(B * T, N).index_select(0, selected.indices)
+        if selected.indices.numel() == 0:
+            q_p, k_p, v_p = self._qkv(z_selected)
+            projection_dependency = (q_p.sum() + k_p.sum() + v_p.sum()) * 0
+            output_dependency = self.o(z_selected).sum() * 0
+            context = inherited_context
+            if context is None:
+                if held_context is None:
+                    raise RuntimeError("sample-and-hold has no prior attention context")
+                context = tuple(x[:, None].expand(-1, T, -1, -1) for x in held_context)
+            k_empty = k_p.view(1, 0, N_KV_HEADS, HEAD_DIM)
+            v_empty = v_p.view(1, 0, N_KV_HEADS, HEAD_DIM)
+            residual = torch.zeros_like(z) + projection_dependency + output_dependency
+            return residual, *context, k_empty, v_empty
+
+        q_p, k_p, v_p = self._qkv(z_selected)
+        q = q_p.view(-1, N_Q_HEADS, HEAD_DIM)
+        k_new = k_p.view(-1, N_KV_HEADS, HEAD_DIM)
+        v_new = v_p.view(-1, N_KV_HEADS, HEAD_DIM)
+        q, k_new = self.rope(
+            q.unsqueeze(0), k_new.unsqueeze(0), selected.positions.unsqueeze(0))
+        q = q.squeeze(0).contiguous()
+        k_new = k_new.squeeze(0).contiguous()
+        v_new = v_new.contiguous()
+        k_chunks = (*past_k_chunks, k_new.unsqueeze(0))
+        v_chunks = (*past_v_chunks, v_new.unsqueeze(0))
+        document_chunks = (*past_document_chunks, selected.documents)
+        position_chunks = (*past_position_chunks, selected.positions)
+        q_documents, q_counts = torch.unique_consecutive(
+            selected.documents, return_counts=True)
+
+        selectors = []
+        destinations = []
+        source_positions = []
+        k_document_indices = []
+        for documents, positions in zip(document_chunks, position_chunks):
+            keep = torch.isin(documents, q_documents)
+            selector = keep.nonzero().flatten()
+            selectors.append(selector.to(torch.int32))
+            if selector.numel() == 0:
+                continue
+            docs = documents.index_select(0, selector)
+            doc_indices = torch.searchsorted(q_documents, docs)
+            kept_positions = positions.index_select(0, selector)
+            k_document_indices.append(doc_indices)
+            source_positions.append(kept_positions)
+
+        all_k_docs = torch.cat(k_document_indices)
+        k_counts = torch.bincount(
+            all_k_docs, minlength=q_documents.numel()).to(torch.int32)
+        cu_k = _cu_seqlens_from_counts(k_counts)
+        for doc_indices, positions in zip(k_document_indices, source_positions):
+            ranks = (positions - self.token_offset).div(
+                self.token_stride, rounding_mode="floor")
+            destinations.append(
+                (cu_k[:-1].to(torch.int64).index_select(0, doc_indices) + ranks).to(
+                    torch.int32))
+        piece_sizes = tuple(selector.numel() for selector in selectors)
+        piece_offsets = torch.zeros(
+            len(piece_sizes) + 1, dtype=torch.int32, device=z.device)
+        if piece_sizes:
+            torch.cumsum(
+                torch.tensor(piece_sizes, dtype=torch.int32, device=z.device),
+                dim=0, out=piece_offsets[1:])
+        history_plan = PackedChunkLayout(
+            start=packed_chunk.start,
+            end=packed_chunk.end,
+            selectors=torch.cat(selectors),
+            destinations=torch.cat(destinations),
+            piece_sizes=piece_sizes,
+            piece_offsets=piece_offsets,
+            cu_seqlens_q=_cu_seqlens_from_counts(q_counts),
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=selected.max_seqlen,
+            max_seqlen_k=selected.max_seqlen,
+        )
+        backend = _varlen_backend(q)
+        if ATTN_IMPL == "flash" and backend is None:
+            raise RuntimeError(
+                "attn_impl='flash' requires a validated varlen forward+backward backend")
+        if backend is not None:
+            fused_value = None
+            if _varlen_value_fusion_enabled(backend, q):
+                fused_value = _pack_selected_chunk_kv(
+                    k_chunks, v_chunks, history_plan)
+                k_packed = fused_value[..., :HEAD_DIM]
+                v_packed = k_packed
+            else:
+                k_packed = _pack_selected_chunk_history(k_chunks, history_plan)
+                v_packed = _pack_selected_chunk_history(v_chunks, history_plan)
+            k_ctx, c = _varlen_attention_contexts(
+                backend, q, k_packed, v_packed,
+                history_plan.cu_seqlens_q, history_plan.cu_seqlens_k,
+                history_plan.max_seqlen_q, history_plan.max_seqlen_k,
+                fused_value=fused_value)
+        else:
+            k_packed = _pack_selected_chunk_history(k_chunks, history_plan)
+            v_packed = _pack_selected_chunk_history(v_chunks, history_plan)
+            k_positions = selected.positions.new_empty(k_packed.shape[0]).index_copy(
+                0, history_plan.destinations.to(torch.int64),
+                torch.cat(source_positions))
+            k_ctx, c = _selected_chunk_sdpa_contexts(
+                q, k_packed, v_packed, selected.positions, k_positions,
+                history_plan.cu_seqlens_q, history_plan.cu_seqlens_k)
+
+        flat_size = B * T
+
+        def scatter(x: torch.Tensor) -> torch.Tensor:
+            return x.new_zeros(
+                flat_size, x.shape[-2], x.shape[-1]).index_copy(
+                0, selected.indices, x).view(B, T, x.shape[-2], x.shape[-1])
+
+        q_own, k_own, c_own = map(scatter, (q, k_ctx, c))
+        if inherited_context is None:
+            columns = torch.arange(T, device=z.device).view(1, T)
+            source_columns = columns - position_ids.remainder(self.token_stride)
+            local = source_columns.ge(0)
+            source = (
+                torch.arange(B, device=z.device).view(B, 1) * T
+                + source_columns.clamp_min(0)
+            ).reshape(-1)
+            held = tuple(
+                x.reshape(flat_size, N_Q_HEADS, HEAD_DIM).index_select(
+                    0, source).view(B, T, N_Q_HEADS, HEAD_DIM)
+                for x in (q_own, k_own, c_own)
+            )
+            if held_context is not None:
+                previous = tuple(
+                    x[:, None].expand(-1, T, -1, -1) for x in held_context)
+                held = tuple(
+                    torch.where(local.unsqueeze(-1).unsqueeze(-1), own, prior)
+                    for own, prior in zip(held, previous)
+                )
+            q_full, k_full, c_full = held
+        else:
+            choose = selected.mask.unsqueeze(-1).unsqueeze(-1)
+            q_full = torch.where(choose, q_own, inherited_context[0])
+            k_full = torch.where(choose, k_own, inherited_context[1])
+            c_full = torch.where(choose, c_own, inherited_context[2])
+        residual_selected = self.o(c.reshape(-1, N))
+        residual = residual_selected.new_zeros(flat_size, N).index_copy(
+            0, selected.indices, residual_selected).view(B, T, N)
+        return (
+            residual, q_full, k_full, c_full,
+            k_new.unsqueeze(0), v_new.unsqueeze(0),
+        )
+
+
+class InheritedContextMixer(nn.Module):
+    def _outputs(self, z: torch.Tensor, inherited_context):
+        if inherited_context is None:
+            raise RuntimeError("an inherited-context layer requires an earlier attention layer")
+        q, k_ctx, c = inherited_context
+        return torch.zeros_like(z), q, k_ctx, c
+
+    def forward(
+        self, z: torch.Tensor, attn_mask=None, position_ids=None,
+        inherited_context=None, selected_layout=None,
+    ):
+        del attn_mask, position_ids, selected_layout
+        return self._outputs(z, inherited_context)
+
+    def forward_chunk(
+        self, z: torch.Tensor, past_k_chunks: tuple, past_v_chunks: tuple,
+        position_ids: torch.Tensor, attention_layout, packed_chunk,
+        inherited_context=None,
+        held_context=None,
+        past_document_chunks=(),
+        past_position_chunks=(),
+    ):
+        del (
+            past_k_chunks, past_v_chunks, position_ids, attention_layout,
+            packed_chunk, held_context, past_document_chunks, past_position_chunks,
+        )
+        attn_out, q, k_ctx, c = self._outputs(z, inherited_context)
+        empty_shape = (z.shape[0], 0, N_KV_HEADS, HEAD_DIM)
+        empty = z.new_empty(empty_shape)
+        return attn_out, q, k_ctx, c, empty, empty
+
+    def step(
+        self, z: torch.Tensor, position_id: int,
+        k_cache, v_cache, cache_len: int, kv_runtime=None, inherited_context=None,
+        held_context=None,
+    ):
+        del position_id, kv_runtime, held_context
+        attn_out, q, k_ctx, c = self._outputs(z, inherited_context)
+        context = (q, k_ctx, c)
+        return attn_out, q, k_ctx, c, k_cache, v_cache, cache_len, context
 
 
 
@@ -5376,10 +6114,22 @@ def _fused_linear_cross_entropy_eager(
 
 
 class Block(nn.Module):
-    def __init__(self, ablation: bool = False) -> None:
+    def __init__(
+        self,
+        active_ordinal: Optional[int],
+        token_stride: int,
+        token_schedule: str,
+        ablation: bool = False,
+    ) -> None:
         super().__init__()
         self.ln_attn = nn.LayerNorm(N)
-        self.attn = GroupedQueryCausalSelfAttention()
+        if active_ordinal is None:
+            self.attn = InheritedContextMixer()
+        elif token_stride == 1:
+            self.attn = GroupedQueryCausalSelfAttention()
+        else:
+            offset = active_ordinal % token_stride if token_schedule == "staggered" else 0
+            self.attn = StridedGroupedQueryCausalSelfAttention(token_stride, offset)
         self.ln_ffn = nn.LayerNorm(N)
         self.ffn = ParaplexFFN(ablation=ablation)
 
@@ -5393,7 +6143,18 @@ class Model(nn.Module):
         self.cfg = cfg
         self.ablation = bool(ablation)
         self.emb = nn.Embedding(VOCAB, N)
-        self.blocks = nn.ModuleList([Block(ablation=ablation) for _ in range(LAYERS)])
+        active_ordinals = {
+            layer: ordinal for ordinal, layer in enumerate(cfg.attn_layers)
+        }
+        self.blocks = nn.ModuleList([
+            Block(
+                active_ordinals.get(layer + 1),
+                cfg.attn_token_stride,
+                cfg.attn_token_schedule,
+                ablation=ablation,
+            )
+            for layer in range(LAYERS)
+        ])
         self.depth_attn = DepthAttn()
         self.head = nn.Linear(N, VOCAB, bias=False)
         if TIED_EMBEDDINGS:
@@ -5524,7 +6285,7 @@ class Model(nn.Module):
                         alpha=tria_alpha)
                     p_out = None
                 else:
-                    w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
+                    w = torch.softmax(block.ffn.gate_selector.logits, dim=-1)
                     carry_new, p_out = tria.tria_init_seed_and_gate(
                         r, i, o, accT_seed, seed_valid, w, axis=tria_axis,
                         alpha=tria_alpha)
@@ -5537,7 +6298,7 @@ class Model(nn.Module):
                 )
                 p_out = None
             else:
-                w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
+                w = torch.softmax(block.ffn.gate_selector.logits, dim=-1)
                 carry_new, p_out = (
                     tria.tria_init_and_gate(
                         r, i, o, w, axis=tria_axis, alpha=tria_alpha)
@@ -5575,15 +6336,19 @@ class Model(nn.Module):
         position_ids: torch.Tensor,
         carry_prev: Optional[torch.Tensor],
         p_in: Optional[torch.Tensor],
+        inherited_context,
+        selected_layout=None,
         is_last_block: bool = False,
     ):
         attn_out, q_h, k_ctx_h, c_h = block.attn(
-            h, attn_mask=attn_mask, position_ids=position_ids)
+            h, attn_mask=attn_mask, position_ids=position_ids,
+            inherited_context=inherited_context, selected_layout=selected_layout)
+        next_context = (q_h, k_ctx_h, c_h)
         h, hist_k, hist_v, _, carry_new, p_out = self._block_core(
             block, h, hist_k, hist_v, sub_idx0,
             attn_out, q_h, k_ctx_h, c_h, position_ids,
             None, carry_prev, p_in, None, None, False, is_last_block)
-        return h, hist_k, hist_v, carry_new, p_out
+        return h, hist_k, hist_v, carry_new, p_out, next_context
 
     def _run_block_chunk(
         self,
@@ -5597,22 +6362,33 @@ class Model(nn.Module):
         packed_chunk: PackedChunkLayout,
         past_k_chunks: tuple,
         past_v_chunks: tuple,
+        past_document_chunks: tuple,
+        past_position_chunks: tuple,
+        held_context,
         phase_trace: Optional[torch.Tensor],
         carry_prev: Optional[torch.Tensor],
         p_in: Optional[torch.Tensor],
         accT_seed: Optional[torch.Tensor],
         seed_valid: Optional[torch.Tensor],
+        inherited_context,
         is_first_block: bool,
         is_last_block: bool,
     ):
         attn_out, q_h, k_ctx_h, c_h, k_new, v_new = block.attn.forward_chunk(
-            h, past_k_chunks, past_v_chunks, position_ids, attention_layout, packed_chunk)
+            h, past_k_chunks, past_v_chunks, position_ids, attention_layout, packed_chunk,
+            inherited_context=inherited_context, held_context=held_context,
+            past_document_chunks=past_document_chunks,
+            past_position_chunks=past_position_chunks)
+        next_context = (q_h, k_ctx_h, c_h)
         h, hist_k, hist_v, next_phase_trace, carry_new, p_out = self._block_core(
             block, h, hist_k, hist_v, sub_idx0,
             attn_out, q_h, k_ctx_h, c_h, position_ids,
             phase_trace, carry_prev, p_in, accT_seed, seed_valid,
             is_first_block, is_last_block)
-        return h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry_new, p_out
+        return (
+            h, hist_k, hist_v, k_new, v_new, next_phase_trace,
+            carry_new, p_out, next_context,
+        )
 
     def _run_chunk_stack_impl(self, h_emb_chunk: torch.Tensor, position_ids_chunk: torch.Tensor,
                               attention_layout: Optional[PackedAttentionLayout],
@@ -5631,19 +6407,25 @@ class Model(nn.Module):
         k_new_out = []
         v_new_out = []
         phase_out = []
+        context_out = []
+        inherited_context = None
         with tria.depth_replay_scope(
             seed=accT_seed, seed_valid=seed_valid, tape=replay_tape
         ):
             for bi, block in enumerate(self.blocks):
                 ls = layer_states[bi]
-                h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry, p = self._run_block_chunk(
+                h, hist_k, hist_v, k_new, v_new, next_phase_trace, carry, p, inherited_context = self._run_block_chunk(
                     block, h, hist_k, hist_v, 2 * bi, position_ids_chunk,
                     attention_layout, packed_chunk,
-                    ls.k_chunks, ls.v_chunks, ls.phase_trace, carry, p,
-                    accT_seed, seed_valid, bi == 0, bi == n_blocks - 1)
+                    ls.k_chunks, ls.v_chunks,
+                    ls.document_chunks, ls.position_chunks, ls.attn_context,
+                    ls.phase_trace, carry, p,
+                    accT_seed, seed_valid, inherited_context,
+                    bi == 0, bi == n_blocks - 1)
                 k_new_out.append(k_new)
                 v_new_out.append(v_new)
                 phase_out.append(next_phase_trace)
+                context_out.append(tuple(x[:, -1] for x in inherited_context))
             endpoint = (
                 tria.temporal_carry_endpoint(
                     carry, endpoint_reset,
@@ -5652,7 +6434,12 @@ class Model(nn.Module):
                 if want_endpoint else None
             )
             tail = carry[:, -1].detach().contiguous() if want_tail else None
-        return (h, endpoint, tail, *k_new_out, *v_new_out, *phase_out)
+        return (
+            h, endpoint, tail, *k_new_out, *v_new_out, *phase_out,
+            *(x[0] for x in context_out),
+            *(x[1] for x in context_out),
+            *(x[2] for x in context_out),
+        )
 
     @torch._dynamo.disable
     def _run_chunk_stack_checkpointed(
@@ -5759,11 +6546,34 @@ class Model(nn.Module):
         k_new = flat[3:3 + n_blocks]
         v_new = flat[3 + n_blocks:3 + 2 * n_blocks]
         phase = flat[3 + 2 * n_blocks:3 + 3 * n_blocks]
+        q_tail = flat[3 + 3 * n_blocks:3 + 4 * n_blocks]
+        k_tail = flat[3 + 4 * n_blocks:3 + 5 * n_blocks]
+        c_tail = flat[3 + 5 * n_blocks:3 + 6 * n_blocks]
+        sparse_layouts = [
+            (
+                block.attn._chunk_layout(
+                    position_ids_chunk, attention_layout, packed_chunk)
+                if isinstance(block.attn, StridedGroupedQueryCausalSelfAttention)
+                else None
+            )
+            for block in self.blocks
+        ]
         new_layer_states = [
             TrainChunkLayerState(
                 k_chunks=layer_states[i].k_chunks + (k_new[i],),
                 v_chunks=layer_states[i].v_chunks + (v_new[i],),
                 phase_trace=phase[i],
+                document_chunks=(
+                    layer_states[i].document_chunks + (sparse_layouts[i].documents,)
+                    if sparse_layouts[i] is not None
+                    else layer_states[i].document_chunks
+                ),
+                position_chunks=(
+                    layer_states[i].position_chunks + (sparse_layouts[i].positions,)
+                    if sparse_layouts[i] is not None
+                    else layer_states[i].position_chunks
+                ),
+                attn_context=(q_tail[i], k_tail[i], c_tail[i]),
             )
             for i in range(n_blocks)
         ]
@@ -6000,11 +6810,23 @@ class Model(nn.Module):
         hist_k = [k0]
         hist_v = [v0]
         n_blocks = len(self.blocks)
+        inherited_context = None
+        selected_layouts = {}
+        packed = attn_mask if isinstance(attn_mask, PackedAttentionLayout) else None
         with tria.depth_replay_scope():
             for bi, block in enumerate(self.blocks):
-                h, hist_k, hist_v, carry, p = self._run_block(
+                selected_layout = None
+                if isinstance(block.attn, StridedGroupedQueryCausalSelfAttention):
+                    key = (block.attn.token_stride, block.attn.token_offset)
+                    selected_layout = selected_layouts.get(key)
+                    if selected_layout is None:
+                        selected_layout = _selected_token_layout(
+                            position_ids, packed, *key)
+                        selected_layouts[key] = selected_layout
+                h, hist_k, hist_v, carry, p, inherited_context = self._run_block(
                     block, h, hist_k, hist_v, 2 * bi,
                     attn_mask, position_ids, carry, p,
+                    inherited_context, selected_layout,
                     is_last_block=bi == n_blocks - 1)
         # `carry` is the final depth-composed Tria for each token/neuron. The
         # temporal path below composes those finished 3x3 matrices over T; it
@@ -6054,7 +6876,10 @@ class Model(nn.Module):
         states,
         kv_runtime: Optional[InferenceKVRuntime] = None,
     ):
-        is_bos = bool(pos_t == 0)
+        abs_pos = int(pos_t)
+        if not 0 <= abs_pos < SEQ_LEN:
+            raise ValueError(f"abs_pos={abs_pos} is outside configured seq_len={SEQ_LEN}")
+        is_bos = abs_pos == 0
         if states is None:
             caches, tria_ca_cache, tria_temporal_state = None, None, None
         else:
@@ -6085,6 +6910,7 @@ class Model(nn.Module):
         p = None      
         n_blocks = len(self.blocks)
         tria_alpha = float(self.cfg.tria_carrier_alpha)
+        inherited_context = None
         # spec §12.1: seed for the (single) current token's Tria L0.
         pending = (
             torch.zeros(idx_t.shape[0], dtype=torch.bool, device=idx_t.device)
@@ -6099,8 +6925,10 @@ class Model(nn.Module):
         )
         for bi, (block, cache) in enumerate(zip(self.blocks, caches)):
             is_last_block = bi == n_blocks - 1
-            attn_out, q_h, k_ctx_h, c_h, k_all, v_all = block.attn.step(
-                h, pos_t, cache.k, cache.v, cache.cache_len, kv_runtime=kv_runtime)
+            attn_out, q_h, k_ctx_h, c_h, k_all, v_all, cache_pos, held_context = block.attn.step(
+                h, abs_pos, cache.k, cache.v, cache.cache_pos, kv_runtime=kv_runtime,
+                inherited_context=inherited_context, held_context=cache.attn_context)
+            inherited_context = (q_h, k_ctx_h, c_h)
             skip, _ = self.depth_attn(sub_idx, hist_k[:, :, :sub_idx + 1], hist_v[:, :, :sub_idx + 1])
             if RESIDUAL_BRANCH_RMS_CAP is not None:
                 skip = capped_rms(skip, RESIDUAL_BRANCH_RMS_CAP)
@@ -6125,7 +6953,7 @@ class Model(nn.Module):
                             alpha=tria_alpha)
                         p = None
                     else:
-                        w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
+                        w = torch.softmax(block.ffn.gate_selector.logits, dim=-1)
                         carry, p = tria.tria_init_seed_and_gate(
                             r, i, o, accT_seed_b, seed_valid, w, axis=bi % 3,
                             alpha=tria_alpha)
@@ -6138,7 +6966,7 @@ class Model(nn.Module):
                     )
                     p = None
                 else:
-                    w = torch.softmax(block.ffn.gate_selector.logits, dim=0)
+                    w = torch.softmax(block.ffn.gate_selector.logits, dim=-1)
                     carry, p = (
                         tria.tria_init_and_gate(
                             r, i, o, w, axis=bi % 3, alpha=tria_alpha)
@@ -6161,7 +6989,9 @@ class Model(nn.Module):
                 hist_v[:, :, sub_idx] = v_i
 
             new_caches.append(LayerCache(k=k_all, v=v_all, phase_trace=next_phase_trace,
-                                           cache_len=cache.cache_len + 1))
+                                           cache_pos=cache_pos,
+                                           cache_capacity=0 if k_all is None else k_all.shape[1],
+                                           attn_context=held_context))
 
         self.last_tria_document_carry_stats = None
         if carry is not None:
@@ -6179,8 +7009,8 @@ class Model(nn.Module):
             carry_token_id = CARRY_TOKEN_ID
             hard_fire_now = (
                 self.tria_hard_fire_enabled
-                and (pos_t + 1 < SEQ_LEN)
-                and ((pos_t + 1) % int(self.cfg.tria_temporal_window) == 0)
+                and (abs_pos + 1 < SEQ_LEN)
+                and ((abs_pos + 1) % int(self.cfg.tria_temporal_window) == 0)
             )
             if carry_token_id is not None:
                 explicit_fire_now = idx_t.view(-1).eq(int(carry_token_id))
@@ -6197,7 +7027,7 @@ class Model(nn.Module):
             document_carry = document_carry_t.unsqueeze(1)
             a_t = self.tria_agg(document_carry)
             h, tria_ca_cache = self.tria_final_ca.step(
-                a_t, h, tria_ca_cache, pos_t, SEQ_LEN, carry_key_mask=fire_now[:, None])
+                a_t, h, tria_ca_cache, abs_pos, SEQ_LEN, carry_key_mask=fire_now[:, None])
             tria_temporal_state = TriaTemporalState(carry=document_carry_t, refeed_pending=fire_now)
         return self._head_in(h[:, -1, :]), (new_caches, tria_ca_cache, tria_temporal_state)
 
@@ -6236,21 +7066,26 @@ async def eval_loss_async(model: nn.Module, stream: TokenStream, cfg: Config, de
     loop = asyncio.get_event_loop()
     n = max(1, cfg.eval_batches)
     raw_batches = await asyncio.gather(*[loop.run_in_executor(None, stream.sample_device_batch) for _ in range(n)])
-    losses = []
+    total_nll = 0.0
+    total_tokens = 0
     with torch.no_grad():
         for b in raw_batches:
             x, y, position_ids, attn_mask = split_train_batch(
                 b, eos_id, cfg
             )
+            ntok = int((y != IGNORE_INDEX).sum().item())
+            if ntok == 0:
+                continue
             ddp_sync_mutable_buffers(model)
             with amp_autocast(device):
                 loss = model(x, attn_mask=attn_mask, position_ids=position_ids, labels=y)
-            losses.append(float(loss.item()))
+            total_nll += float(loss.item()) * ntok
+            total_tokens += ntok
             raw = ddp_unwrap_model(model)
             raw.last_tria_depth_carry = None
             raw.last_tria_document_carry_stats = None
     model.train()
-    return sum(losses) / len(losses)
+    return ddp_weighted_mean(total_nll, total_tokens, device)[0]
 
 
 def lr_at(cfg: Config, step_zero_based: int) -> float:
@@ -6505,12 +7340,18 @@ def format_eval_status(
     bits_tok: float,
     bpb: float,
 ) -> str:
-    return _log_line([
+    parts = [
         _log_color("[EVAL]", 135, bold=True) + " " + _log_color(str(step), 141, bold=True),
         _log_color("loss:", 208) + " " + _log_color(f"{eval_loss:.4f}", 215, bold=True),
         _log_color("bit/tok:", 135) + " " + _log_color(f"{bits_tok:.4f}", 183),
-        _log_color("bpb:", 173) + " " + _log_color(f"{bpb:.4f}", 215),
-    ])
+    ]
+    if math.isfinite(bpb):
+        parts.append(
+            _log_color("bpb:", 173)
+            + " "
+            + _log_color(f"{bpb:.4f}", 215)
+        )
+    return _log_line(parts)
 
 
 
@@ -6524,10 +7365,19 @@ def print_training_budget(
     remaining_steps = max(0, int(cfg.steps) - int(start_step))
     run_tokens = remaining_steps * tokens_per_step
     cumulative_target_tokens = max(0, int(tokens_seen)) + run_tokens
-    run_epochs = run_tokens / max(1, data_tokens)
     label = "budget" if int(start_step) == 0 else "remaining"
-    print(f"  {label:<10}{format_big_int(run_tokens)} tokens over {remaining_steps:,} steps "
-          f"({run_epochs:.3f} epochs of {format_big_int(data_tokens)})")
+    if data_tokens > 0:
+        run_epochs = run_tokens / data_tokens
+        suffix = (
+            f" ({run_epochs:.3f} epochs of "
+            f"{format_big_int(data_tokens)})"
+        )
+    else:
+        suffix = " (streamed SFT; epochs are not defined)"
+    print(
+        f"  {label:<10}{format_big_int(run_tokens)} tokens over "
+        f"{remaining_steps:,} steps{suffix}"
+    )
     if int(start_step) > 0:
         print(f"  schedule step {int(start_step):,} -> {int(cfg.steps):,} "
               f"(target is total steps, not additional steps)")
@@ -6546,8 +7396,15 @@ def print_training_scale(
     scale = f"{tpp:.1f} tok/param"
     if cumulative_target_tokens != run_tokens:
         scale += f" remaining  ·  {cumulative_tpp:.1f} cumulative tok/param"
-    print(f"           paraplex: {format_big_int(params)} params  ·  "
-          f"{scale}  ·  {epoch_tokens_per_param:.1f} data-tok/param")
+    data_scale = (
+        f"  ·  {epoch_tokens_per_param:.1f} data-tok/param"
+        if data_tokens > 0
+        else ""
+    )
+    print(
+        f"           paraplex: {format_big_int(params)} params  ·  "
+        f"{scale}{data_scale}"
+    )
 
 
 def canonicalize_model_state_dict(state: dict) -> dict:
@@ -6568,7 +7425,21 @@ def canonicalize_model_state_dict(state: dict) -> dict:
             state[canonical] = legacy_value
 
     for layer in range(LAYERS):
+        selector_key = f"blocks.{layer}.ffn.gate_selector.logits"
+        selector = state.get(selector_key)
+        if selector is not None:
+            if selector.shape == (9,):
+                state[selector_key] = selector.unsqueeze(0).repeat(N_Q_HEADS, 1)
+            elif selector.shape != (N_Q_HEADS, 9):
+                raise ValueError(
+                    f"invalid selector shape at layer {layer}: {tuple(selector.shape)}")
+
         prefix = f"blocks.{layer}.attn."
+        if layer + 1 not in ATTN_LAYERS:
+            for key in tuple(state):
+                if key.startswith(prefix):
+                    state.pop(key)
+            continue
         packed = prefix + "qkv_weight"
         old_keys = [prefix + "q.weight", prefix + "k.weight", prefix + "v.weight"]
         old_values = [state.get(key) for key in old_keys]
@@ -6670,6 +7541,7 @@ def optimizer_class_from_name(name: str):
 
 def load_optimizer_checkpoint(
     optimizer: torch.optim.Optimizer,
+    model: nn.Module,
     path: str,
     optimizer_name: str,
     device: torch.device,
@@ -6689,6 +7561,25 @@ def load_optimizer_checkpoint(
             f"[resume] WARNING: checkpoint optimizer={saved_name!r}, "
             f"active config optimizer={active_name!r}; optimizer starts fresh.")
         return False
+
+    selector_ids = {
+        id(param) for name, param in model.named_parameters()
+        if name.endswith(".gate_selector.logits")
+    }
+    saved_groups = saved_state.get("param_groups", [])
+    if len(saved_groups) == len(optimizer.param_groups):
+        for active_group, saved_group in zip(optimizer.param_groups, saved_groups):
+            active_params = active_group["params"]
+            saved_params = saved_group.get("params", [])
+            if len(active_params) != len(saved_params):
+                continue
+            for param, saved_id in zip(active_params, saved_params):
+                if id(param) not in selector_ids or tuple(param.shape) != (N_Q_HEADS, 9):
+                    continue
+                entry = saved_state.get("state", {}).get(saved_id, {})
+                for key, value in tuple(entry.items()):
+                    if torch.is_tensor(value) and tuple(value.shape) == (9,):
+                        entry[key] = value.unsqueeze(0).repeat(N_Q_HEADS, 1)
 
     # Tensor history belongs to the checkpoint. LR/WD/lr_mult and other group
     # options belong to the active config and are restored after loading.
@@ -6962,7 +7853,7 @@ async def train_one_async(
         # SFT rows are rendered chat, not raw corpus bytes: a bytes/token ratio
         # (and the bpb it feeds) has no meaning here, and estimating one would
         # re-read the dataset for nothing.
-        train_bpt = eval_bpt = 1.0
+        train_bpt = eval_bpt = float("nan")
     else:
         train_bpt, _, _ = ensure_train_bytes_per_token_meta(dataset, cfg, device)
         if os.path.abspath(eval_dataset) == os.path.abspath(dataset):
@@ -6974,6 +7865,9 @@ async def train_one_async(
     if ddp_is_main():
         print("[data] all ranks ready", flush=True)
     apply_config(cfg)
+    ddp_assert_config_consensus(cfg)
+    if resume_in:
+        assert_resume_attention_config(cfg, resume_blob.get("cfg", {}))
     print_architecture_report(cfg, device, ablation, dataset, val_dataset)
     budget = None
     if ddp_is_main():
@@ -7267,7 +8161,7 @@ async def train_one_async(
             weight_decay=cfg.weight_decay,
         )
     if resume_in:
-        load_optimizer_checkpoint(opt, resume_in, optimizer_name, device)
+        load_optimizer_checkpoint(opt, model, resume_in, optimizer_name, device)
     if bool(getattr(cfg, "save_initial_checkpoint", False)) and ckpt_out and ddp_is_main():
         root, ext = os.path.splitext(ckpt_out)
         init_path = f"{root}.init{ext or '.pt'}"
@@ -7287,7 +8181,9 @@ async def train_one_async(
         ddp_print(f"[train] saved initial {tag} with optimizer state -> {init_path}")
     n_params = count_params(ddp_unwrap_model(model))
 
-    if os.path.abspath(eval_dataset) == os.path.abspath(dataset):
+    if is_sft_dataset(cfg):
+        data_note = "SFT assistant-target loss"
+    elif os.path.abspath(eval_dataset) == os.path.abspath(dataset):
         data_note = f"{train_bpt:.3f} bytes/token"
     else:
         data_note = f"{train_bpt:.3f} train bytes/token  ·  {eval_bpt:.3f} eval bytes/token"
@@ -7417,23 +8313,32 @@ async def train_one_async(
         _save_checkpoint(path_override=runpoint_path, step_override=current_step)
 
     def _handle_interrupt() -> None:
+        completed_step = max(int(start_step), int(step) - 1)
         save_flag = 0
         if ddp_is_main():
-            print(f"\n[interrupt] Ctrl-C at step {step}/{cfg.steps} ({tag}, {time.time() - t0:.0f}s elapsed).",
+            print(f"\n[interrupt] Ctrl-C after completed step "
+                  f"{completed_step}/{cfg.steps} "
+                  f"({tag}, {time.time() - t0:.0f}s elapsed).",
                   file=_REAL_STDOUT, flush=True)
-            runpoint.pause()  # stop the 's'-watcher thread and restore cooked/echo
-                               # terminal mode -- without this, input() below
-                               # competes with that thread for stdin (which
-                               # was in cbreak+no-echo the whole time anyway)
-                               # and silently loses keystrokes.
-            try:
-                print("[interrupt] save a checkpoint at this step before exiting? [y/N] ",
-                      end="", file=_REAL_STDOUT, flush=True)
-                answer = input().strip().lower()
-            except EOFError:
-                answer = "n"
-            finally:
-                runpoint.resume()
+            decision_path = os.environ.get(
+                "LOOM_DDP_INTERRUPT_DECISION_FILE", ""
+            )
+            if decision_path:
+                try:
+                    with open(decision_path, encoding="ascii") as handle:
+                        answer = "y" if handle.read().strip() == "1" else "n"
+                except OSError:
+                    answer = "n"
+            else:
+                runpoint.pause()  # keep the key watcher away from input()
+                try:
+                    print("[interrupt] save a checkpoint at this step before exiting? [y/N] ",
+                          end="", file=_REAL_STDOUT, flush=True)
+                    answer = input().strip().lower()
+                except EOFError:
+                    answer = "n"
+                finally:
+                    runpoint.resume()
             save_flag = 1 if answer in ("y", "yes") else 0
 
         if ddp_is_distributed():
@@ -7442,7 +8347,7 @@ async def train_one_async(
             save_flag = int(flag_t.item())
 
         if save_flag:
-            _save_checkpoint()
+            _save_checkpoint(step_override=completed_step)
             if ddp_is_main():
                 print("[interrupt] saved.", file=_REAL_STDOUT, flush=True)
         elif ddp_is_main():
@@ -7451,7 +8356,12 @@ async def train_one_async(
         if ddp_is_distributed():
             ddp_barrier(device)
             dist.destroy_process_group()
-        raise SystemExit(130)  # 128+SIGINT: conventional shell exit code for Ctrl-C
+        # A self-launching parent returns conventional status 130 after
+        # torchrun observes clean rank exits. Direct/single-process runs own
+        # their shell status themselves.
+        raise SystemExit(
+            0 if os.environ.get("LOOM_SELF_LAUNCHED_DDP") == "1" else 130
+        )
 
     step = start_step
     refeeds_since_log = torch.zeros((), dtype=torch.long, device=device)
@@ -7645,7 +8555,7 @@ async def train_one_async(
                     )
                     final_eval_local = await eval_loss_async(
                         eval_model, eval_stream, cfg, device, eos_id=eval_eos_id)
-                    final_eval = ddp_mean_float(final_eval_local, device)
+                    final_eval = final_eval_local
                     best_eval = min(best_eval, final_eval)
                     bits_tok, bpb = loss_to_bits(final_eval, eval_bpt)
                     elapsed = time.time() - t0
@@ -7677,13 +8587,26 @@ async def train_one_async(
             else model_base
         )
         full = eval_full_model(full_eval_model, cfg, val_dataset, device)
-        full_eval_loss = ddp_mean_float(float(full["loss_nats"]), device)
-        full_eval_bpb = ddp_mean_float(float(full["bpb"]), device)
-        ddp_print(
-            f"[{tag}] full_eval {val_dataset}  "
-            f"eval_loss {full_eval_loss:.4f}  bits/tok {full['bits_tok']:.4f}  "
-            f"bpb {full_eval_bpb:.4f}  tokens {int(full['total_tokens'])}"
+        if is_sft_dataset(cfg):
+            full_eval_loss, full_eval_tokens = ddp_weighted_mean(
+                float(full["total_nll"]), int(full["total_tokens"]), device)
+        else:
+            full_eval_loss = ddp_mean_float(float(full["loss_nats"]), device)
+            full_eval_tokens = int(full["total_tokens"])
+        full_eval_bpb = (
+            full_eval_loss / math.log(2.0) / float(eval_bpt)
+            if math.isfinite(float(full["bpb"]))
+            else float("nan")
         )
+        full_eval_fields = (
+            f"[{tag}] full_eval {val_dataset}  "
+            f"eval_loss {full_eval_loss:.4f}  "
+            f"bits/tok {full_eval_loss / math.log(2.0):.4f}"
+        )
+        if math.isfinite(full_eval_bpb):
+            full_eval_fields += f"  bpb {full_eval_bpb:.4f}"
+        full_eval_fields += f"  tokens {full_eval_tokens}"
+        ddp_print(full_eval_fields)
     return {
         "final_eval_loss": final_eval,
         "best_eval_loss": best_eval,
@@ -7849,7 +8772,7 @@ def _eval_full_sft(model: nn.Module, cfg: Config, dataset: str, device: torch.de
                 while remaining > 0:
                     rows = stream._take_rows(min(B, remaining))
                     remaining -= len(rows)
-                    ids, mask = stream._pack_batch_np(rows)
+                    ids, mask, _ = stream._pack_batch_np(rows)
                     yield torch.from_numpy(ids), torch.from_numpy(mask), None
             batches = cached_batches()
         for ids, mask, packed_layout in batches:

@@ -63,8 +63,8 @@ static std::vector<torch::Tensor> depth_replay_launch(
                     grad_p.scalar_type() == r.scalar_type() && grad_p.sizes() == r.sizes(),
                     "grad_p must match R/I/O");
         TORCH_CHECK(w.is_cuda() && w.device() == r.device() &&
-                    w.scalar_type() == r.scalar_type() && w.numel() == 9,
-                    "w must contain nine activation-dtype values");
+                    w.scalar_type() == r.scalar_type() && w.dim() == 2 && w.size(1) == 9,
+                    "w must be [Q,9]");
     }
     c10::cuda::CUDAGuard guard(r.device());
     auto gc = grad_carry.contiguous();
@@ -77,9 +77,16 @@ static std::vector<torch::Tensor> depth_replay_launch(
     auto gprev = torch::empty_like(gc);
     const int64_t B = rc.size(0), T = rc.size(1), H = rc.size(2), n = rc.numel();
     const int threads = GATE_MIX_THREADS;
-    const int64_t blocks = (n + threads - 1) / threads;
+    const int64_t heads = gated ? wc.size(0) : 1;
+    TORCH_CHECK(!gated || H % heads == 0, "hidden must be divisible by Q");
+    const int64_t hidden_per_head = H / heads;
+    const int64_t chunks_per_head = gated ? (hidden_per_head + threads - 1) / threads : 1;
+    const int64_t partials_per_head = gated ? B * T * chunks_per_head : 0;
+    const int64_t blocks = gated
+        ? B * T * heads * chunks_per_head
+        : (n + threads - 1) / threads;
     auto partial = gated
-        ? torch::empty({9, blocks}, rc.options().dtype(torch::kFloat32))
+        ? torch::empty({heads * 9, partials_per_head}, rc.options().dtype(torch::kFloat32))
         : torch::empty({0}, rc.options().dtype(torch::kFloat32));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16, rc.scalar_type(),
@@ -97,7 +104,8 @@ static std::vector<torch::Tensor> depth_replay_launch(
                     sv.numel() ? sv.data_ptr<bool>() : nullptr,
                     gr.data_ptr<scalar_t>(), gi.data_ptr<scalar_t>(), go.data_ptr<scalar_t>(),
                     gprev.data_ptr<scalar_t>(), partial.data_ptr<float>(), (float)alpha,
-                    (int)axis, (int)layer_index, B, T, H);
+                    (int)axis, (int)layer_index, B, T, H, hidden_per_head,
+                    heads, chunks_per_head, partials_per_head);
             } else {
                 depth_replay_backward_kernel<scalar_t, false><<<
                     blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -108,19 +116,20 @@ static std::vector<torch::Tensor> depth_replay_launch(
                     sv.numel() ? sv.data_ptr<bool>() : nullptr,
                     gr.data_ptr<scalar_t>(), gi.data_ptr<scalar_t>(), go.data_ptr<scalar_t>(),
                     gprev.data_ptr<scalar_t>(), nullptr, (float)alpha,
-                    (int)axis, (int)layer_index, B, T, H);
+                    (int)axis, (int)layer_index, B, T, H, hidden_per_head,
+                    heads, chunks_per_head, partials_per_head);
             }
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (!gated) return {gr, gi, go, gprev};
-    auto gw32 = torch::empty({9}, rc.options().dtype(torch::kFloat32));
+    auto gw32 = torch::empty({heads * 9}, rc.options().dtype(torch::kFloat32));
     const int reduce_threads = 256;
     const int reduce_warps = reduce_threads / 32;
     gate_mix_grad_w_reduce_kernel<<<
-        9, reduce_threads, reduce_warps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        partial.data_ptr<float>(), gw32.data_ptr<float>(), blocks);
+        heads * 9, reduce_threads, reduce_warps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), gw32.data_ptr<float>(), partials_per_head);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {gr, gi, go, gprev, gw32.to(wc.scalar_type())};
+    return {gr, gi, go, gprev, gw32.view_as(wc).to(wc.scalar_type())};
 }
 
 std::vector<torch::Tensor> depth_replay_backward_cuda(

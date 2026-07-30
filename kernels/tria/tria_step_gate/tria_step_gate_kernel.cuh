@@ -7,7 +7,8 @@ __global__ void tria_step_gate_forward_kernel(
     const scalar_t* __restrict__ r, const scalar_t* __restrict__ i_, const scalar_t* __restrict__ o,
     const scalar_t* __restrict__ carry_prev, const scalar_t* __restrict__ w,
     scalar_t* __restrict__ carry_new, scalar_t* __restrict__ p_out,
-    float* __restrict__ scale_out, float alpha, int axis, int64_t n) {
+    float* __restrict__ scale_out, float alpha, int axis, int64_t n,
+    int64_t hidden, int64_t hidden_per_head) {
     const int64_t idx=blockIdx.x*(int64_t)blockDim.x+threadIdx.x;
     if(idx>=n) return;
     float m[9],cp[9],pre[9];
@@ -17,8 +18,9 @@ __global__ void tria_step_gate_forward_kernel(
     tria_matmul9(m,cp,pre);
     const float scale=tria_rms9(pre),inv=1.0f/scale;
     scalar_t* out=carry_new+idx*9; float p=0.0f;
+    const scalar_t* wh=w+((idx%hidden)/hidden_per_head)*9;
     #pragma unroll
-    for(int k=0;k<9;++k){ const float cv=pre[k]*inv; out[k]=(scalar_t)cv; p=fmaf(cv,(float)w[k],p); }
+    for(int k=0;k<9;++k){ const float cv=pre[k]*inv; out[k]=(scalar_t)cv; p=fmaf(cv,(float)wh[k],p); }
     p_out[idx]=(scalar_t)p; scale_out[idx]=scale;
 }
 
@@ -30,10 +32,13 @@ __global__ void tria_step_gate_backward_kernel(
     const float* __restrict__ scale,
     scalar_t* __restrict__ grad_r, scalar_t* __restrict__ grad_i, scalar_t* __restrict__ grad_o,
     scalar_t* __restrict__ grad_carry_prev, float* __restrict__ grad_w_partial,
-    float alpha, int axis, int64_t n) {
-    const int64_t idx=blockIdx.x*(int64_t)blockDim.x+threadIdx.x;
+    float alpha, int axis, int64_t n, int64_t hidden, int64_t hidden_per_head,
+    int64_t heads, int64_t chunks_per_head, int64_t partials_per_head) {
+    int64_t idx,head,partial;
+    const bool valid=gate_mix_head_index(hidden,hidden_per_head,heads,chunks_per_head,n,idx,head,partial);
+    const scalar_t* wh=w+head*9;
     float local_w[9]={0.0f};
-    if(idx<n){
+    if(valid){
         const float rv=(float)r[idx],iv=(float)i_[idx],ov=(float)o[idx];
         float m[9],cp[9],pre[9],gout[9],gpre[9],gm[9],gcp[9];
         tria_carrier_build9(rv,iv,ov,alpha,axis,m);
@@ -42,7 +47,7 @@ __global__ void tria_step_gate_backward_kernel(
         tria_matmul9(m,cp,pre);
         const float gp=(float)grad_p_out[idx],inv=1.0f/scale[idx];
         #pragma unroll
-        for(int k=0;k<9;++k){ gout[k]=(float)grad_carry_new[idx*9+k]+gp*(float)w[k]; local_w[k]=gp*pre[k]*inv; }
+        for(int k=0;k<9;++k){ gout[k]=(float)grad_carry_new[idx*9+k]+gp*(float)wh[k]; local_w[k]=gp*pre[k]*inv; }
         tria_rms_backward9(gout,pre,scale[idx],gpre);
         tria_matmul_right_transpose9(gpre,cp,gm);
         tria_matmul_left_transpose9(m,gpre,gcp);
@@ -54,7 +59,7 @@ __global__ void tria_step_gate_backward_kernel(
         for(int k=0;k<9;++k) grad_carry_prev[idx*9+k]=(scalar_t)gcp[k];
     }
     gate_mix_block_reduce9(local_w);
-    if(threadIdx.x<9) grad_w_partial[(int64_t)threadIdx.x*gridDim.x+blockIdx.x]=local_w[threadIdx.x];
+    if(threadIdx.x<9) grad_w_partial[(head*9+threadIdx.x)*partials_per_head+partial]=local_w[threadIdx.x];
 }
 
 // Gated counterpart of tria_step_reverse_backward_kernel -- see that
@@ -67,10 +72,13 @@ __global__ void tria_step_gate_reverse_backward_kernel(
     scalar_t* __restrict__ grad_r, scalar_t* __restrict__ grad_i, scalar_t* __restrict__ grad_o,
     scalar_t* __restrict__ grad_previous, scalar_t* __restrict__ previous_out,
     float* __restrict__ grad_w_partial,
-    float alpha, int axis, int64_t n) {
-    const int64_t idx=blockIdx.x*(int64_t)blockDim.x+threadIdx.x;
+    float alpha, int axis, int64_t n, int64_t hidden, int64_t hidden_per_head,
+    int64_t heads, int64_t chunks_per_head, int64_t partials_per_head) {
+    int64_t idx,head,partial;
+    const bool valid=gate_mix_head_index(hidden,hidden_per_head,heads,chunks_per_head,n,idx,head,partial);
+    const scalar_t* wh=w+head*9;
     float local_w[9]={0.0f};
-    if(idx<n){
+    if(valid){
         const float rv=(float)r[idx],iv=(float)i_[idx],ov=(float)o[idx];
         float m[9],cur[9],prev[9],pre[9],gout[9],gpre[9],gm[9],gprev[9];
         tria_carrier_build9(rv,iv,ov,alpha,axis,m);
@@ -81,7 +89,7 @@ __global__ void tria_step_gate_reverse_backward_kernel(
         const float scale=tria_rms9(pre),inv=1.0f/scale;
         const float gp=(float)grad_p_out[idx];
         #pragma unroll
-        for(int k=0;k<9;++k){ gout[k]=(float)grad_carry_new[idx*9+k]+gp*(float)w[k]; local_w[k]=gp*pre[k]*inv; }
+        for(int k=0;k<9;++k){ gout[k]=(float)grad_carry_new[idx*9+k]+gp*(float)wh[k]; local_w[k]=gp*pre[k]*inv; }
         tria_rms_backward9(gout,pre,scale,gpre);
         tria_matmul_right_transpose9(gpre,prev,gm);
         tria_matmul_left_transpose9(m,gpre,gprev);
@@ -96,5 +104,5 @@ __global__ void tria_step_gate_reverse_backward_kernel(
         }
     }
     gate_mix_block_reduce9(local_w);
-    if(threadIdx.x<9) grad_w_partial[(int64_t)threadIdx.x*gridDim.x+blockIdx.x]=local_w[threadIdx.x];
+    if(threadIdx.x<9) grad_w_partial[(head*9+threadIdx.x)*partials_per_head+partial]=local_w[threadIdx.x];
 }

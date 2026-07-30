@@ -74,11 +74,18 @@ __global__ void depth_replay_backward_kernel(
     scalar_t* __restrict__ grad_previous,
     float* __restrict__ grad_w_partial,
     float alpha, int axis, int layer_index,
-    int64_t B, int64_t T, int64_t H) {
-    const int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t B, int64_t T, int64_t H, int64_t hidden_per_head,
+    int64_t heads, int64_t chunks_per_head, int64_t partials_per_head) {
     const int64_t n = B * T * H;
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t head = 0, partial = blockIdx.x;
+    bool valid_idx = idx < n;
+    if (GATED)
+        valid_idx = gate_mix_head_index(
+            H, hidden_per_head, heads, chunks_per_head, n, idx, head, partial);
+    const scalar_t* wh = GATED ? w + head * 9 : nullptr;
     float local_w[9] = {0.0f};
-    if (idx < n) {
+    if (valid_idx) {
         float previous[9];
         depth_replay_previous9(
             r_ptrs, i_ptrs, o_ptrs, axes, seed, seed_valid,
@@ -94,7 +101,7 @@ __global__ void depth_replay_backward_kernel(
         for (int k = 0; k < 9; ++k) {
             const scalar_t stored = (scalar_t)(pre[k] * inv);
             gout[k] = (float)grad_carry[idx * 9 + k] +
-                (GATED ? gp * (float)w[k] : 0.0f);
+                (GATED ? gp * (float)wh[k] : 0.0f);
             if (GATED) local_w[k] = gp * (float)stored;
         }
         tria_rms_backward9(gout, pre, scale, gpre);
@@ -112,6 +119,7 @@ __global__ void depth_replay_backward_kernel(
     if (GATED) {
         gate_mix_block_reduce9(local_w);
         if (threadIdx.x < 9)
-            grad_w_partial[(int64_t)threadIdx.x * gridDim.x + blockIdx.x] = local_w[threadIdx.x];
+            grad_w_partial[(head * 9 + threadIdx.x) * partials_per_head + partial] =
+                local_w[threadIdx.x];
     }
 }

@@ -12,10 +12,24 @@
 // with it directly).
 constexpr int GATE_MIX_THREADS = 256;
 
+__device__ __forceinline__ bool gate_mix_head_index(
+    int64_t hidden, int64_t hidden_per_head, int64_t heads,
+    int64_t chunks_per_head, int64_t n,
+    int64_t& idx, int64_t& head, int64_t& partial) {
+    const int64_t chunk = blockIdx.x % chunks_per_head;
+    const int64_t segment = blockIdx.x / chunks_per_head;
+    head = segment % heads;
+    const int64_t bt = segment / heads;
+    const int64_t h_local = chunk * blockDim.x + threadIdx.x;
+    idx = bt * hidden + head * hidden_per_head + h_local;
+    partial = bt * chunks_per_head + chunk;
+    return h_local < hidden_per_head && idx < n;
+}
+
 // ============================================================================
 // SharedTriaReader.attention_pool_slots: one query-attention pool over the H
-// axis per (b,t), operating directly on the 9-dim slots (spec Sec6/Sec7.11's
-// "pool in slot-space" identity: score_j = q.(W x_j + b) = (W^T q).x_j + q.b,
+// axis per (b,t), operating directly on the 9-dim slots ("pool in slot-space"
+// identity: score_j = q.(W x_j + b) = (W^T q).x_j + q.b,
 // the q.b term is a per-(b,t,h)-CONSTANT additive shift into a softmax over h
 // -- softmax is exactly shift-invariant to that, so it contributes zero to
 // both the forward output and every gradient; correctly omitted here, not a
@@ -34,7 +48,7 @@ constexpr int GATE_MIX_THREADS = 256;
 constexpr int SLOT_POOL_THREADS = 256;
 
 // ============================================================================
-// Spec Sec4's per-layer gate mix: p[b,t,h] = Sum_k w[k]*slot_k(carry[b,t,h]).
+// Per-head gate mix: p[b,t,h] = Sum_k w[head(h),k]*slot_k(carry[b,t,h]).
 // One thread per (b,t,h), 9 FMAs in registers -- no [B,T,H,9] intermediate,
 // no matmul/bmm of any kind (this is a fixed-length-9 weighted reduction, not
 // a matrix product; routing it through cuBLAS via torch.einsum is exactly the

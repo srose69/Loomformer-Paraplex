@@ -93,7 +93,7 @@ std::vector<torch::Tensor> tria_init_seed_backward_cuda(
 std::vector<torch::Tensor> tria_init_seed_gate_forward_cuda(
     torch::Tensor r, torch::Tensor i, torch::Tensor o,
     torch::Tensor seed, torch::Tensor valid, torch::Tensor w, double alpha, int64_t axis) {
-    TORCH_CHECK(w.numel() == 9, "tria_init_seed_gate_forward_cuda: w must have 9 elements");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "tria_init_seed_gate_forward_cuda: w must be [Q,9]");
     c10::cuda::CUDAGuard guard(r.device());
     auto r_c = r.contiguous();
     auto i_c = i.contiguous();
@@ -102,6 +102,9 @@ std::vector<torch::Tensor> tria_init_seed_gate_forward_cuda(
     auto valid_c = valid.contiguous();
     auto w_c = w.contiguous();
     const int64_t B = r_c.size(0), T = r_c.size(1), H = r_c.size(2);
+    const int64_t heads = w_c.size(0);
+    TORCH_CHECK(H % heads == 0, "tria_init_seed_gate_forward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = H / heads;
     const int64_t n = r_c.numel();
     auto carry = torch::empty({n, 9}, r_c.options());
     auto p_out = torch::empty_like(r_c);
@@ -114,7 +117,7 @@ std::vector<torch::Tensor> tria_init_seed_gate_forward_cuda(
                 r_c.data_ptr<scalar_t>(), i_c.data_ptr<scalar_t>(), o_c.data_ptr<scalar_t>(),
                 seed_c.data_ptr<scalar_t>(), valid_c.data_ptr<bool>(), w_c.data_ptr<scalar_t>(),
                 carry.data_ptr<scalar_t>(), p_out.data_ptr<scalar_t>(), scale.data_ptr<float>(),
-                (float)alpha, (int)axis, B, T, H);
+                (float)alpha, (int)axis, B, T, H, hidden_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {carry.view({B, T, H, 3, 3}), p_out};
@@ -134,23 +137,30 @@ std::vector<torch::Tensor> tria_init_seed_gate_backward_cuda(
     auto valid_c = valid.contiguous();
     auto w_c = w.contiguous();
     const int64_t B = r_c.size(0), T = r_c.size(1), H = r_c.size(2);
+    TORCH_CHECK(w_c.dim() == 2 && w_c.size(1) == 9, "tria_init_seed_gate_backward_cuda: w must be [Q,9]");
+    const int64_t heads = w_c.size(0);
+    TORCH_CHECK(H % heads == 0, "tria_init_seed_gate_backward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = H / heads;
     const int64_t n = r_c.numel();
     auto grad_r = torch::empty_like(r_c);
     auto grad_i = torch::empty_like(i_c);
     auto grad_o = torch::empty_like(o_c);
     auto grad_seed = torch::zeros_like(seed_c);
     const int threads = GATE_MIX_THREADS;
-    const int64_t blocks = (n + threads - 1) / threads;
-    auto grad_w_partial = torch::empty({9, blocks}, r_c.options().dtype(torch::kFloat32));
-    auto grad_w_acc = torch::empty({9}, r_c.options().dtype(torch::kFloat32));
+    const int64_t chunks_per_head = (hidden_per_head + threads - 1) / threads;
+    const int64_t partials_per_head = B * T * chunks_per_head;
+    const int64_t blocks = B * T * heads * chunks_per_head;
+    const int64_t forward_blocks = (n + threads - 1) / threads;
+    auto grad_w_partial = torch::empty({heads * 9, partials_per_head}, r_c.options().dtype(torch::kFloat32));
+    auto grad_w_acc = torch::empty({heads * 9}, r_c.options().dtype(torch::kFloat32));
     auto scale = torch::empty({n}, r_c.options().dtype(torch::kFloat32));
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, r_c.scalar_type(),
         "tria_init_seed_gate_backward_cuda", ([&] {
-            tria_init_seed_gate_forward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            tria_init_seed_gate_forward_kernel<scalar_t><<<forward_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
                 r_c.data_ptr<scalar_t>(), i_c.data_ptr<scalar_t>(), o_c.data_ptr<scalar_t>(),
                 seed_c.data_ptr<scalar_t>(), valid_c.data_ptr<bool>(), w_c.data_ptr<scalar_t>(),
                 static_cast<scalar_t*>(nullptr), static_cast<scalar_t*>(nullptr), scale.data_ptr<float>(),
-                (float)alpha, (int)axis, B, T, H);
+                (float)alpha, (int)axis, B, T, H, hidden_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, r_c.scalar_type(),
@@ -161,14 +171,15 @@ std::vector<torch::Tensor> tria_init_seed_gate_backward_cuda(
                 seed_c.data_ptr<scalar_t>(), valid_c.data_ptr<bool>(), w_c.data_ptr<scalar_t>(),
                 scale.data_ptr<float>(), grad_r.data_ptr<scalar_t>(), grad_i.data_ptr<scalar_t>(), grad_o.data_ptr<scalar_t>(),
                 grad_seed.data_ptr<scalar_t>(), grad_w_partial.data_ptr<float>(),
-                (float)alpha, (int)axis, B, T, H);
+                (float)alpha, (int)axis, B, T, H, hidden_per_head, heads,
+                chunks_per_head, partials_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int reduce_threads = 256;
     const int reduce_nwarps = (reduce_threads + 31) / 32;
-    gate_mix_grad_w_reduce_kernel<<<9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), blocks);
+    gate_mix_grad_w_reduce_kernel<<<heads * 9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
+        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), partials_per_head);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grad_w = grad_w_acc.to(w_c.scalar_type());
+    auto grad_w = grad_w_acc.view_as(w_c).to(w_c.scalar_type());
     return {grad_r, grad_i, grad_o, grad_seed, grad_w};
 }

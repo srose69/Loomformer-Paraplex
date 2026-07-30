@@ -37,7 +37,7 @@ by **srose69** (SimpleRose)
 [![Precision FP32 FP16 BF16](https://img.shields.io/badge/precision-FP32%20%7C%20FP16%20%7C%20BF16-2563eb)](#configuration)
 [![Attention GQA](https://img.shields.io/badge/attention-causal%20GQA-black)](#causal-gqa)
 [![Attention backends](https://img.shields.io/badge/backends-FlashAttention%20%7C%20TE%20%7C%20SDPA-0ea5e9)](#cuda-kernels-and-replay)
-[![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/collections/srs6901/loomformer-paraplex)
+[![Checkpoints HF](https://img.shields.io/badge/checkpoints-HF-yellow)](https://huggingface.co/srs6901/LoomFormer-Paraplex/)
 [![Training PT + SFT](https://img.shields.io/badge/training-PT%20%2B%20SFT-9333ea)](#training-sft-and-inference)
 [![Distributed DDP](https://img.shields.io/badge/distributed-DDP-7c3aed)](#training-sft-and-inference)
 [![Data packed + OTF](https://img.shields.io/badge/data-packed%20%2B%20OTF-0891b2)](#training-sft-and-inference)
@@ -159,7 +159,7 @@ The name **LoomFormer** refers to the way these paths are interwoven: ordinary c
 
 Published checkpoints are available on Hugging Face:
 
-**[Hugging Face checkpoint repository](https://huggingface.co/collections/srs6901/loomformer-paraplex)**
+**[Hugging Face checkpoint repository](https://huggingface.co/srs6901/LoomFormer-Paraplex/)**
 
 The reference run currently described in this README used:
 
@@ -270,6 +270,72 @@ K^{\mathrm{ctx}}_t = A_tK_{\le t}.
 LoomFormer keeps both the attention context `Vctx` and the attended key context `Kctx`. The ordinary attention output is projected back into the residual stream, while `Q`, `Kctx` and `Vctx` are also passed into Paraplex.
 
 The causal-attention implementation supports flat, chunked and token-by-token execution. Packed SFT rows carry a linear `segment_ids`/`cu_seqlens` layout. With `attn_impl: auto`, Ampere-and-newer training sends that layout to a validated FlashAttention or Transformer Engine varlen backend. The compact SDPA path processes each document independently on Pascal and in reference execution. Temporal chunks use precomputed gather plans for the K/V history. Document-layout metadata remains `O(BT)` and preserves isolation across packed examples.
+
+Attention depth and token density are constructor options. `attn_layers` is a sorted 1-based list; omitted or `null` keeps every layer active. Inactive layers contain no QKV/output parameters, allocate no KV cache, emit a zero attention residual, and reuse the nearest lower active layer's current conditioning context. Layer 1 must remain active.
+
+`attn_token_stride: 2` stores and attends only half of the document-relative positions. `shared` uses offset 0 in every active layer; `staggered` rotates offsets by active-layer ordinal. Selected tokens compute Q/K/V and write compact KV. Gaps receive an inherited context, while the first active layer uses document-safe sample-and-hold. RoPE and Tria retain logical positions; `cache_pos` counts physical KV writes. A logical 16K configuration therefore allocates roughly 8K KV entries per stride-2 active layer. Sparse schedules change the trained architecture and should not be enabled only after training a dense checkpoint.
+
+The layer mixer is chosen once by the constructor; inactive blocks do not take
+a per-token runtime branch:
+
+```text
+┌───────────────────────────────────────────┐
+│               Decoder block               │
+└─────────────────────┬─────────────────────┘
+                      │ constructor selection
+          ┌───────────┴───────────┐
+          ▼                       ▼
+┌───────────────────────┐  ┌───────────────────────────┐
+│    AttentionMixer     │  │  InheritedContextMixer   │
+│ active layer          │  │ inactive layer           │
+│ QKV + O + RoPE        │  │ 0 attention parameters   │
+│ compact physical KV   │  │ 0 KV memory, passthrough │
+└───────────────────────┘  └───────────────────────────┘
+```
+
+For `attn_layers: [1, 3, 5]`, stride 2 and `staggered`, offsets follow the
+ordinal among active attention layers, not the absolute decoder-layer number:
+
+```text
+document-relative position:       0  1  2  3  4  5  6  7
+config layer 1 (ordinal 0):       1  0  1  0  1  0  1  0
+config layer 3 (ordinal 1):       0  1  0  1  0  1  0  1
+config layer 5 (ordinal 2):       1  0  1  0  1  0  1  0
+inactive layers 2 and 4:          ·  ·  ·  ·  ·  ·  ·  ·
+```
+
+Each packed document restarts this pattern at logical position zero. Selection
+compacts only the physical attention path:
+
+```text
+logical abs_pos:       0  1  2  3  4  5  6  7
+write KV?:             1  0  1  0  1  0  1  0
+physical cache_pos:    0  ·  1  ·  2  ·  3  ·
+                       │     │     │     │
+selected token ── gather ── QKV/RoPE ── compact causal attention ── scatter
+gap token      ── inherited context / document-safe sample-and-hold
+Tria + RoPE    ── retain the full logical timeline 0…7
+```
+
+Common schedules are:
+
+```yaml
+# Token sparsity only; attention remains present in every decoder layer.
+attn_layers: null
+attn_token_stride: 2
+attn_token_schedule: staggered
+
+# Attention exists only in the first two layers; each stores one third of tokens.
+attn_layers: [1, 2]
+attn_token_stride: 3
+attn_token_schedule: staggered
+```
+
+Attention selection never edits LM targets or the SFT loss mask. Dense,
+layer-sparse and checkerboard models are evaluated on the same shifted target
+tensor; only their hidden states and therefore their logits differ.
+
+The resolved schedule is stored in checkpoints and AIO configuration. DDP verifies that every rank resolved the same Config before constructing the model. Resume rejects attention-architecture changes; use `init_checkpoint` for an intentional dense-to-sparse initialization.
 
 ### DepthAttn
 
@@ -1102,9 +1168,9 @@ cd Loomformer-Paraplex
 ./setup.sh
 ```
 
-The installer probes every visible GPU. A machine containing Pascal or Volta selects the CUDA `12.6` / PyTorch `cu126` profile. A Turing-or-newer machine selects CUDA `13.0` / PyTorch `cu130`. The toolkit and venv are installed under `~/loom` by default. The menu also provides read-only environment inspection, package reinstall and repository update.
+The installer probes every visible GPU. A machine containing Pascal or Volta selects the CUDA `12.6` / PyTorch `cu126` profile. A Turing-or-newer machine selects CUDA `13.0` / PyTorch `cu130`. The toolkit and venv are installed under `~/loom` by default. If the system Python lacks `ensurepip`, setup falls back to user-local `virtualenv` without requiring root; an incomplete environment is preserved under a timestamped `.incomplete.*` name before retrying. The menu also provides read-only environment inspection, package reinstall and repository update.
 
-The current installer defaults to PyTorch `2.12.1`. `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR` and `LOOM_BUILD_JOBS` provide explicit profile and location overrides.
+The current installer defaults to PyTorch `2.12.1`. `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR`, `LOOM_BUILD_JOBS` and `LOOM_NVCC_THREADS` provide explicit profile, location and native-build overrides.
 
 Repository update uses `git pull --ff-only` for a Git checkout. Tarball installations receive an upstream-file overlay. Checkpoints, datasets, logs, environments and local-only paths remain in place.
 
@@ -1262,7 +1328,7 @@ The model is configured from YAML. The main groups are:
 | Area | Representative fields |
 | --- | --- |
 | Shape | `model_dim`, `n_q_heads`, `n_kv_heads`, `gqa_group_size`, `hidden`, `layers` |
-| Attention | `attn_impl`, `attn_sdpa_compute_dtype`, `attn_sdpa_value_fusion`, `rope_*` |
+| Attention | `attn_impl`, `attn_layers`, `attn_token_stride`, `attn_token_schedule`, `attn_sdpa_compute_dtype`, `attn_sdpa_value_fusion`, `rope_*` |
 | DepthAttn | `depth_attn_readout`, `depth_attn_qkv_rms`, `residual_branch_rms_cap` |
 | Paraplex | `phase_sectors`, `activation`, `powlu_m`, `phase_grad_mode`, `phase_grad_floor`, `paraplex_gate_proj` |
 | Tria | `tria_carry_enabled`, `tria_temporal_enabled`, `tria_temporal_window`, `tria_carrier_alpha`, calibration fields |
@@ -1443,7 +1509,7 @@ W_{\mathrm{eff}}=\left(W_{\mathrm{real}},\left(W^{I,U},\mathbf W^{I,\mathrm{ctx}
 
 Опубликованные чекпойнты находятся на Hugging Face:
 
-**[Репозиторий чекпойнтов на Hugging Face](https://huggingface.co/collections/srs6901/loomformer-paraplex)**
+**[Репозиторий чекпойнтов на Hugging Face](https://huggingface.co/srs6901/LoomFormer-Paraplex/)**
 
 Референсный запуск, описанный в этом README, использовал:
 
@@ -1554,6 +1620,72 @@ K^{\mathrm{ctx}}_t = A_tK_{\le t}.
 LoomFormer сохраняет и attention context `Vctx`, и attended key context `Kctx`. Обычный attention-output проецируется обратно в residual stream, а `Q`, `Kctx` и `Vctx` одновременно передаются в Paraplex.
 
 Реализация causal attention поддерживает flat, chunked и token-by-token режимы. Packed-строки SFT несут линейный layout `segment_ids`/`cu_seqlens`. При `attn_impl: auto` на Ampere и новее layout передаётся в проверенный varlen-backend FlashAttention или Transformer Engine. Компактный SDPA-путь на Pascal и в reference execution обрабатывает каждый документ отдельно. Temporal chunks используют заранее построенные gather-plans для K/V-history. Document-layout metadata имеет размер `O(BT)` и сохраняет изоляцию packed examples.
+
+Глубина и токенная плотность attention задаются при сборке модели. `attn_layers` — отсортированный 1-based список; отсутствие поля или `null` оставляет attention во всех слоях. Неактивные слои не содержат QKV/output-параметров, не выделяют KV cache, дают нулевой attention residual и используют текущий conditioning context ближайшего нижнего активного слоя. Первый слой должен оставаться активным.
+
+При `attn_token_stride: 2` attention сохраняет и читает только половину document-relative позиций. Режим `shared` использует offset 0 во всех активных слоях, а `staggered` чередует offsets по ordinal активного слоя. Выбранные токены вычисляют Q/K/V и записывают компактный KV; gaps получают унаследованный context, а первый активный слой использует document-safe sample-and-hold. RoPE и Tria работают с логическими позициями, `cache_pos` считает физические KV-записи. Поэтому логический конфиг 16K выделяет примерно 8K KV-позиций на stride-2 active layer. Sparse schedule меняет обучаемую архитектуру; включать его только после dense-training нельзя.
+
+Mixer слоя выбирается конструктором один раз; неактивные блоки не выполняют
+per-token runtime branch:
+
+```text
+┌───────────────────────────────────────────┐
+│               Decoder block               │
+└─────────────────────┬─────────────────────┘
+                      │ выбор конструктора
+          ┌───────────┴───────────┐
+          ▼                       ▼
+┌───────────────────────┐  ┌───────────────────────────┐
+│    AttentionMixer     │  │  InheritedContextMixer   │
+│ активный слой         │  │ неактивный слой          │
+│ QKV + O + RoPE        │  │ 0 attention-параметров   │
+│ компактный physical KV│  │ 0 KV-памяти, passthrough │
+└───────────────────────┘  └───────────────────────────┘
+```
+
+Для `attn_layers: [1, 3, 5]`, stride 2 и `staggered` offset определяется
+ordinal среди активных attention-слоёв, а не абсолютным номером decoder-layer:
+
+```text
+document-relative position:       0  1  2  3  4  5  6  7
+config layer 1 (ordinal 0):       1  0  1  0  1  0  1  0
+config layer 3 (ordinal 1):       0  1  0  1  0  1  0  1
+config layer 5 (ordinal 2):       1  0  1  0  1  0  1  0
+неактивные layers 2 и 4:          ·  ·  ·  ·  ·  ·  ·  ·
+```
+
+Каждый packed document перезапускает узор с logical position zero. Selection
+уплотняет только физический attention-путь:
+
+```text
+logical abs_pos:       0  1  2  3  4  5  6  7
+писать KV?:            1  0  1  0  1  0  1  0
+physical cache_pos:    0  ·  1  ·  2  ·  3  ·
+                       │     │     │     │
+selected token ── gather ── QKV/RoPE ── compact causal attention ── scatter
+gap token      ── inherited context / document-safe sample-and-hold
+Tria + RoPE    ── сохраняют полную logical timeline 0…7
+```
+
+Типовые расписания:
+
+```yaml
+# Только токенная sparsity; attention остаётся во всех decoder layers.
+attn_layers: null
+attn_token_stride: 2
+attn_token_schedule: staggered
+
+# Attention есть только в первых двух слоях; каждый хранит треть токенов.
+attn_layers: [1, 2]
+attn_token_stride: 3
+attn_token_schedule: staggered
+```
+
+Attention selection никогда не меняет LM-targets или SFT loss mask. Dense,
+layer-sparse и checkerboard модели оцениваются на одном shifted target tensor;
+различаются только hidden states и, следовательно, logits.
+
+Разрешённое расписание сохраняется в checkpoints и AIO config. Перед сборкой модели DDP проверяет, что все ranks получили один и тот же Config. Resume запрещает менять attention-архитектуру; для намеренной dense-to-sparse инициализации используется `init_checkpoint`.
 
 ### DepthAttn
 
@@ -2386,9 +2518,9 @@ cd Loomformer-Paraplex
 ./setup.sh
 ```
 
-Установщик проверяет compute capability каждой видимой GPU. Машина с Pascal или Volta получает профиль CUDA `12.6` / PyTorch `cu126`. Машина только с Turing и более новыми GPU получает CUDA `13.0` / PyTorch `cu130`. По умолчанию toolkit и venv устанавливаются в `~/loom`. В меню также доступны read-only проверка окружения, переустановка пакетов и обновление репозитория.
+Установщик проверяет compute capability каждой видимой GPU. Машина с Pascal или Volta получает профиль CUDA `12.6` / PyTorch `cu126`. Машина только с Turing и более новыми GPU получает CUDA `13.0` / PyTorch `cu130`. По умолчанию toolkit и venv устанавливаются в `~/loom`. Если в системном Python отсутствует `ensurepip`, setup без root переключается на user-local `virtualenv`; незавершённое окружение перед повтором сохраняется под timestamped-именем `.incomplete.*`. В меню также доступны read-only проверка окружения, переустановка пакетов и обновление репозитория.
 
-Текущая версия установщика по умолчанию использует PyTorch `2.12.1`. Переменные `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR` и `LOOM_BUILD_JOBS` задают явный профиль и пути.
+Текущая версия установщика по умолчанию использует PyTorch `2.12.1`. Переменные `LOOM_CUDA_LINE`, `LOOM_TORCH_VERSION`, `LOOM_INSTALL_DIR`, `LOOM_REPO_DIR`, `LOOM_BUILD_JOBS` и `LOOM_NVCC_THREADS` задают профиль, пути и параметры нативной сборки.
 
 Для Git-checkout обновление выполняется через `git pull --ff-only`. Tarball-установка получает overlay файлов нового upstream. Чекпойнты, датасеты, логи, окружения и local-only paths остаются на месте.
 
@@ -2546,7 +2678,7 @@ python loomcloner.py \
 | Область | Характерные поля |
 | --- | --- |
 | Форма | `model_dim`, `n_q_heads`, `n_kv_heads`, `gqa_group_size`, `hidden`, `layers` |
-| Attention | `attn_impl`, `attn_sdpa_compute_dtype`, `attn_sdpa_value_fusion`, `rope_*` |
+| Attention | `attn_impl`, `attn_layers`, `attn_token_stride`, `attn_token_schedule`, `attn_sdpa_compute_dtype`, `attn_sdpa_value_fusion`, `rope_*` |
 | DepthAttn | `depth_attn_readout`, `depth_attn_qkv_rms`, `residual_branch_rms_cap` |
 | Paraplex | `phase_sectors`, `activation`, `powlu_m`, `phase_grad_mode`, `phase_grad_floor`, `paraplex_gate_proj` |
 | Tria | `tria_carry_enabled`, `tria_temporal_enabled`, `tria_temporal_window`, `tria_carrier_alpha`, calibration fields |

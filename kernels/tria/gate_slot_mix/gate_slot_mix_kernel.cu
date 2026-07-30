@@ -19,10 +19,11 @@
 template __global__ void gate_slot_mix_forward_kernel<float>(const float* __restrict__ carry,   
     const float* __restrict__ w,       
     float* __restrict__ p,             
-    int64_t n);
+    int64_t n, int64_t hidden, int64_t hidden_per_head);
 template __global__ void gate_slot_mix_backward_kernel<float>(const float* __restrict__ grad_p,     
     const float* __restrict__ carry,      
     const float* __restrict__ w,          
     float* __restrict__ grad_carry,       
     float* __restrict__ grad_w_acc,          
-    int64_t n);
+    int64_t n, int64_t hidden, int64_t hidden_per_head,
+    int64_t heads, int64_t chunks_per_head, int64_t partials_per_head);

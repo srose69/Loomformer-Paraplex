@@ -420,21 +420,23 @@ def calibrate_kv_runtime(
 
     # CPU storage: use pinned memory and benchmark both transport and the exact
     # online-attention pipeline. Candidate sizes are geometry-independent.
+    attn = model.blocks[0].attn
+    stride = int(getattr(attn, "token_stride", 1))
+    physical_len = max(1, math.ceil(calib_len / stride))
     candidates = [
         c for c in (128, 256, 512, 1024, 2048, 4096)
-        if c <= calib_len
+        if c <= physical_len
     ]
-    if calib_len not in candidates:
-        candidates.append(calib_len)
+    if physical_len not in candidates:
+        candidates.append(physical_len)
     candidates = sorted(set(candidates))
     dtype = settings.torch_dtype()
-    attn = model.blocks[0].attn
     best: Optional[Tuple[float, int, int, float, float, float]] = None
 
     for chunk in candidates:
-        n_chunks = math.ceil(calib_len / chunk)
+        n_chunks = math.ceil(physical_len / chunk)
         host_k = torch.zeros(
-            (1, calib_len, lf.N_KV_HEADS, lf.HEAD_DIM),
+            (1, physical_len, lf.N_KV_HEADS, lf.HEAD_DIM),
             dtype=dtype, pin_memory=True)
         host_v = torch.zeros(
             host_k.shape, dtype=dtype, pin_memory=True)
@@ -462,9 +464,10 @@ def calibrate_kv_runtime(
         # Taking the minimum is intentionally conservative: calibration must
         # never claim more overlap budget than either real execution mode
         # demonstrated on this machine.
-        decode_layer_us = 1e6 / max(decode_tps * int(lf.LAYERS), 1e-9)
+        active_layers = len(getattr(model.cfg, "attn_layers", ())) or int(lf.LAYERS)
+        decode_layer_us = 1e6 / max(decode_tps * active_layers, 1e-9)
         prefill_layer_us = (
-            chunk / max(prefill_tps * int(lf.LAYERS), 1e-9) * 1e6)
+            chunk * stride / max(prefill_tps * active_layers, 1e-9) * 1e6)
         overlap_us = min(compute_us, decode_layer_us, prefill_layer_us)
         if copy_us <= overlap_us:
             required = 1
@@ -487,7 +490,7 @@ def calibrate_kv_runtime(
         pipeline_us = _median_cuda_us(
             compute,
             lambda: attn._step_cpu_kv(
-                q, k_new, v_new, host_k, host_v, calib_len - 1, runtime),
+                q, k_new, v_new, host_k, host_v, physical_len - 1, runtime),
             repeats=3,
         )
         transfer_bytes = 2 * chunk * lf.N_KV_HEADS * lf.HEAD_DIM * torch.empty(
@@ -595,6 +598,10 @@ def _state_nbytes(states: Tuple) -> int:
                 t = getattr(obj, f.name)
                 if isinstance(t, torch.Tensor):
                     total += t.numel() * t.element_size()
+                elif isinstance(t, tuple):
+                    total += sum(
+                        x.numel() * x.element_size()
+                        for x in t if isinstance(x, torch.Tensor))
     return total
 
 
@@ -602,10 +609,15 @@ def snapshot_states(states: Tuple, device: torch.device) -> Tuple:
     caches, ca_cache, temporal = states
     snap_caches = [
         lf.LayerCache(
-            k=_trim_to(c.k, c.cache_len, device),
-            v=_trim_to(c.v, c.cache_len, device),
+            k=_trim_to(c.k, c.cache_pos, device),
+            v=_trim_to(c.v, c.cache_pos, device),
             phase_trace=_copy_to(c.phase_trace, device),
-            cache_len=int(c.cache_len),
+            cache_pos=int(c.cache_pos),
+            cache_capacity=int(c.cache_capacity),
+            attn_context=(
+                None if c.attn_context is None
+                else tuple(_copy_to(x, device) for x in c.attn_context)
+            ),
         )
         for c in caches
     ]
@@ -633,10 +645,15 @@ def restore_states(
     kv_device = device if kv_device is None else torch.device(kv_device)
     live_caches = [
         lf.LayerCache(
-            k=_expand_to(c.k, seq_len, kv_device),
-            v=_expand_to(c.v, seq_len, kv_device),
+            k=_expand_to(c.k, c.cache_capacity or seq_len, kv_device),
+            v=_expand_to(c.v, c.cache_capacity or seq_len, kv_device),
             phase_trace=_copy_to(c.phase_trace, device),
-            cache_len=int(c.cache_len),
+            cache_pos=int(c.cache_pos),
+            cache_capacity=int(c.cache_capacity),
+            attn_context=(
+                None if c.attn_context is None
+                else tuple(_copy_to(x, device) for x in c.attn_context)
+            ),
         )
         for c in caches
     ]
@@ -802,7 +819,7 @@ def generate_turn(model, tok, chat: AIOChatTemplate, messages: List[Dict],
 # banner / settings display
 # ============================================================================
 
-def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dict) -> None:
+def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dict, cfg) -> None:
     print(COLOR.cyan(BANNER))
     quant = manifest.get("quantization", {}).get("target_dtype", "none")
     print(COLOR.dim(f"  archive: {aio_path}  ({n_params:,} params, packed={quant})"))
@@ -811,6 +828,12 @@ def print_banner(aio_path: str, n_params: int, settings: Settings, manifest: Dic
     print(COLOR.dim(
         f"  kvstorage={settings.kvstorage}  "
         "(persistent KV placement and prefix reuse across turns)"))
+    active_layers = len(getattr(cfg, "attn_layers", ())) or int(cfg.layers)
+    stride = int(getattr(cfg, "attn_token_stride", 1))
+    physical = math.ceil(int(cfg.seq_len) / stride)
+    print(COLOR.dim(
+        f"  attention={active_layers}/{int(cfg.layers)} layers  "
+        f"logical={int(cfg.seq_len)}  physical_kv<={physical}  stride={stride}"))
     print(COLOR.dim("  /help for commands · type / to browse them · Esc interrupts a reply\n"))
 
 
@@ -961,7 +984,7 @@ def run_chat(aio_path: str, settings: Settings, system: Optional[str],
         consume_us=calibration.consume_us,
     )
 
-    print_banner(aio_path, lf.count_params(model), settings, manifest)
+    print_banner(aio_path, lf.count_params(model), settings, manifest, cfg)
     if kv_device != device:
         peer_text = (
             "" if calibration.peer_access is None

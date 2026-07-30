@@ -195,12 +195,13 @@ def _load_safetensors_checkpoint(path: str) -> Dict[str, Any]:
         )
     with open(config_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    if "cfg" not in meta or not isinstance(meta["cfg"], Mapping):
-        raise ValueError("config JSON must contain 'cfg' mapping")
+    cfg = meta.get("loomformer_cfg") or meta.get("cfg")
+    if not isinstance(cfg, Mapping):
+        raise ValueError("config JSON must contain 'loomformer_cfg' or 'cfg' mapping")
     model_state = _load_safetensors(path)
     blob: Dict[str, Any] = {
         "model": model_state,
-        "cfg": meta["cfg"],
+        "cfg": cfg,
         "model_kind": meta.get("model_kind", "loomformer"),
         "ffn_type": meta.get("ffn_type", "paraplex"),
         "ablation": meta.get("ablation", False),
@@ -266,8 +267,10 @@ def build_package(
                 for key in (
                     "vocab", "model_dim", "n_q_heads", "n_kv_heads", "head_dim",
                     "hidden", "layers", "seq_len", "tied_embeddings", "activation",
-                    "phase_sectors", "tria_carry_enabled", "tria_temporal_window",
-                    "tria_carrier_alpha", "tria_polarm_beta",
+                    "phase_sectors", "attn_layers", "attn_token_stride",
+                    "attn_token_schedule", "tria_carry_enabled",
+                    "tria_temporal_window", "tria_carrier_alpha",
+                    "tria_polarm_beta",
                 )
                 if key in cfg
             },
@@ -377,17 +380,42 @@ def export_safetensors(
 
     save_file(sd, str(out))
 
-    meta = {
-        "cfg": dict(blob["cfg"]),
-        "model_kind": blob.get("model_kind", "loomformer"),
+    cfg = dict(blob["cfg"])
+    target_dtype_name = _dtype_name(target_dtype) if target_dtype is not None else "fp32"
+
+    meta: Dict[str, Any] = {
+        "model_type": "loomformer",
+        "architectures": ["LoomFormerForCausalLM"],
+        "auto_map": {
+            "AutoConfig": "loomformer.LoomFormerConfig",
+            "AutoModelForCausalLM": "loomformer.LoomFormerForCausalLM",
+        },
+        "vocab_size": int(cfg.get("vocab", 0)),
+        "hidden_size": int(cfg.get("model_dim", 0)),
+        "num_hidden_layers": int(cfg.get("layers", 0)),
+        "num_attention_heads": int(cfg.get("n_q_heads", 0)),
+        "num_key_value_heads": int(cfg.get("n_kv_heads", 0)),
+        "head_dim": int(cfg.get("head_dim", 0)),
+        "intermediate_size": int(cfg.get("hidden", 0)),
+        "max_position_embeddings": int(cfg.get("seq_len", 0)),
+        "tie_word_embeddings": bool(cfg.get("tied_embeddings", True)),
+        "rope_theta": float(cfg.get("rope_theta", 10000.0)),
+        "rope_scaling": {
+            "type": "linear",
+            "factor": float(cfg.get("rope_factor", 1.0)),
+        },
+        "torch_dtype": target_dtype_name,
         "ffn_type": blob.get("ffn_type", "paraplex"),
+        "activation": str(cfg.get("activation", "")),
+        "model_kind": blob.get("model_kind", "loomformer"),
         "ablation": bool(blob.get("ablation", False)),
+        "loomformer_cfg": cfg,
     }
     for key in ("step", "tokens_seen", "train_loss", "eval_loss"):
         if key in blob:
             meta[key] = blob[key]
 
-    config_path = out.with_suffix(".json")
+    config_path = out.parent / "config.json"
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 

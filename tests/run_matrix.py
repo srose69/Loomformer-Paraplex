@@ -45,6 +45,10 @@ import torch
 import yaml
 
 from synthetic_tokenizer import build_synthetic_bpe
+from attention_matrix import (
+    MATRIX_PATH,
+    attention_cases as build_attention_cases,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -589,6 +593,8 @@ def _write_validation_report(
     output: Path,
     profile: Dict[str, Any],
     attention: list[Dict[str, Any]],
+    attention_cases: list[Dict[str, Any]],
+    ddp_executed: bool,
 ) -> None:
     output = output.absolute()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -603,6 +609,15 @@ def _write_validation_report(
             "gpu_count": int(profile["gpu_count"]),
         },
         "attention": attention,
+        "attention_config_matrix": {
+            "source": str(MATRIX_PATH.relative_to(ROOT)),
+            "cases_per_workload_execution": len(attention_cases),
+            "workloads": ["pt", "sft"],
+            "executions": (
+                ["single_gpu", "ddp"] if ddp_executed else ["single_gpu"]
+            ),
+            "cases": attention_cases,
+        },
     }
     fd, temporary = tempfile.mkstemp(
         prefix=f".{output.name}.",
@@ -699,6 +714,11 @@ def run_matrix(args: argparse.Namespace) -> None:
             "tokenizer": str(tokenizer),
             "vocab": vocab,
         }
+        attention_cases = build_attention_cases()
+        _status(
+            "PASS",
+            f"attention config matrix ({len(attention_cases)} cases per workload/execution)",
+        )
         pt_checkpoint = work / "pt.pt"
         pt_runpoints = work / "pt_runpoints"
         pt_config = _write_config(
@@ -844,38 +864,35 @@ def run_matrix(args: argparse.Namespace) -> None:
         )
         _check_checkpoint(eager_checkpoint, step=1, optimizer="adamw")
 
-        # Each destructive split gets its own corpus. Reusing one would turn
-        # the second matrix cell into a materially different dataset.
-        for checkpointing in (False, True):
-            suffix = "on" if checkpointing else "off"
-            pt_parquet = _make_pt_parquet(work, f"pt_parquet_ckpt_{suffix}")
-            otf_checkpoint = work / f"pt_otf_ckpt_{suffix}.pt"
+        pt_attention_dataset = _make_pt_parquet(
+            work, "pt_attention_matrix")
+        for attention_case in attention_cases:
+            case_name = attention_case["name"]
+            overrides = attention_case["overrides"]
+            otf_checkpoint = work / f"pt_otf_{case_name}.pt"
             otf_config = _write_config(
                 PT_TEMPLATE,
-                work / f"pt_otf_ckpt_{suffix}.yaml",
+                work / f"pt_otf_{case_name}.yaml",
                 {
                     **common,
+                    **overrides,
                     "steps": 1,
                     "grad_accum_steps": 1,
                     "save_every": 0,
                     "save_initial_checkpoint": False,
-                    "train_dataset": str(pt_parquet),
+                    "train_dataset": str(pt_attention_dataset),
                     "dataset_format": "parquet",
                     "dataset_cache": "ram",
                     "auto_val_split_pct": 20.0,
                     "checkpoint": str(otf_checkpoint),
                     "runpoints_path": None,
-                    "grad_checkpointing": checkpointing,
-                    # Exercise Dynamo/custom-op integration where the
-                    # architecture supports torch.compile; Pascal stays eager.
                     "compile": bool(profile["compile"]),
                     "graph": bool(profile["compile"]),
                     "attn_impl": "auto" if profile["modern"] else "sdpa",
                 },
             )
             _run(
-                "PT Parquet OTF + auto-val + compile/custom-op graph "
-                f"[checkpointing={suffix}]",
+                f"PT attention matrix [{case_name}]",
                 [
                     sys.executable,
                     "loomformer.py",
@@ -885,34 +902,35 @@ def run_matrix(args: argparse.Namespace) -> None:
                 ],
             )
             _check_checkpoint(otf_checkpoint, step=1, optimizer="adamw")
-            _assert_split(pt_parquet, 30)
+            _assert_split(pt_attention_dataset, 30)
 
         sft_config: Optional[Path] = None
         sft_checkpoint: Optional[Path] = None
         sft_digest: Optional[str] = None
-        for checkpointing in (False, True):
-            suffix = "on" if checkpointing else "off"
-            sft_parquet = _make_sft_parquet(work, f"sft_parquet_ckpt_{suffix}")
-            case_checkpoint = work / f"sft_ckpt_{suffix}.pt"
+        resume_case_name = "first_two_stride3_staggered_ckpt_on"
+        sft_attention_dataset = _make_sft_parquet(
+            work, "sft_attention_matrix")
+        for attention_case in attention_cases:
+            case_name = attention_case["name"]
+            overrides = attention_case["overrides"]
+            case_checkpoint = work / f"sft_{case_name}.pt"
             case_config = _write_config(
                 SFT_TEMPLATE,
-                work / f"sft_ckpt_{suffix}.yaml",
+                work / f"sft_{case_name}.yaml",
                 {
                     **common,
-                    "steps": 2 if checkpointing else 1,
-                    "train_dataset": str(sft_parquet),
+                    **overrides,
+                    "steps": 2 if case_name == resume_case_name else 1,
+                    "train_dataset": str(sft_attention_dataset),
                     "init_checkpoint": str(pt_checkpoint),
                     "checkpoint": str(case_checkpoint),
-                    "grad_checkpointing": checkpointing,
                     "attn_impl": "auto" if profile["modern"] else "sdpa",
                     "compile": bool(profile["compile"]),
                     "graph": bool(profile["compile"]),
                 },
             )
             _run(
-                "SFT Parquet OTF: PT init, packed masks, "
-                "compile/custom-op graph "
-                f"[checkpointing={suffix}]",
+                f"SFT attention matrix [{case_name}]",
                 [
                     sys.executable,
                     "loomformer.py",
@@ -922,17 +940,15 @@ def run_matrix(args: argparse.Namespace) -> None:
                 ],
             )
             case_digest = _check_checkpoint(
-                case_checkpoint,
-                step=2 if checkpointing else 1,
-                optimizer="atom",
+                case_checkpoint, step=2 if case_name == resume_case_name else 1,
+                optimizer="atom"
             )
             if case_digest == pt_digest:
                 raise AssertionError(
-                    f"SFT checkpointing={suffix} did not change pretrained "
-                    "model weights"
+                    f"SFT case {case_name} did not change pretrained model weights"
                 )
-            _assert_split(sft_parquet, 40)
-            if checkpointing:
+            _assert_split(sft_attention_dataset, 40)
+            if case_name == resume_case_name:
                 sft_config = case_config
                 sft_checkpoint = case_checkpoint
                 sft_digest = case_digest
@@ -964,15 +980,32 @@ def run_matrix(args: argparse.Namespace) -> None:
         gpu_count = int(profile["gpu_count"])
         if gpu_count >= 2 and not args.no_ddp:
             ddp_device = "cudas"
+            _run(
+                "sparse DDP reducer invariant with rank-local empty selection",
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node=2",
+                    "tests/ddp_sparse_smoke.py",
+                ],
+                timeout=90,
+                extra_env={"TORCH_DISTRIBUTED_DEBUG": "DETAIL"},
+            )
             compile_modes = (
                 (False, True) if profile["all_compile"] else (False,)
             )
+            ddp_sft_dataset = _make_sft_parquet(
+                work, "sft_ddp_attention_matrix"
+            )
             for compile_enabled in compile_modes:
                 compile_suffix = "on" if compile_enabled else "off"
-                for checkpointing in (False, True):
-                    checkpoint_suffix = "on" if checkpointing else "off"
+                for attention_case in attention_cases:
+                    case_name = attention_case["name"]
+                    overrides = attention_case["overrides"]
                     case_suffix = (
-                        f"compile_{compile_suffix}_ckpt_{checkpoint_suffix}"
+                        f"{case_name}_compile_{compile_suffix}"
                     )
                     ddp_pt_checkpoint = work / f"pt_ddp_{case_suffix}.pt"
                     ddp_pt_config = _write_config(
@@ -980,6 +1013,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                         work / f"pt_ddp_{case_suffix}.yaml",
                         {
                             **common,
+                            **overrides,
                             "device": ddp_device,
                             "batch_size": gpu_count,
                             "steps": 1,
@@ -989,7 +1023,6 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "checkpoint": str(ddp_pt_checkpoint),
                             "train_dataset": str(pt_bin),
                             "runpoints_path": None,
-                            "grad_checkpointing": checkpointing,
                             "compile": compile_enabled,
                             "graph": compile_enabled,
                             "attn_impl": (
@@ -999,8 +1032,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                     )
                     _run(
                         f"PT DDP across all {gpu_count} visible GPUs "
-                        f"[compile={compile_suffix}, "
-                        f"checkpointing={checkpoint_suffix}]",
+                        f"[{case_name}, compile={compile_suffix}]",
                         [
                             sys.executable,
                             "loomformer.py",
@@ -1022,13 +1054,11 @@ def run_matrix(args: argparse.Namespace) -> None:
 
             for compile_enabled in compile_modes:
                 compile_suffix = "on" if compile_enabled else "off"
-                for checkpointing in (False, True):
-                    checkpoint_suffix = "on" if checkpointing else "off"
+                for attention_case in attention_cases:
+                    case_name = attention_case["name"]
+                    overrides = attention_case["overrides"]
                     case_suffix = (
-                        f"compile_{compile_suffix}_ckpt_{checkpoint_suffix}"
-                    )
-                    ddp_sft_dataset = _make_sft_parquet(
-                        work, f"sft_ddp_parquet_{case_suffix}"
+                        f"{case_name}_compile_{compile_suffix}"
                     )
                     ddp_sft_checkpoint = work / f"sft_ddp_{case_suffix}.pt"
                     ddp_sft_config = _write_config(
@@ -1036,6 +1066,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                         work / f"sft_ddp_{case_suffix}.yaml",
                         {
                             **common,
+                            **overrides,
                             "device": ddp_device,
                             "batch_size": gpu_count,
                             "steps": 1,
@@ -1043,7 +1074,6 @@ def run_matrix(args: argparse.Namespace) -> None:
                             "auto_val_split_pct": 20.0,
                             "init_checkpoint": str(pt_checkpoint),
                             "checkpoint": str(ddp_sft_checkpoint),
-                            "grad_checkpointing": checkpointing,
                             "compile": compile_enabled,
                             "graph": compile_enabled,
                             "attn_impl": (
@@ -1053,8 +1083,7 @@ def run_matrix(args: argparse.Namespace) -> None:
                     )
                     _run(
                         f"SFT DDP across all {gpu_count} visible GPUs "
-                        f"[compile={compile_suffix}, "
-                        f"checkpointing={checkpoint_suffix}]",
+                        f"[{case_name}, compile={compile_suffix}]",
                         [
                             sys.executable,
                             "loomformer.py",
@@ -1082,6 +1111,8 @@ def run_matrix(args: argparse.Namespace) -> None:
                 Path(args.report),
                 profile,
                 attention_report,
+                attention_cases,
+                gpu_count >= 2 and not args.no_ddp,
             )
         completed = True
         _banner("Validation complete")

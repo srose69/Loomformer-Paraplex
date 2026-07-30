@@ -17,7 +17,11 @@ torch::Tensor gate_slot_mix_forward_cuda(torch::Tensor carry, torch::Tensor w) {
     TORCH_CHECK(carry.scalar_type() == w.scalar_type(), "gate_slot_mix_forward_cuda: dtype mismatch");
     TORCH_CHECK(carry.dim() >= 2 && carry.size(-1) == 3 && carry.size(-2) == 3,
                 "gate_slot_mix_forward_cuda: carry must end in [...,3,3]");
-    TORCH_CHECK(w.numel() == 9, "gate_slot_mix_forward_cuda: w must have exactly 9 elements");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "gate_slot_mix_forward_cuda: w must be [Q,9]");
+    const int64_t hidden = carry.size(-3);
+    const int64_t heads = w.size(0);
+    TORCH_CHECK(hidden % heads == 0, "gate_slot_mix_forward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = hidden / heads;
     c10::cuda::CUDAGuard device_guard(carry.device());
 
     auto carry_c = carry.contiguous();
@@ -33,7 +37,8 @@ torch::Tensor gate_slot_mix_forward_cuda(torch::Tensor carry, torch::Tensor w) {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, carry_c.scalar_type(),
         "gate_slot_mix_forward_cuda", ([&] {
             gate_slot_mix_forward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                carry_c.data_ptr<scalar_t>(), w_c.data_ptr<scalar_t>(), p.data_ptr<scalar_t>(), n);
+                carry_c.data_ptr<scalar_t>(), w_c.data_ptr<scalar_t>(), p.data_ptr<scalar_t>(),
+                n, hidden, hidden_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return p;
@@ -45,7 +50,11 @@ std::vector<torch::Tensor> gate_slot_mix_backward_cuda(
                 "gate_slot_mix_backward_cuda: inputs must be CUDA tensors");
     TORCH_CHECK(carry.scalar_type() == w.scalar_type() && grad_p.scalar_type() == w.scalar_type(),
                 "gate_slot_mix_backward_cuda: dtype mismatch");
-    TORCH_CHECK(w.numel() == 9, "gate_slot_mix_backward_cuda: w must have exactly 9 elements");
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == 9, "gate_slot_mix_backward_cuda: w must be [Q,9]");
+    const int64_t hidden = carry.size(-3);
+    const int64_t heads = w.size(0);
+    TORCH_CHECK(hidden % heads == 0, "gate_slot_mix_backward_cuda: hidden must be divisible by Q");
+    const int64_t hidden_per_head = hidden / heads;
     c10::cuda::CUDAGuard device_guard(carry.device());
 
     auto gp_c = grad_p.contiguous();
@@ -56,22 +65,26 @@ std::vector<torch::Tensor> gate_slot_mix_backward_cuda(
     auto grad_carry = torch::empty_like(carry_c);
 
     const int threads = GATE_MIX_THREADS;
-    const int64_t blocks = (n + threads - 1) / threads;
-    auto grad_w_partial = torch::empty({9, blocks}, carry_c.options().dtype(torch::kFloat32));
-    auto grad_w_acc = torch::empty({9}, carry_c.options().dtype(torch::kFloat32));
+    const int64_t chunks_per_head = (hidden_per_head + threads - 1) / threads;
+    const int64_t bt = n / hidden;
+    const int64_t partials_per_head = bt * chunks_per_head;
+    const int64_t blocks = bt * heads * chunks_per_head;
+    auto grad_w_partial = torch::empty({heads * 9, partials_per_head}, carry_c.options().dtype(torch::kFloat32));
+    auto grad_w_acc = torch::empty({heads * 9}, carry_c.options().dtype(torch::kFloat32));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, carry_c.scalar_type(),
         "gate_slot_mix_backward_cuda", ([&] {
             gate_slot_mix_backward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
                 gp_c.data_ptr<scalar_t>(), carry_c.data_ptr<scalar_t>(), w_c.data_ptr<scalar_t>(),
-                grad_carry.data_ptr<scalar_t>(), grad_w_partial.data_ptr<float>(), n);
+                grad_carry.data_ptr<scalar_t>(), grad_w_partial.data_ptr<float>(),
+                n, hidden, hidden_per_head, heads, chunks_per_head, partials_per_head);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int reduce_threads = 256;
     const int reduce_nwarps = (reduce_threads + 31) / 32;
-    gate_mix_grad_w_reduce_kernel<<<9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), blocks);
+    gate_mix_grad_w_reduce_kernel<<<heads * 9, reduce_threads, reduce_nwarps * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
+        grad_w_partial.data_ptr<float>(), grad_w_acc.data_ptr<float>(), partials_per_head);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grad_w = grad_w_acc.to(w_c.scalar_type());
+    auto grad_w = grad_w_acc.view_as(w_c).to(w_c.scalar_type());
     return {grad_carry, grad_w};
 }

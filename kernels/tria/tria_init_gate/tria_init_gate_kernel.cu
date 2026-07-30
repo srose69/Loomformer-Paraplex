@@ -21,7 +21,7 @@ template __global__ void tria_init_gate_forward_kernel<float>(const float* __res
     float* __restrict__ carry_1,
     float* __restrict__ p_out,
     float* __restrict__ scale_out,
-    float alpha, int axis, int64_t n);
+    float alpha, int axis, int64_t n, int64_t hidden, int64_t hidden_per_head);
 template __global__ void tria_init_gate_backward_kernel<float>(const float* __restrict__ grad_carry_1,
     const float* __restrict__ grad_p_out,
     const float* __restrict__ r, const float* __restrict__ i_, const float* __restrict__ o,
@@ -29,4 +29,6 @@ template __global__ void tria_init_gate_backward_kernel<float>(const float* __re
     const float* __restrict__ scale,
     float* __restrict__ grad_r, float* __restrict__ grad_i, float* __restrict__ grad_o,
     float* __restrict__ grad_w_acc,
-    float alpha, int axis, int64_t n);
+    float alpha, int axis, int64_t n,
+    int64_t hidden, int64_t hidden_per_head, int64_t heads,
+    int64_t chunks_per_head, int64_t partials_per_head);

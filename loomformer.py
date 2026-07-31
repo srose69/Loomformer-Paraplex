@@ -1265,7 +1265,12 @@ from loomformer_model.types import (
 )
 
 from loomformer_model.attentions.attention_backends import (
+    _flash_backend_cache,
+    _probe_flash_value_fusion,
+    _probe_te_value_fusion,
+    _te_backend_cache,
     _try_load_cuda_packed_gather,
+    _varlen_backend_failure_detail,
     _PackedGather as _PackedGather,
     _PackedGatherPair as _PackedGatherPair,
     _pack_selected_chunk_history as _pack_selected_chunk_history,

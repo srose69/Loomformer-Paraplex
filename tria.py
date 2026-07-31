@@ -150,10 +150,33 @@ class _PolARMRecompute(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (matrix,) = ctx.saved_tensors
-        with torch.enable_grad():
-            replay = matrix.detach().requires_grad_(True)
-            output = _polarm_impl(replay, ctx.beta, ctx.eps)
-            (grad_matrix,) = torch.autograd.grad(output, replay, grad_output)
+        input_dtype = matrix.dtype
+        x = matrix.float() if input_dtype in (torch.float16, torch.bfloat16) else matrix
+        h = (
+            grad_output.float()
+            if grad_output.dtype in (torch.float16, torch.bfloat16)
+            else grad_output
+        )
+        gram = x.transpose(-1, -2) @ x
+        raw_scale = gram.diagonal(dim1=-2, dim2=-1).mean(-1, keepdim=True)
+        scale = raw_scale.unsqueeze(-1).clamp_min(ctx.eps)
+        c = 0.5 * ctx.beta
+        f = x @ gram
+        grad_f = (
+            h @ gram
+            + x @ h.transpose(-1, -2) @ x
+            + x @ x.transpose(-1, -2) @ h
+        )
+        grad_matrix = (1.0 + c) * h - c * grad_f / scale
+        scale_live = raw_scale.gt(ctx.eps).unsqueeze(-1)
+        quotient = (h * f).sum(dim=(-2, -1), keepdim=True)
+        grad_matrix = grad_matrix + torch.where(
+            scale_live,
+            c * quotient * (2.0 / 3.0) * x / scale.square(),
+            torch.zeros_like(grad_matrix),
+        )
+        if grad_matrix.dtype != input_dtype:
+            grad_matrix = grad_matrix.to(input_dtype)
         return grad_matrix, None, None
 
 
@@ -1335,11 +1358,20 @@ class IdentityAnchoredGate(nn.Module):
         self.alpha_max = float(alpha_max)
         self.raw_alpha = nn.Parameter(torch.zeros(()))
 
-    def forward(self, wx: torch.Tensor, bias: torch.Tensor, p: Optional[torch.Tensor]) -> torch.Tensor:
+    def alpha(self) -> torch.Tensor:
+        return self.alpha_max * torch.tanh(self.raw_alpha)
+
+    def forward(
+        self,
+        wx: torch.Tensor,
+        bias: torch.Tensor,
+        p: Optional[torch.Tensor],
+        alpha: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if p is None:
             return wx + bias  # layer 1 (spec §5): no incoming p, behaves exactly
                               # like the architecture before tria existed.
-        alpha = self.alpha_max * torch.tanh(self.raw_alpha)
+        alpha = self.alpha() if alpha is None else alpha
         return wx * (1.0 + alpha * p) + bias
 
 

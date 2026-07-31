@@ -951,15 +951,22 @@ def apply_config(cfg: Config) -> None:
             and TRIA_CARRY_ENABLED
             and TRIA_TEMPORAL_ENABLED
         )
-        graph_helper.set_runtime_not_required(
-            {
+        runtime_not_required = set()
+        if not TRIA_CARRY_ENABLED:
+            runtime_not_required.update(
+                {
+                    "tria_init", "tria_init_gate", "tria_step",
+                    "tria_step_gate", "gate_slot_mix", "slot_attention_pool",
+                    "final_ca_sparse", "temporal_carry",
+                }
+            )
+        if replay_stack_is_eager:
+            runtime_not_required.update({
                 "tria_init", "tria_init_gate", "tria_step", "tria_step_gate",
                 "gate_slot_mix", "temporal_carry", "phase_sin",
                 "phase_sin_secant", "pvpowlu", "depth_attn", "beta_space",
-            }
-            if replay_stack_is_eager
-            else set()
-        )
+            })
+        graph_helper.set_runtime_not_required(runtime_not_required)
         graph_helper.install_capture_hooks(sys.modules[__name__], tria)
 
 
@@ -1265,12 +1272,12 @@ from loomformer_model.types import (
 )
 
 from loomformer_model.attentions.attention_backends import (
-    _flash_backend_cache,
-    _probe_flash_value_fusion,
-    _probe_te_value_fusion,
-    _te_backend_cache,
+    _flash_backend_cache as _flash_backend_cache,
+    _probe_flash_value_fusion as _probe_flash_value_fusion,
+    _probe_te_value_fusion as _probe_te_value_fusion,
+    _te_backend_cache as _te_backend_cache,
     _try_load_cuda_packed_gather,
-    _varlen_backend_failure_detail,
+    _varlen_backend_failure_detail as _varlen_backend_failure_detail,
     _PackedGather as _PackedGather,
     _PackedGatherPair as _PackedGatherPair,
     _pack_selected_chunk_history as _pack_selected_chunk_history,

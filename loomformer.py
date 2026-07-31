@@ -188,6 +188,10 @@ class Config:
     lr: float = 2e-3
     weight_decay: float = 0.01
     grad_clip: float = 1.0
+    # Divide the loss by this factor during backward, then restore the
+    # gradient scale after clipping. Values >1 protect deep BF16/FP32
+    # backward graphs from overflowing before global clipping can run.
+    backward_scale: float = 1.0
     grad_accum_steps: int = 1
     prefetch_batches: int = 256
     gpu_prefetch_batches: int = 8
@@ -2237,6 +2241,14 @@ async def train_one_async(
     full_eval_bpb = float("nan")
 
     accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1) or 1))
+    backward_scale = float(getattr(cfg, "backward_scale", 1.0) or 1.0)
+    if not math.isfinite(backward_scale) or backward_scale < 1.0:
+        raise ValueError(
+            f"backward_scale must be finite and >= 1, got {backward_scale!r}")
+    if backward_scale != 1.0:
+        ddp_print(
+            f"[precision] backward_scale={backward_scale:g} "
+            "(loss downscaled during backward; gradients restored after clipping)")
     tokens_seen_global = int(tokens_seen_at_start)
     data_wait_s = 0.0 
     batch_iter = stream.batches((int(cfg.steps) - start_step) * accum_steps).__aiter__()
@@ -2491,7 +2503,7 @@ async def train_one_async(
                     ddp_trace(
                         "backward_begin", step=step, micro=trace_micro
                     )
-                    (total_loss / float(accum_steps)).backward()
+                    (total_loss / (float(accum_steps) * backward_scale)).backward()
                     ddp_trace(
                         "backward_end", step=step, micro=trace_micro
                     )
@@ -2525,14 +2537,41 @@ async def train_one_async(
                 raise RuntimeError(
                     "non-finite gradient detected before optimizer step: "
                     f"optimizer={optimizer_name} step={step} lr={lr_at(cfg, step - 1):.9g} "
+                    f"backward_scale={backward_scale:g} "
                     f"summary={bad_grad_summary}; "
                     f"first={bad_grad}; "
                     f"examples={bad_grad_list}"
                 )
             if cfg.grad_clip and cfg.grad_clip > 0:
                 ddp_trace("grad_clip_begin", step=step)
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+                if backward_scale == 1.0:
+                    torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+                else:
+                    # Keep the norm reduction in scaled space.  Applying
+                    # min(S, C / ||g_scaled||) restores S and clips to C in
+                    # one multiply, without clip_grad_norm_'s fixed 1e-6
+                    # denominator epsilon crushing deliberately tiny grads.
+                    scaled_norm = torch.nn.utils.clip_grad_norm_(
+                        params, float("inf"))
+                    restore = (float(cfg.grad_clip) / scaled_norm).clamp(
+                        max=backward_scale)
+                    for p in params:
+                        if p.grad is not None:
+                            p.grad.mul_(restore.to(device=p.grad.device))
                 ddp_trace("grad_clip_end", step=step)
+            elif backward_scale != 1.0:
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.mul_(backward_scale)
+            if backward_scale != 1.0:
+                bad_unscaled_grad = _first_nonfinite("grad")
+                if bad_unscaled_grad is not None:
+                    raise RuntimeError(
+                        "non-finite gradient while restoring backward scale: "
+                        f"optimizer={optimizer_name} step={step} "
+                        f"backward_scale={backward_scale:g}; "
+                        f"first={bad_unscaled_grad}"
+                    )
             lr = lr_at(cfg, step - 1)
             for g in opt.param_groups:
                 g["lr"] = lr * float(g.get("lr_mult", 1.0))

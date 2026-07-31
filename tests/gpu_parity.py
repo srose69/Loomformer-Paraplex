@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 import loomformer as lf
 import graph_helper
 import tria
+from inline_kernels import depth_history
 
 
 def _config(
@@ -431,7 +432,8 @@ def _run_with_production_kernel_coverage(run):
     """Require the real chunked PT fused paths to execute fwd and bwd."""
     classes = {
         "paraplex": lf._ParaplexFused,
-        "depth_attn_list": lf._DepthAttnListFused,
+        "depth_history_append": depth_history._AppendPair,
+        "depth_attn_arena": depth_history._Attention,
         "tria_init_gate": tria._TriaInitAndGateFused,
         "tria_init_seed_gate": tria._TriaInitSeedAndGateFused,
         "tria_step_gate": tria._TriaStepAndGateFused,

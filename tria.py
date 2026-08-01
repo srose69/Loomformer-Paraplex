@@ -1257,7 +1257,6 @@ class _TemporalCarryFused(torch.autograd.Function):
         return grad_depth_carry, None
 
 
-
 class _TemporalCarryEndpointFused(torch.autograd.Function):
     @staticmethod
     def forward(ctx, depth, reset, initial, initial_valid):
@@ -1276,9 +1275,10 @@ class _TemporalCarryEndpointFused(torch.autograd.Function):
         else:
             initial = depth.new_empty(0)
             valid = torch.empty(0, dtype=torch.bool, device=depth.device)
-        endpoint, endpoint_fp32 = module.temporal_carry_endpoint_forward(
+        endpoint, endpoint_fp32, scales, checkpoints = module.temporal_carry_endpoint_forward(
             depth.contiguous(), reset, initial, valid)
-        ctx.save_for_backward(depth, endpoint_fp32, reset, initial, valid)
+        ctx.save_for_backward(
+            depth, endpoint_fp32, reset, initial, valid, scales, checkpoints)
         ctx.has_initial = has_initial
         return endpoint
 
@@ -1287,9 +1287,10 @@ class _TemporalCarryEndpointFused(torch.autograd.Function):
         module = _try_load_cuda_tria()
         if module is None:
             raise RuntimeError("CUDA temporal endpoint module is unavailable")
-        depth, endpoint_fp32, reset, initial, valid = ctx.saved_tensors
+        depth, endpoint_fp32, reset, initial, valid, scales, checkpoints = ctx.saved_tensors
         grad_depth, grad_initial = module.temporal_carry_endpoint_backward(
-            grad_endpoint.contiguous(), depth, endpoint_fp32, reset, initial, valid)
+            grad_endpoint.contiguous(), depth, endpoint_fp32, reset, initial, valid,
+            scales, checkpoints)
         return grad_depth, None, (grad_initial if ctx.has_initial else None), None
 
 def temporal_carry_cuda(

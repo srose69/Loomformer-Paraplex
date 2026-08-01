@@ -63,7 +63,8 @@ torch::Tensor temporal_carry_backward_cuda(
     torch::Tensor document_carry, torch::Tensor scale, torch::Tensor reset_mask);
 std::vector<torch::Tensor> temporal_carry_endpoint_backward_cuda(
     torch::Tensor grad_endpoint, torch::Tensor depth, torch::Tensor endpoint_fp32,
-    torch::Tensor reset, torch::Tensor initial, torch::Tensor initial_valid);
+    torch::Tensor reset, torch::Tensor initial, torch::Tensor initial_valid,
+    torch::Tensor scales, torch::Tensor checkpoints);
 std::vector<torch::Tensor> depth_replay_backward_cuda(
     torch::Tensor grad_carry, torch::Tensor r, torch::Tensor i, torch::Tensor o,
     torch::Tensor r_ptrs, torch::Tensor i_ptrs, torch::Tensor o_ptrs,

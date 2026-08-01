@@ -41,7 +41,7 @@ __device__ __forceinline__ float pp_phase_grad(
 }
 
 __device__ __forceinline__ float pp_gate(float amp, float m, float& dlog) {
-    const float safe = fmaxf(amp, 1.0e-12f);
+    const float safe = fmaxf(amp, 1.0e-6f);
     const float root = sqrtf(safe);
     const float denom = root + 1.0f;
     const float exponent = m / denom;

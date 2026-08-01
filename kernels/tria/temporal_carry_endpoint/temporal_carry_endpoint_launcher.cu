@@ -30,8 +30,11 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
     auto init_c = has_initial ? initial.contiguous() : torch::empty({0}, depth.options());
     auto valid_c = has_initial ? initial_valid.contiguous() : torch::empty({0}, depth.options().dtype(torch::kBool));
     const int64_t B = depth_c.size(0), T = depth_c.size(1), H = depth_c.size(2);
+    const int64_t C = (T + TCE_CHECKPOINT_INTERVAL - 1) / TCE_CHECKPOINT_INTERVAL;
     auto endpoint = torch::empty({B, H, 3, 3}, depth.options());
     auto endpoint_fp32 = torch::empty({B, H, 3, 3}, depth.options().dtype(torch::kFloat32));
+    auto scales = torch::empty({B, T, H}, depth.options().dtype(torch::kFloat32));
+    auto checkpoints = torch::empty({B, C, H, 3, 3}, depth.options().dtype(torch::kFloat32));
     const int threads = 256;
     const int64_t blocks = (B * H + threads - 1) / threads;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, depth_c.scalar_type(),
@@ -41,26 +44,41 @@ std::vector<torch::Tensor> temporal_carry_endpoint_forward_cuda(
                 has_initial ? init_c.data_ptr<scalar_t>() : nullptr,
                 has_initial ? valid_c.data_ptr<bool>() : nullptr,
                 endpoint.data_ptr<scalar_t>(),
-                endpoint_fp32.data_ptr<float>(), B, T, H, has_initial);
+                endpoint_fp32.data_ptr<float>(), scales.data_ptr<float>(),
+                checkpoints.data_ptr<float>(), B, T, H, C, has_initial);
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {endpoint, endpoint_fp32};
+    return {endpoint, endpoint_fp32, scales, checkpoints};
 }
 
 std::vector<torch::Tensor> temporal_carry_endpoint_backward_cuda(
     torch::Tensor grad_endpoint, torch::Tensor depth, torch::Tensor endpoint_fp32,
-    torch::Tensor reset, torch::Tensor initial, torch::Tensor initial_valid) {
+    torch::Tensor reset, torch::Tensor initial, torch::Tensor initial_valid,
+    torch::Tensor scales, torch::Tensor checkpoints) {
     TORCH_CHECK(grad_endpoint.is_cuda() && depth.is_cuda() && endpoint_fp32.is_cuda() && reset.is_cuda(),
                 "temporal_carry_endpoint_backward_cuda: CUDA inputs required");
+    TORCH_CHECK(scales.is_cuda() && checkpoints.is_cuda() &&
+                scales.scalar_type() == torch::kFloat32 && checkpoints.scalar_type() == torch::kFloat32,
+                "temporal endpoint backward: scales/checkpoints must be CUDA float32");
     const bool has_initial = initial.numel() != 0;
     c10::cuda::CUDAGuard guard(depth.device());
     auto grad_c = grad_endpoint.contiguous();
     auto depth_c = depth.contiguous();
     auto endpoint_c = endpoint_fp32.contiguous();
+    auto scales_c = scales.contiguous();
+    auto checkpoints_c = checkpoints.contiguous();
     auto reset_c = reset.contiguous();
     auto init_c = has_initial ? initial.contiguous() : torch::empty({0}, depth.options());
     auto valid_c = has_initial ? initial_valid.contiguous() : torch::empty({0}, depth.options().dtype(torch::kBool));
     const int64_t B = depth_c.size(0), T = depth_c.size(1), H = depth_c.size(2);
+    const int64_t C = checkpoints_c.size(1);
+    TORCH_CHECK(scales_c.dim() == 3 && scales_c.size(0) == B &&
+                scales_c.size(1) == T && scales_c.size(2) == H,
+                "temporal endpoint backward: invalid scales shape");
+    TORCH_CHECK(checkpoints_c.dim() == 5 && checkpoints_c.size(0) == B &&
+                checkpoints_c.size(2) == H && checkpoints_c.size(3) == 3 && checkpoints_c.size(4) == 3 &&
+                C == (T + TCE_CHECKPOINT_INTERVAL - 1) / TCE_CHECKPOINT_INTERVAL,
+                "temporal endpoint backward: invalid checkpoints shape");
     auto grad_depth = torch::zeros_like(depth_c);
     auto grad_initial = has_initial ? torch::zeros_like(init_c) : torch::empty({0}, depth.options());
     const int threads = 256;
@@ -81,9 +99,10 @@ std::vector<torch::Tensor> temporal_carry_endpoint_backward_cuda(
                         reset_c.data_ptr<bool>(),
                         has_initial ? init_c.data_ptr<state_t>() : nullptr,
                         has_initial ? valid_c.data_ptr<bool>() : nullptr,
+                        scales_c.data_ptr<float>(), checkpoints_c.data_ptr<float>(),
                         grad_depth.data_ptr<state_t>(),
                         has_initial ? grad_initial.data_ptr<state_t>() : nullptr,
-                        B, T, H, has_initial);
+                        B, T, H, C, has_initial);
                 }));
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();

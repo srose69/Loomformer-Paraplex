@@ -10,12 +10,13 @@ group is split into a torch-free <name>_kernel.cuh (the actual device code,
 safe to nvcc --ptx standalone) and an ATen-facing <name>_launcher.cu (arg
 checks, dispatch, kernel launch, pybind).
 
-Rebuild mechanics: torch.utils.cpp_extension.load() already drives ninja
-under build_directory, and ninja already does its own incremental/skip-if-
-unchanged compilation. We do NOT try to out-guess ninja's own change
-detection -- we compute+store sha256 per source file purely as a visible,
-committable record (".hashes.json") and as a fast pre-check to decide
-whether a real rebuild happened (only then is there anything worth printing).
+Rebuild mechanics: torch.utils.cpp_extension.load() drives ninja under
+build_directory.  We hash every translation unit plus every recursively
+included project-local header and inject the aggregate digest into both the
+C++ and CUDA compile commands.  A .cuh-only edit therefore changes ninja's
+command line and forces recompilation even when a deploy/copy preserved the
+header's mtime.  The per-file hashes are also stored in ".hashes.json" as a
+visible, committable record and used for the compact build-status message.
 ninja/nvcc's own --verbose spam is always suppressed (verbose=False
 unconditionally) in favor of one compact, self-overwriting "[kernels]"
 status line per build step -- see _status().
@@ -138,6 +139,17 @@ def _source_dependencies(sources: Sequence[str]) -> List[str]:
             if os.path.commonpath((candidate, _KERNELS_DIR)) == _KERNELS_DIR:
                 pending.append(candidate)
     return sorted(found)
+
+
+def _dependency_digest(hashes: Dict[str, str]) -> str:
+    """Stable digest of paths and contents used to force header rebuilds."""
+    h = hashlib.sha256()
+    for path, digest in sorted(hashes.items()):
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(digest.encode("ascii"))
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _ptx_dump_enabled() -> bool:
@@ -284,8 +296,9 @@ def build_or_load(
     real incremental build) under kernels/build/<ext_name>/. Note: only the
     *_launcher.cu / bindings.cpp translation units are ever passed here as
     `sources` -- the *_kernel.cuh headers they #include are automatically
-    picked up by ninja's own header dependency scan, so a kernel.cuh-only
-    edit still triggers a real rebuild even though it's never listed here.
+    included in the aggregate source hash.  That hash is injected into the
+    compiler command, so a kernel.cuh-only edit forces a rebuild even if its
+    filesystem timestamp did not change.
 
     ptx_kernels: optional {label: "<group>/<name>_kernel.cu"} map (paths
     relative to kernels/) -- one entry per kernel GROUP this module
@@ -313,6 +326,15 @@ def build_or_load(
         os.path.relpath(s, _KERNELS_DIR): _sha256_file(s)
         for s in dependency_sources
     }
+    # cpp_extension's input versioner hashes explicit sources and flags, but
+    # not headers.  Ninja normally catches headers through depfiles; relying
+    # on mtime alone is unsafe when rsync/cp -p/deployment preserves it.  Put
+    # the transitive content digest in both compile commands so either layer
+    # necessarily sees a changed build input after any local .cuh edit.
+    source_digest = _dependency_digest(current)
+    digest_flag = f"-DLOOM_KERNEL_SOURCE_HASH={source_digest[:16]}"
+    effective_cflags = [*(extra_cflags or []), digest_flag]
+    effective_cuda_cflags = [*(extra_cuda_cflags or []), digest_flag]
     ext_lock = _extension_lock(ext_name)
     with ext_lock:
         with _STATE_LOCK:
@@ -336,8 +358,8 @@ def build_or_load(
         module = _cpp_load(
             name=ext_name,
             sources=abs_sources,
-            extra_cflags=extra_cflags,
-            extra_cuda_cflags=extra_cuda_cflags,
+            extra_cflags=effective_cflags,
+            extra_cuda_cflags=effective_cuda_cflags,
             build_directory=build_dir,
             verbose=bool(os.environ.get("KERNELS_VERBOSE")) and _status_enabled(),
         )

@@ -2831,6 +2831,29 @@ def _eval_full_batch_nll(model: nn.Module, batch: torch.Tensor, device: torch.de
     return float(nll.item()), int(y.numel())
 
 
+def _eval_full_raw_batch_nll(
+    model: nn.Module,
+    batch: torch.Tensor,
+    cfg: Config,
+    device: torch.device,
+    eos_id: Optional[int],
+) -> Tuple[float, int]:
+    """Evaluate a raw-corpus batch with the exact PT document semantics."""
+    x, y, position_ids, attn_mask = split_train_batch(batch, eos_id, cfg)
+    ntok = int((y != IGNORE_INDEX).sum().item())
+    if ntok == 0:
+        return 0.0, 0
+    with amp_autocast(device):
+        loss = model(
+            x,
+            attn_mask=attn_mask,
+            position_ids=position_ids,
+            labels=y,
+            ignore_index=IGNORE_INDEX,
+        )
+    return float(loss.item()) * ntok, ntok
+
+
 @torch.no_grad()
 def _eval_full_sft(model: nn.Module, cfg: Config, dataset: str, device: torch.device,
                     eval_batch_size: Optional[int] = None) -> Dict[str, float]:
@@ -2902,6 +2925,144 @@ def _tokenize_raw_corpus_full(path: str, cfg: Config) -> Tuple[np.ndarray, float
     return arr, bpt
 
 
+def _tokenize_raw_corpus_for_eval(
+    path: str,
+    cfg: Config,
+) -> Tuple[np.ndarray, float, Optional[int], Optional[int]]:
+    """Tokenize raw documents exactly as the PT stream packs them.
+
+    Raw rows are documents.  ShardStream inserts one EOS between consecutive
+    rows; split_train_batch then derives document-relative positions, packed
+    attention boundaries and temporal-Tria resets from those EOS markers.
+    Full evaluation must preserve the same representation.
+    """
+    tok = build_tokenizer(cfg)
+    eos_id = _tok_special_id(tok, "<eos>")
+    bos_id = _tok_special_id(tok, "<bos>")
+    corpus = RawCorpus(
+        path,
+        fmt=getattr(cfg, "dataset_format", "auto"),
+        text_field=getattr(cfg, "text_field", "text"),
+    )
+    ids: List[int] = []
+    total_bytes = 0
+    content_tokens = 0
+    first_doc = True
+    for fi, key, length in corpus._docs:
+        text = corpus._read_doc_text(fi, key, length)
+        encoded = tok.encode(text)
+        if not first_doc and eos_id is not None:
+            ids.append(int(eos_id))
+        ids.extend(encoded)
+        first_doc = False
+        total_bytes += len(text.encode("utf-8"))
+        content_tokens += len(encoded)
+    if content_tokens <= 0:
+        raise ValueError(f"cannot evaluate empty raw corpus: {path}")
+    assert cfg.vocab <= 65536, "uint16 storage requires vocab <= 65536"
+    return (
+        np.asarray(ids, dtype=np.uint16),
+        total_bytes / content_tokens,
+        eos_id,
+        bos_id,
+    )
+
+
+def _eval_full_raw_model(
+    model: nn.Module,
+    cfg: Config,
+    dataset: str,
+    device: torch.device,
+    eval_batch_size: Optional[int],
+    eval_data_cache: str,
+) -> Dict[str, float]:
+    tokens, bpt, eos_id, bos_id = _tokenize_raw_corpus_for_eval(dataset, cfg)
+    if len(tokens) < 2:
+        raise ValueError(f"dataset too short for eval: {dataset}")
+
+    T = int(cfg.seq_len)
+    B = max(1, int(
+        eval_batch_size if eval_batch_size is not None else cfg.batch_size))
+    cache = str(eval_data_cache or "ram").lower()
+    if cache not in ("mmap", "ram", "gpu"):
+        raise ValueError(
+            f"eval_data_cache must be 'mmap', 'ram', or 'gpu', got {eval_data_cache!r}")
+    if cache == "gpu" and device.type != "cuda":
+        cache = "ram"
+
+    # ShardStream consumes independent rows of T+1 model tokens.  A tokenizer
+    # with BOS contributes that first token without consuming corpus content;
+    # otherwise the row consumes all T+1 tokens itself.  Do not use the
+    # overlapping T-stride windows of prepared-token evaluation: PT resets
+    # positions/carry at every packed row, and deliberately has no target
+    # spanning two rows.
+    content_per_row = T + 1 - (1 if bos_id is not None else 0)
+    n_rows = int(len(tokens)) // content_per_row
+    tail_start = n_rows * content_per_row
+    total_nll = 0.0
+    total_tokens = 0
+
+    def prepend_bos(batch: torch.Tensor) -> torch.Tensor:
+        if bos_id is None:
+            return batch
+        bos = torch.full(
+            (batch.shape[0], 1), int(bos_id),
+            dtype=batch.dtype, device=batch.device)
+        return torch.cat((bos, batch), dim=1)
+
+    if cache == "gpu":
+        data_t = torch.from_numpy(
+            np.asarray(tokens, dtype=np.int64)).to(device, non_blocking=True)
+        if n_rows:
+            rows = data_t[:tail_start].view(n_rows, content_per_row)
+            for i in range(0, n_rows, B):
+                nll, ntok = _eval_full_raw_batch_nll(
+                    model, prepend_bos(rows[i:i + B]), cfg, device, eos_id)
+                total_nll += nll
+                total_tokens += ntok
+        tail_min = 1 if bos_id is not None else 2
+        if len(tokens) - tail_start >= tail_min:
+            nll, ntok = _eval_full_raw_batch_nll(
+                model, prepend_bos(data_t[tail_start:].view(1, -1)),
+                cfg, device, eos_id)
+            total_nll += nll
+            total_tokens += ntok
+    else:
+        data = np.asarray(tokens, dtype=np.uint16)
+        if n_rows:
+            rows = data[:tail_start].reshape(n_rows, content_per_row)
+            for i in range(0, n_rows, B):
+                batch = torch.from_numpy(
+                    np.asarray(rows[i:i + B], dtype=np.int64))
+                if device.type == "cuda":
+                    batch = batch.pin_memory()
+                batch = batch.to(device, non_blocking=True)
+                nll, ntok = _eval_full_raw_batch_nll(
+                    model, prepend_bos(batch), cfg, device, eos_id)
+                total_nll += nll
+                total_tokens += ntok
+        tail_min = 1 if bos_id is not None else 2
+        if len(tokens) - tail_start >= tail_min:
+            batch = torch.from_numpy(np.asarray(
+                data[tail_start:], dtype=np.int64)[None, :])
+            if device.type == "cuda":
+                batch = batch.pin_memory()
+            batch = batch.to(device, non_blocking=True)
+            nll, ntok = _eval_full_raw_batch_nll(
+                model, prepend_bos(batch), cfg, device, eos_id)
+            total_nll += nll
+            total_tokens += ntok
+
+    loss_nats = total_nll / max(1, total_tokens)
+    return {
+        "total_tokens": float(total_tokens),
+        "total_nll": float(total_nll),
+        "loss_nats": float(loss_nats),
+        "bits_tok": float(loss_nats / math.log(2.0)),
+        "bpb": float(loss_nats / math.log(2.0) / bpt),
+    }
+
+
 @torch.no_grad()
 def eval_full_model(
     model: nn.Module,
@@ -2916,11 +3077,12 @@ def eval_full_model(
     if fmt == "sft":
         return _eval_full_sft(model, cfg, dataset, device, eval_batch_size)
     is_bin = fmt == "bin" or (fmt == "auto" and os.path.isfile(dataset) and dataset.endswith(".bin"))
+    if not is_bin:
+        return _eval_full_raw_model(
+            model, cfg, dataset, device, eval_batch_size, eval_data_cache)
     if is_bin:
         bpt, _, _ = load_bytes_per_token(dataset)
         mmap = np.memmap(dataset, dtype=np.uint16, mode="r")
-    else:
-        mmap, bpt = _tokenize_raw_corpus_full(dataset, cfg)
     if len(mmap) < 2:
         raise ValueError(f"dataset too short for eval: {dataset}")
 

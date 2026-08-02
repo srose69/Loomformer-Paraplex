@@ -1,6 +1,10 @@
 import asyncio
+import json
+import os
+import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +27,28 @@ class _KnownLossModel(torch.nn.Module):
         del kwargs
         return idx.new_tensor(2.0 if int(idx[0, 0]) == 1 else 8.0,
                               dtype=torch.float32)
+
+
+class _TinyTokenizer:
+    vocab_size = 32
+
+    def encode(self, text):
+        return [{"a": 1, "b": 2, "c": 3, "d": 4,
+                 "e": 5, "f": 6, "g": 7, "h": 8,
+                 "i": 9}[c] for c in text]
+
+    def special_id(self, token):
+        return {"<bos>": 30, "<eos>": 31}.get(token)
+
+
+class _DocumentAwareLossModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, idx, **kwargs):
+        self.calls.append((idx.detach().clone(), kwargs))
+        return idx.new_tensor(2.0, dtype=torch.float32)
 
 
 class LossAccountingTests(unittest.TestCase):
@@ -81,6 +107,50 @@ class LossAccountingTests(unittest.TestCase):
         loss = asyncio.run(lf.eval_loss_async(
             _KnownLossModel(), _EvalStream(batches), cfg, torch.device("cpu")))
         self.assertAlmostEqual(loss, (2.0 * 2 + 8.0 * 4) / 6, places=7)
+
+    def test_full_raw_eval_preserves_pt_document_boundaries(self):
+        cfg = lf.Config(
+            dataset_format="jsonl",
+            text_field="text",
+            seq_len=4,
+            batch_size=2,
+            tria_temporal_enabled=False,
+        )
+        model = _DocumentAwareLossModel()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "docs.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                for text in ("ab", "c", "defghi"):
+                    f.write(json.dumps({"text": text}) + "\n")
+            with mock.patch.object(
+                    lf, "build_tokenizer", return_value=_TinyTokenizer()):
+                result = lf.eval_full_model(
+                    model, cfg, path, torch.device("cpu"), eval_batch_size=2)
+
+        self.assertEqual(result["total_tokens"], 11.0)
+        self.assertEqual(result["loss_nats"], 2.0)
+        self.assertEqual(len(model.calls), 2)
+        idx, kwargs = model.calls[0]
+        torch.testing.assert_close(idx, torch.tensor([
+            [30, 1, 2, 31],
+            [30, 31, 4, 5],
+        ]))
+        torch.testing.assert_close(kwargs["labels"], torch.tensor([
+            [1, 2, 31, 3],
+            [31, 4, 5, 6],
+        ]))
+        torch.testing.assert_close(kwargs["position_ids"], torch.tensor([
+            [0, 1, 2, 3],
+            [0, 1, 0, 1],
+        ]))
+        self.assertIsInstance(kwargs["attn_mask"], lf.PackedAttentionLayout)
+        torch.testing.assert_close(
+            kwargs["attn_mask"].segment_ids,
+            torch.tensor([[0, 0, 0, 0], [0, 0, 1, 1]], dtype=torch.int32),
+        )
+        tail_idx, tail_kwargs = model.calls[1]
+        torch.testing.assert_close(tail_idx, torch.tensor([[30, 7, 8]]))
+        torch.testing.assert_close(tail_kwargs["labels"], torch.tensor([[7, 8, 9]]))
 
 
 if __name__ == "__main__":
